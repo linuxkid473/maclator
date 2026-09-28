@@ -1,0 +1,666 @@
+//! Workqueue emulation: libdispatch worker threads, kernel event delivery and
+//! workloops.
+//!
+//! XNU owns three things libdispatch relies on:
+//!  * the per-process *workq kqueue* (`KEVENT_FLAG_WORKQ`): knotes fire by
+//!    spawning a workqueue thread that receives the events on its stack;
+//!  * *workloops* (`kevent_id` + `KEVENT_FLAG_WORKLOOP`): dynamic kqueues, one
+//!    per serial queue, with EVFILT_WORKLOOP knotes that request a servicer
+//!    thread or implement dispatch_sync waits;
+//!  * workqueue thread creation (`workq_kernreturn`).
+//!
+//! We back the workq kqueue and each workloop's regular knotes with ordinary
+//! host kqueues, implement EVFILT_WORKLOOP in user space, and run guest
+//! worker threads laid out exactly as the kernel lays them out.
+
+use crate::hostsys;
+use maclator_core::cpu::Cpu;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Condvar, Mutex, Once};
+
+// ---- constants (workqueue_syscalls.h, event_private.h, priority_private.h) ----
+
+const WQOPS_THREAD_RETURN: u64 = 0x004;
+const WQOPS_QUEUE_NEWSPISUPP: u64 = 0x010;
+const WQOPS_QUEUE_REQTHREADS: u64 = 0x020;
+const WQOPS_QUEUE_REQTHREADS2: u64 = 0x030;
+const WQOPS_THREAD_KEVENT_RETURN: u64 = 0x040;
+const WQOPS_SET_EVENT_MANAGER_PRIORITY: u64 = 0x080;
+const WQOPS_THREAD_WORKLOOP_RETURN: u64 = 0x100;
+const WQOPS_SHOULD_NARROW: u64 = 0x200;
+const WQOPS_SETUP_DISPATCH: u64 = 0x400;
+
+const WQ_FLAG_THREAD_PRIO_QOS: u64 = 0x0000_4000;
+const WQ_FLAG_THREAD_OVERCOMMIT: u64 = 0x0001_0000;
+const WQ_FLAG_THREAD_REUSE: u64 = 0x0002_0000;
+const WQ_FLAG_THREAD_NEWSPI: u64 = 0x0004_0000;
+const WQ_FLAG_THREAD_KEVENT: u64 = 0x0008_0000;
+const WQ_FLAG_THREAD_EVENT_MANAGER: u64 = 0x0010_0000;
+const WQ_FLAG_THREAD_TSD_BASE_SET: u64 = 0x0020_0000;
+const WQ_FLAG_THREAD_WORKLOOP: u64 = 0x0040_0000;
+const WQ_FLAG_THREAD_COOPERATIVE: u64 = 0x0100_0000;
+
+const PP_OVERCOMMIT: u64 = 0x8000_0000;
+const PP_COOPERATIVE: u64 = 0x0800_0000;
+const PP_EVENT_MANAGER: u64 = 0x0200_0000;
+
+const KEVENT_FLAG_IMMEDIATE: u64 = 0x001;
+const KEVENT_FLAG_ERROR_EVENTS: u64 = 0x002;
+const KEVENT_FLAG_STACK_DATA: u64 = 0x008;
+const KEVENT_FLAG_WORKQ: u64 = 0x020;
+const KEVENT_FLAG_PARKING: u64 = 0x800;
+
+const EVFILT_READ: i16 = -1;
+const EVFILT_WORKLOOP: i16 = -17;
+const EV_ADD: u16 = 0x1;
+const EV_DELETE: u16 = 0x2;
+const EV_ENABLE: u16 = 0x4;
+const EV_DISPATCH: u16 = 0x80;
+const EV_ERROR: u16 = 0x4000;
+
+const NOTE_WL_THREAD_REQUEST: u32 = 0x1;
+const NOTE_WL_SYNC_WAIT: u32 = 0x4;
+const NOTE_WL_SYNC_WAKE: u32 = 0x8;
+const NOTE_WL_SYNC_IPC: u32 = 0x8000_0000;
+const NOTE_WL_END_OWNERSHIP: u32 = 0x20;
+const NOTE_WL_IGNORE_ESTALE: u32 = 0x100;
+
+const SYS_KEVENT_QOS: u64 = 374;
+const SYS_KEVENT_ID: u64 = 375;
+const SYS_KQUEUE: u64 = 362;
+
+const KEV_SIZE: u64 = 72;
+const WQ_KEVENT_LIST_LEN: u64 = 16;
+const WQ_KEVENT_DATA_SIZE: u64 = 32 * 1024;
+const STACK_SIZE: u64 = 512 * 1024;
+const GUARD: u64 = 0x4000;
+const PTHREAD_T_OFFSET: u64 = 12 * 1024;
+
+// ---- raw kevent_qos_s helpers ----
+
+#[derive(Clone, Copy, Default, Debug)]
+struct Kev {
+    ident: u64,
+    filter: i16,
+    flags: u16,
+    qos: i32,
+    udata: u64,
+    fflags: u32,
+    xflags: u32,
+    data: i64,
+    ext: [u64; 4],
+}
+
+impl Kev {
+    unsafe fn read(p: u64) -> Kev {
+        let b = p as *const u8;
+        let r64 = |o: usize| std::ptr::read_unaligned(b.add(o) as *const u64);
+        Kev {
+            ident: r64(0),
+            filter: std::ptr::read_unaligned(b.add(8) as *const i16),
+            flags: std::ptr::read_unaligned(b.add(10) as *const u16),
+            qos: std::ptr::read_unaligned(b.add(12) as *const i32),
+            udata: r64(16),
+            fflags: std::ptr::read_unaligned(b.add(24) as *const u32),
+            xflags: std::ptr::read_unaligned(b.add(28) as *const u32),
+            data: r64(32) as i64,
+            ext: [r64(40), r64(48), r64(56), r64(64)],
+        }
+    }
+    unsafe fn write(&self, p: u64) {
+        let b = p as *mut u8;
+        let w64 = |o: usize, v: u64| std::ptr::write_unaligned(b.add(o) as *mut u64, v);
+        w64(0, self.ident);
+        std::ptr::write_unaligned(b.add(8) as *mut i16, self.filter);
+        std::ptr::write_unaligned(b.add(10) as *mut u16, self.flags);
+        std::ptr::write_unaligned(b.add(12) as *mut i32, self.qos);
+        w64(16, self.udata);
+        std::ptr::write_unaligned(b.add(24) as *mut u32, self.fflags);
+        std::ptr::write_unaligned(b.add(28) as *mut u32, self.xflags);
+        w64(32, self.data as u64);
+        for i in 0..4 {
+            w64(40 + i * 8, self.ext[i]);
+        }
+    }
+}
+
+fn host_kqueue() -> i32 {
+    let r = hostsys::unix(SYS_KQUEUE, &[0; 8]);
+    let fd = r.rax as i32;
+    // Move it out of the guest's usual descriptor range.
+    unsafe {
+        let high = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 900);
+        if high >= 0 {
+            libc::close(fd);
+            return high;
+        }
+    }
+    fd
+}
+
+fn kevent_qos(kq: i32, changes: u64, nchanges: u64, out: u64, nout: u64, data: u64, avail: u64, flags: u64) -> hostsys::SysResult {
+    hostsys::unix(SYS_KEVENT_QOS, &[kq as u64, changes, nchanges, out, nout, data, avail, flags])
+}
+
+// ---- workers ----
+
+struct Job {
+    flags: u64,
+    kevent_list: u64,
+    nevents: u64,
+    stack_top: u64,
+    wl: Option<u64>,
+}
+
+struct Worker {
+    stack_low: u64,
+    pthread: u64,
+    tx: Option<Sender<Job>>,
+}
+
+impl Worker {
+    fn new() -> Option<Worker> {
+        let (_, _, _, pthsize) = crate::threads::wq_registration();
+        let pthsize = pthsize.max(0x1000);
+        let total = GUARD + STACK_SIZE + PTHREAD_T_OFFSET + ((pthsize + 0x3fff) & !0x3fff);
+        let base = unsafe {
+            let p = libc::mmap(std::ptr::null_mut(), total as usize, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0);
+            if p == libc::MAP_FAILED {
+                return None;
+            }
+            libc::mprotect(p, GUARD as usize, libc::PROT_NONE);
+            p as u64
+        };
+        let stack_low = base + GUARD;
+        Some(Worker { stack_low, pthread: stack_low + STACK_SIZE + PTHREAD_T_OFFSET, tx: None })
+    }
+    fn kevent_list(&self) -> u64 {
+        self.pthread - WQ_KEVENT_LIST_LEN * KEV_SIZE
+    }
+    fn data_buf(&self) -> u64 {
+        self.kevent_list() - WQ_KEVENT_DATA_SIZE
+    }
+}
+
+static IDLE: Mutex<Vec<Worker>> = Mutex::new(Vec::new());
+
+thread_local! {
+    static PARK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static BOUND_WL: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn take_worker() -> Option<Worker> {
+    if let Some(w) = IDLE.lock().unwrap().pop() {
+        return Some(w);
+    }
+    Worker::new()
+}
+
+fn start_job(mut w: Worker, job: Job) {
+    match &w.tx {
+        Some(tx) => {
+            let _ = tx.send(Job { flags: job.flags | WQ_FLAG_THREAD_REUSE, ..job });
+        }
+        None => {
+            let (tx, rx) = channel::<Job>();
+            w.tx = Some(tx);
+            spawn_worker_thread(w, job, rx);
+        }
+    }
+}
+
+fn spawn_worker_thread(w: Worker, job: Job, rx: Receiver<Job>) {
+    let (start, tsd_off, mts_off, _) = crate::threads::wq_registration();
+    let (stack_low, pthread) = (w.stack_low, w.pthread);
+    let tx = w.tx.clone().unwrap();
+    crate::threads::LIVE_THREADS.fetch_add(1, Ordering::SeqCst);
+    std::thread::Builder::new()
+        .stack_size(8 << 20)
+        .spawn(move || {
+            let port = unsafe { libc::mach_thread_self() } as u64;
+            if tsd_off != 0 && mts_off != 0 {
+                unsafe { *((pthread + tsd_off + mts_off) as *mut u64) = port };
+            }
+            let mut cpu = Cpu::new();
+            let mut job = job;
+            loop {
+                *cpu = Cpu::default();
+                cpu.pc = start;
+                cpu.x[0] = pthread;
+                cpu.x[1] = port;
+                cpu.x[2] = stack_low;
+                cpu.x[3] = job.kevent_list;
+                cpu.x[4] = job.flags;
+                cpu.x[5] = job.nevents;
+                cpu.tpidrro_el0 = pthread + tsd_off;
+                cpu.x[31] = job.stack_top & !0xf;
+                PARK.with(|p| p.set(false));
+                BOUND_WL.with(|b| b.set(job.wl));
+                crate::engine::run_thread(&mut cpu);
+                if !PARK.with(|p| p.get()) {
+                    break;
+                }
+                // The workloop (if any) was released by the return path.
+                IDLE.lock().unwrap().push(Worker { stack_low, pthread, tx: Some(tx.clone()) });
+                match rx.recv() {
+                    Ok(j) => job = j,
+                    Err(_) => break,
+                }
+            }
+            crate::threads::LIVE_THREADS.fetch_sub(1, Ordering::SeqCst);
+        })
+        .expect("failed to spawn workqueue thread");
+}
+
+fn flags_for(pp: u64) -> u64 {
+    let mut f = WQ_FLAG_THREAD_NEWSPI | WQ_FLAG_THREAD_TSD_BASE_SET;
+    if pp & PP_EVENT_MANAGER != 0 {
+        return f | WQ_FLAG_THREAD_KEVENT | WQ_FLAG_THREAD_EVENT_MANAGER;
+    }
+    let qos_bits = (pp >> 8) & 0x3f;
+    let qos = if qos_bits == 0 { 4 } else { 64 - qos_bits.leading_zeros() as u64 };
+    f |= WQ_FLAG_THREAD_PRIO_QOS | qos.min(6);
+    if pp & PP_OVERCOMMIT != 0 {
+        f |= WQ_FLAG_THREAD_OVERCOMMIT;
+    }
+    if pp & PP_COOPERATIVE != 0 {
+        f |= WQ_FLAG_THREAD_COOPERATIVE;
+    }
+    f
+}
+
+// ---- the anonymous workq kqueue ----
+
+static ANON_KQ: AtomicI32 = AtomicI32::new(-1);
+static ANON_MONITOR: Once = Once::new();
+
+fn anon_kq() -> i32 {
+    ANON_MONITOR.call_once(|| {
+        ANON_KQ.store(host_kqueue(), Ordering::SeqCst);
+        std::thread::Builder::new().name("maclator-workq".into()).spawn(anon_monitor).unwrap();
+    });
+    ANON_KQ.load(Ordering::SeqCst)
+}
+
+/// Deliver each event fired on the workq kqueue to a worker thread.
+fn anon_monitor() {
+    let kq = ANON_KQ.load(Ordering::SeqCst);
+    loop {
+        let Some(w) = take_worker() else {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            continue;
+        };
+        let list = w.kevent_list();
+        let mut avail: u64 = WQ_KEVENT_DATA_SIZE;
+        let r = kevent_qos(kq, 0, 0, list, 1, w.data_buf(), &mut avail as *mut u64 as u64, KEVENT_FLAG_STACK_DATA);
+        if r.carry || r.rax == 0 {
+            IDLE.lock().unwrap().push(w);
+            continue;
+        }
+        let qos = unsafe { Kev::read(list) }.qos as u32 as u64;
+        let flags = flags_for(qos) | WQ_FLAG_THREAD_KEVENT;
+        let stack_top = w.data_buf() + avail;
+        start_job(w, Job { flags, kevent_list: list, nevents: r.rax, stack_top, wl: None });
+    }
+}
+
+// ---- workloops ----
+
+#[derive(Default)]
+struct Workloop {
+    /// Host kqueue holding this workloop's regular knotes (-1 until needed).
+    kq: i32,
+    /// Pending thread request (the EVFILT_WORKLOOP knote), if any.
+    thread_request: Option<Kev>,
+    /// A servicer thread is currently bound.
+    bound: bool,
+    /// Regular knotes have fired and need a servicer.
+    needs_service: bool,
+}
+
+#[derive(Default)]
+struct SyncKnote {
+    woken: bool,
+}
+
+struct WlState {
+    loops: HashMap<u64, Workloop>,
+    sync: HashMap<(u64, u64), SyncKnote>,
+    /// workloop kq fd -> workloop id
+    by_fd: HashMap<i32, u64>,
+}
+
+static WL: Mutex<Option<WlState>> = Mutex::new(None);
+static WL_CV: Condvar = Condvar::new();
+static WL_MON_KQ: AtomicI32 = AtomicI32::new(-1);
+static WL_MONITOR: Once = Once::new();
+
+fn with_wl<R>(f: impl FnOnce(&mut WlState) -> R) -> R {
+    let mut g = WL.lock().unwrap();
+    let st = g.get_or_insert_with(|| WlState { loops: HashMap::new(), sync: HashMap::new(), by_fd: HashMap::new() });
+    f(st)
+}
+
+fn wl_mon_kq() -> i32 {
+    WL_MONITOR.call_once(|| {
+        WL_MON_KQ.store(host_kqueue(), Ordering::SeqCst);
+        std::thread::Builder::new().name("maclator-workloops".into()).spawn(wl_monitor).unwrap();
+    });
+    WL_MON_KQ.load(Ordering::SeqCst)
+}
+
+/// Watch every workloop's host kqueue; when one has pending events and no
+/// servicer, bind a worker to it.
+fn wl_monitor() {
+    let mon = WL_MON_KQ.load(Ordering::SeqCst);
+    let mut buf = [0u8; 72 * 8];
+    loop {
+        let r = kevent_qos(mon, 0, 0, buf.as_mut_ptr() as u64, 8, 0, 0, 0);
+        if r.carry {
+            continue;
+        }
+        for i in 0..r.rax {
+            let ev = unsafe { Kev::read(buf.as_ptr() as u64 + i * KEV_SIZE) };
+            let wl_id = ev.udata;
+            let mut g = WL.lock().unwrap();
+            if let Some(st) = g.as_mut() {
+                if let Some(wl) = st.loops.get_mut(&wl_id) {
+                    wl.needs_service = true;
+                }
+                schedule(st, wl_id);
+            }
+        }
+    }
+}
+
+/// Arm the monitor to watch `fd` (one-shot until re-enabled).
+fn watch_wl_kq(fd: i32, wl_id: u64, first: bool) {
+    let mon = wl_mon_kq();
+    let ev = Kev { ident: fd as u64, filter: EVFILT_READ, flags: if first { EV_ADD | EV_DISPATCH } else { EV_ENABLE | EV_DISPATCH }, udata: wl_id, ..Default::default() };
+    let mut b = [0u8; 72];
+    unsafe { ev.write(b.as_mut_ptr() as u64) };
+    kevent_qos(mon, b.as_ptr() as u64, 1, 0, 0, 0, 0, KEVENT_FLAG_IMMEDIATE);
+}
+
+/// If the workloop needs a servicer and has none, bind a worker to it.
+fn schedule(st: &mut WlState, wl_id: u64) {
+    let Some(wl) = st.loops.get_mut(&wl_id) else { return };
+    if wl.bound || (wl.thread_request.is_none() && !wl.needs_service) {
+        return;
+    }
+    let Some(w) = take_worker() else { return };
+    let list = w.kevent_list();
+    let mut n: u64 = 0;
+    let mut qos: u64 = 0;
+    if let Some(tr) = wl.thread_request {
+        unsafe { tr.write(list) };
+        qos = tr.qos as u32 as u64;
+        n = 1;
+    }
+    // kqueue id lives just below the event list; data goes below that.
+    unsafe { *((list - 8) as *mut u64) = wl_id };
+    let data_buf = w.data_buf();
+    let mut avail: u64 = WQ_KEVENT_DATA_SIZE - 8;
+    if wl.kq >= 0 {
+        let r = kevent_qos(wl.kq, 0, 0, list + n * KEV_SIZE, WQ_KEVENT_LIST_LEN - n, data_buf, &mut avail as *mut u64 as u64, KEVENT_FLAG_STACK_DATA | KEVENT_FLAG_IMMEDIATE);
+        if !r.carry {
+            if n == 0 && r.rax > 0 {
+                qos = unsafe { Kev::read(list) }.qos as u32 as u64;
+            }
+            n += r.rax;
+        }
+    }
+    wl.needs_service = false;
+    if n == 0 {
+        IDLE.lock().unwrap().push(w);
+        if wl.kq >= 0 {
+            watch_wl_kq(wl.kq, wl_id, false);
+        }
+        return;
+    }
+    wl.bound = true;
+    let flags = (flags_for(qos) & !(WQ_FLAG_THREAD_EVENT_MANAGER)) | WQ_FLAG_THREAD_KEVENT | WQ_FLAG_THREAD_WORKLOOP;
+    start_job(w, Job { flags, kevent_list: list, nevents: n, stack_top: data_buf + avail, wl: Some(wl_id) });
+}
+
+/// Apply a single change to a workloop. Returns an errno (0 on success).
+fn wl_apply(st: &mut WlState, wl_id: u64, ke: &Kev) -> i64 {
+    if ke.filter != EVFILT_WORKLOOP {
+        // Regular knote: lives on the workloop's host kqueue.
+        let first = {
+            let wl = st.loops.entry(wl_id).or_insert_with(|| Workloop { kq: -1, ..Default::default() });
+            if wl.kq < 0 {
+                wl.kq = host_kqueue();
+                true
+            } else {
+                false
+            }
+        };
+        let fd = st.loops[&wl_id].kq;
+        if first {
+            st.by_fd.insert(fd, wl_id);
+            watch_wl_kq(fd, wl_id, true);
+        }
+        let mut b = [0u8; 72];
+        let mut out = [0u8; 72];
+        unsafe { ke.write(b.as_mut_ptr() as u64) };
+        let r = kevent_qos(fd, b.as_ptr() as u64, 1, out.as_mut_ptr() as u64, 1, 0, 0, KEVENT_FLAG_IMMEDIATE | KEVENT_FLAG_ERROR_EVENTS);
+        if r.carry {
+            return r.rax as i64;
+        }
+        if r.rax > 0 {
+            let e = unsafe { Kev::read(out.as_ptr() as u64) };
+            if e.flags & EV_ERROR != 0 {
+                return e.data;
+            }
+        }
+        return 0;
+    }
+    let ff = ke.fflags;
+    if ff & NOTE_WL_SYNC_IPC != 0 {
+        return libc::ENOENT as i64;
+    }
+    if ff & NOTE_WL_THREAD_REQUEST != 0 {
+        // Stale-state check: *(ext[0]) & mask must equal value & mask.
+        let (addr, mask, value) = (ke.ext[0], ke.ext[1], ke.ext[2]);
+        if addr != 0 && mask != 0 {
+            let cur = crate::guestmem::read_u64(addr).unwrap_or(0);
+            if cur & mask != value & mask {
+                return if ff & NOTE_WL_IGNORE_ESTALE != 0 { 0 } else { libc::ESTALE as i64 };
+            }
+        }
+        let wl = st.loops.entry(wl_id).or_insert_with(|| Workloop { kq: -1, ..Default::default() });
+        if ke.flags & EV_DELETE != 0 {
+            wl.thread_request = None;
+        } else if ke.flags & EV_ADD != 0 {
+            let mut tr = *ke;
+            tr.flags = EV_ADD | EV_ENABLE;
+            wl.thread_request = Some(tr);
+            schedule(st, wl_id);
+        }
+        return 0;
+    }
+    let key = (wl_id, ke.ident);
+    if ff & NOTE_WL_SYNC_WAKE != 0 {
+        if ke.flags & EV_DELETE != 0 {
+            if st.sync.remove(&key).is_none() && ff & NOTE_WL_END_OWNERSHIP != 0 {
+                return libc::ENOENT as i64;
+            }
+            WL_CV.notify_all();
+            return 0;
+        }
+        st.sync.entry(key).or_default().woken = true;
+        WL_CV.notify_all();
+        return 0;
+    }
+    if ff & NOTE_WL_SYNC_WAIT != 0 {
+        // handled by the caller (it blocks)
+        return 0;
+    }
+    if ke.flags & EV_DELETE != 0 {
+        st.sync.remove(&key);
+        return 0;
+    }
+    libc::EINVAL as i64
+}
+
+/// kevent_id() on a workloop.
+fn kevent_id(args: &[u64; 8]) -> hostsys::SysResult {
+    let (wl_id, changes, nchanges, out, nout, data, avail, flags) = (args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7]);
+    let mut nerr: u64 = 0;
+    let mut wait_on: Option<u64> = None;
+    {
+        let mut g = WL.lock().unwrap();
+        let st = g.get_or_insert_with(|| WlState { loops: HashMap::new(), sync: HashMap::new(), by_fd: HashMap::new() });
+        for i in 0..nchanges {
+            let ke = unsafe { Kev::read(changes + i * KEV_SIZE) };
+            if ke.filter == EVFILT_WORKLOOP && ke.fflags & NOTE_WL_SYNC_WAIT != 0 && ke.flags & EV_DELETE == 0 {
+                wait_on = Some(ke.ident);
+                continue;
+            }
+            let err = wl_apply(st, wl_id, &ke);
+            if err != 0 && flags & KEVENT_FLAG_ERROR_EVENTS != 0 && nerr < nout {
+                let mut e = ke;
+                e.flags |= EV_ERROR;
+                e.data = err;
+                unsafe { e.write(out + nerr * KEV_SIZE) };
+                nerr += 1;
+            }
+        }
+        if let Some(tid) = wait_on {
+            // Register the waiter (a wake may already be preposted).
+            st.sync.entry((wl_id, tid)).or_default();
+        }
+    }
+    if let Some(tid) = wait_on {
+        // dispatch_sync waiter: block until SYNC_WAKE for our tid.
+        let g = WL.lock().unwrap();
+        return finish_wait(g, (wl_id, tid), nerr);
+    }
+    if nerr > 0 || flags & KEVENT_FLAG_ERROR_EVENTS != 0 || nout == 0 {
+        return hostsys::SysResult { rax: nerr, rdx: 0, carry: false };
+    }
+    // Plain poll of the workloop's regular knotes.
+    let kq = with_wl(|st| st.loops.get(&wl_id).map(|w| w.kq).unwrap_or(-1));
+    if kq < 0 {
+        return hostsys::SysResult { rax: 0, rdx: 0, carry: false };
+    }
+    kevent_qos(kq, 0, 0, out, nout, data, avail, (flags & (KEVENT_FLAG_STACK_DATA | KEVENT_FLAG_IMMEDIATE)) | KEVENT_FLAG_IMMEDIATE)
+}
+
+fn finish_wait(mut g: std::sync::MutexGuard<'_, Option<WlState>>, key: (u64, u64), nerr: u64) -> hostsys::SysResult {
+    loop {
+        let st = g.as_mut().unwrap();
+        match st.sync.get_mut(&key) {
+            Some(k) if k.woken => {
+                k.woken = false;
+                return hostsys::SysResult { rax: nerr, rdx: 0, carry: false };
+            }
+            // Deleted by the waker: also a wake-up.
+            None => return hostsys::SysResult { rax: nerr, rdx: 0, carry: false },
+            _ => {}
+        }
+        g = WL_CV.wait(g).unwrap();
+    }
+}
+
+// ---- syscall entry points ----
+
+/// Guest kevent_qos / kevent_id aimed at the workq kqueue or a workloop.
+/// Returns None when the call should go to the host unchanged.
+pub fn kevent_redirect(n: u64, args: &[u64; 8]) -> Option<hostsys::SysResult> {
+    match n {
+        SYS_KEVENT_QOS => {
+            let flags = args[7];
+            if flags & KEVENT_FLAG_WORKQ == 0 {
+                return None;
+            }
+            let mut a = *args;
+            a[0] = anon_kq() as u64;
+            a[7] = flags & !(KEVENT_FLAG_WORKQ | KEVENT_FLAG_PARKING);
+            if a[4] == 0 {
+                a[7] |= KEVENT_FLAG_IMMEDIATE;
+            }
+            Some(hostsys::unix(SYS_KEVENT_QOS, &a))
+        }
+        SYS_KEVENT_ID => Some(kevent_id(args)),
+        _ => None,
+    }
+}
+
+/// workq_kernreturn(options, item, affinity, prio)
+pub fn kernreturn(_cpu: &mut Cpu, a: &[u64; 8]) -> Result<u64, u64> {
+    match a[0] {
+        WQOPS_QUEUE_NEWSPISUPP | WQOPS_SET_EVENT_MANAGER_PRIORITY | WQOPS_SETUP_DISPATCH | WQOPS_SHOULD_NARROW => Ok(0),
+        WQOPS_QUEUE_REQTHREADS | WQOPS_QUEUE_REQTHREADS2 => {
+            let count = a[1].max(1);
+            let pp = a[3];
+            anon_kq();
+            for _ in 0..count {
+                let Some(w) = take_worker() else { return Err(libc::EAGAIN as u64) };
+                let mut flags = flags_for(pp);
+                if flags & WQ_FLAG_THREAD_EVENT_MANAGER == 0 {
+                    flags &= !WQ_FLAG_THREAD_KEVENT;
+                }
+                let stack_top = w.pthread;
+                start_job(w, Job { flags, kevent_list: 0, nevents: 0, stack_top, wl: None });
+            }
+            Ok(0)
+        }
+        WQOPS_THREAD_KEVENT_RETURN | WQOPS_THREAD_RETURN => {
+            if a[0] == WQOPS_THREAD_KEVENT_RETURN && a[1] != 0 && (a[2] as i64) > 0 {
+                let kq = anon_kq();
+                kevent_qos(kq, a[1], a[2], 0, 0, 0, 0, KEVENT_FLAG_IMMEDIATE);
+            }
+            park();
+            Ok(0)
+        }
+        WQOPS_THREAD_WORKLOOP_RETURN => {
+            let wl = BOUND_WL.with(|b| b.get());
+            if let Some(wl_id) = wl {
+                let mut g = WL.lock().unwrap();
+                let st = g.get_or_insert_with(|| WlState { loops: HashMap::new(), sync: HashMap::new(), by_fd: HashMap::new() });
+                if a[1] != 0 && (a[2] as i64) > 0 {
+                    for i in 0..a[2] {
+                        let ke = unsafe { Kev::read(a[1] + i * KEV_SIZE) };
+                        wl_apply(st, wl_id, &ke);
+                    }
+                }
+                let kq = if let Some(w) = st.loops.get_mut(&wl_id) {
+                    w.bound = false;
+                    w.kq
+                } else {
+                    -1
+                };
+                if kq >= 0 {
+                    watch_wl_kq(kq, wl_id, false);
+                }
+                // Parking happens after this returns; the next servicer is
+                // picked by schedule() (possibly this same thread later).
+                drop(g);
+                park();
+                let mut g = WL.lock().unwrap();
+                if let Some(st) = g.as_mut() {
+                    schedule(st, wl_id);
+                }
+            } else {
+                park();
+            }
+            Ok(0)
+        }
+        op => {
+            if std::env::var_os("MACLATOR_TRACE").is_some() {
+                eprintln!("[maclator] unhandled workq op {:#x}", op);
+            }
+            Ok(0)
+        }
+    }
+}
+
+fn park() {
+    PARK.with(|p| p.set(true));
+    BOUND_WL.with(|b| b.set(None));
+    crate::engine::exit_current_thread();
+}

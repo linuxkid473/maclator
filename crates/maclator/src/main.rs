@@ -13,6 +13,7 @@ mod spawn;
 mod symbols;
 mod syscalls;
 mod threads;
+mod workq;
 
 use std::sync::atomic::Ordering;
 

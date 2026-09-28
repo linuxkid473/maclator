@@ -91,7 +91,7 @@ pub fn handle_svc(cpu: &mut Cpu) {
     }
     let trace = TRACE.load(Ordering::Relaxed);
     if trace {
-        eprintln!("[sys] {}({:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}) pc={:#x}", syscall_name(n), args[0], args[1], args[2], args[3], args[4], args[5], cpu.pc - 4);
+        eprintln!("[sys] {}#{}({:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}) pc={:#x}", syscall_name(n), n, args[0], args[1], args[2], args[3], args[4], args[5], cpu.pc - 4);
     }
     bsd(cpu, n, args);
     if trace {
@@ -196,13 +196,25 @@ fn bsd(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
         },
         SYS_BSDTHREAD_TERMINATE => threads::bsdthread_terminate(cpu, &args),
         SYS_WORKQ_OPEN => set_ok(cpu, 0, 0),
-        SYS_WORKQ_KERNRETURN => match threads::workq_kernreturn(cpu, &args) {
+        SYS_WORKQ_KERNRETURN => match crate::workq::kernreturn(cpu, &args) {
             Ok(v) => set_ok(cpu, v, 0),
             Err(e) => set_err(cpu, e),
         },
         SYS_EXECVE | SYS_POSIX_SPAWN => {
             crate::engine::flush_profile();
             let r = crate::spawn::exec_like(n, &args);
+            set_res(cpu, r);
+        }
+        374 | 375 => {
+            if TRACE.load(Ordering::Relaxed) {
+                eprintln!("[kev] #{n} fd/id={:#x} nchanges={} nevents={} flags={:#x}", args[0], args[2], args[4], args[7]);
+                for i in 0..(args[2].min(4)) {
+                    let e = args[1] + i * 72;
+                    let v = unsafe { std::slice::from_raw_parts(e as *const u64, 9) };
+                    eprintln!("[kev]   change ident={:#x} filter={} flags={:#x} qos={:#x} udata={:#x} fflags={:#x}", v[0], (v[1] & 0xffff) as i16, (v[1] >> 16) & 0xffff, v[1] >> 32, v[2], v[3] & 0xffffffff);
+                }
+            }
+            let r = crate::workq::kevent_redirect(n, &args).unwrap_or_else(|| hostsys::unix(n, &args));
             set_res(cpu, r);
         }
         _ => {
@@ -345,6 +357,6 @@ pub fn syscall_name(n: u64) -> &'static str {
         521 => "abort_with_payload",
         536 => "shared_region_map_and_slide_2_np",
         550 => "map_with_linking_np",
-        _ => "sys",
+        _ => "?",
     }
 }

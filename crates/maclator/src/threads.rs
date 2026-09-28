@@ -21,7 +21,10 @@ const PTHREAD_START_CUSTOM: u64 = 0x0100_0000;
 const PTHREAD_START_TSD_BASE_SET: u64 = 0x1000_0000;
 const PTHREAD_START_SUSPENDED: u64 = 0x0200_0000;
 
-const PTHREAD_FEATURE_SUPPORTED: u64 = 0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x4000_0000 | 0x40 | 0x80 | 0x100;
+// DISPATCHFUNC | FINEPRIO | BSDTHREADCTL | SETSELF | QOS_MAINTENANCE | QOS_DEFAULT | KEVENT.
+// Workloops are not offered: libdispatch then drives everything through the
+// kevent workqueue, which Maclator emulates on top of a host kqueue.
+const PTHREAD_FEATURE_SUPPORTED: u64 = 0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x4000_0000 | 0x40 | 0x80;
 
 /// bsdthread_register(threadstart, wqthread, pthsize, init_data, init_data_size, dispatchqueue_offset)
 pub fn bsdthread_register(a: &[u64; 8]) -> Result<u64, u64> {
@@ -138,90 +141,13 @@ pub fn bsdthread_terminate(_cpu: &mut Cpu, a: &[u64; 8]) {
     crate::engine::exit_current_thread();
 }
 
-// ---------------- workqueue ----------------
-
-const WQOPS_THREAD_RETURN: u64 = 0x004;
-const WQOPS_QUEUE_NEWSPISUPP: u64 = 0x010;
-const WQOPS_QUEUE_REQTHREADS: u64 = 0x020;
-const WQOPS_QUEUE_REQTHREADS2: u64 = 0x030;
-const WQOPS_THREAD_KEVENT_RETURN: u64 = 0x040;
-const WQOPS_SET_EVENT_MANAGER_PRIORITY: u64 = 0x080;
-const WQOPS_THREAD_WORKLOOP_RETURN: u64 = 0x100;
-const WQOPS_SHOULD_NARROW: u64 = 0x200;
-const WQOPS_SETUP_DISPATCH: u64 = 0x400;
-
-const WQ_FLAG_THREAD_NEWSPI: u64 = 0x0080_0000;
-const WQ_FLAG_THREAD_REUSE: u64 = 0x0002_0000;
-const WQ_FLAG_THREAD_TSD_BASE_SET: u64 = 0x0020_0000;
-
-static WQ_PENDING: Mutex<Vec<u64>> = Mutex::new(Vec::new());
-static WQ_IDLE: std::sync::Condvar = std::sync::Condvar::new();
-
-/// workq_kernreturn(options, item, affinity, prio)
-pub fn workq_kernreturn(cpu: &mut Cpu, a: &[u64; 8]) -> Result<u64, u64> {
-    let op = a[0];
-    match op {
-        WQOPS_QUEUE_NEWSPISUPP | WQOPS_SET_EVENT_MANAGER_PRIORITY | WQOPS_SETUP_DISPATCH => Ok(0),
-        WQOPS_SHOULD_NARROW => Ok(0),
-        WQOPS_QUEUE_REQTHREADS | WQOPS_QUEUE_REQTHREADS2 => {
-            let count = a[1].max(1);
-            let prio = a[3];
-            for _ in 0..count {
-                start_wq_thread(prio);
-            }
-            Ok(0)
-        }
-        WQOPS_THREAD_RETURN | WQOPS_THREAD_KEVENT_RETURN | WQOPS_THREAD_WORKLOOP_RETURN => {
-            // The worker is done: park it until more work is requested, then
-            // restart it at the wqthread entry (REUSE).
-            let _ = cpu;
-            crate::engine::exit_current_thread();
-            Ok(0)
-        }
-        _ => {
-            if std::env::var_os("MACLATOR_TRACE").is_some() {
-                eprintln!("[maclator] unhandled workq op {:#x}", op);
-            }
-            Ok(0)
-        }
-    }
-}
-
-fn start_wq_thread(prio: u64) {
-    let start = WQTHREAD_START.load(Ordering::SeqCst);
-    let tsd_off = TSD_OFFSET.load(Ordering::SeqCst) as u64;
-    let pthsize = PTHSIZE.load(Ordering::SeqCst).max(0x1000);
-    // Allocate stack + pthread struct like the kernel does.
-    let stack_size: u64 = 512 * 1024;
-    let guard: u64 = 0x4000;
-    let total = guard + stack_size + ((pthsize + 0xfff) & !0xfff);
-    let base = unsafe {
-        let p = libc::mmap(std::ptr::null_mut(), total as usize, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0);
-        if p == libc::MAP_FAILED {
-            return;
-        }
-        libc::mprotect(p, guard as usize, libc::PROT_NONE);
-        p as u64
-    };
-    let stack_top = base + guard + stack_size;
-    let pthread = stack_top;
-    let _ = &WQ_PENDING;
-    let _ = &WQ_IDLE;
-    let mut cpu = Cpu::new();
-    cpu.pc = start;
-    cpu.x[0] = pthread;
-    cpu.x[2] = stack_top - stack_size; // stackaddr (low)
-    cpu.x[3] = 0; // kevent list
-    let mut flags = WQ_FLAG_THREAD_NEWSPI | (prio & 0xffff);
-    if tsd_off != 0 {
-        cpu.tpidrro_el0 = pthread + tsd_off;
-        flags |= WQ_FLAG_THREAD_TSD_BASE_SET;
-    }
-    let _ = WQ_FLAG_THREAD_REUSE;
-    cpu.x[4] = 0;
-    cpu.x[5] = flags;
-    cpu.x[31] = stack_top & !0xf;
-    spawn_guest(cpu, move |c| {
-        c.x[1] = unsafe { libc::mach_thread_self() } as u64;
-    });
+// The workqueue (libdispatch worker threads and kernel event delivery) lives
+// in `workq.rs`; it needs the registration data kept here.
+pub fn wq_registration() -> (u64, u64, u64, u64) {
+    (
+        WQTHREAD_START.load(Ordering::SeqCst),
+        TSD_OFFSET.load(Ordering::SeqCst) as u64,
+        MACH_THREAD_SELF_OFFSET.load(Ordering::SeqCst) as u64,
+        PTHSIZE.load(Ordering::SeqCst),
+    )
 }

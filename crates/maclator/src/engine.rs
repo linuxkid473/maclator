@@ -71,7 +71,41 @@ pub fn crash(cpu: &Cpu, why: &str) -> ! {
         }
     }
     crate::symbols::backtrace(cpu);
+    // Strings materialised by ADRP+ADD just before the crash (crash messages).
+    for i in 1..24u64 {
+        let a = cpu.pc.wrapping_sub(i * 4);
+        let (Some(w1), Some(w2)) = (read_insn(a), read_insn(a + 4)) else { continue };
+        if w1 & 0x9F00_0000 == 0x9000_0000 && w2 & 0xFFC0_0000 == 0x9100_0000 && (w1 & 31) == ((w2 >> 5) & 31) {
+            let immlo = ((w1 >> 29) & 3) as u64;
+            let immhi = ((w1 >> 5) & 0x7ffff) as u64;
+            let imm = (((immhi << 2) | immlo) << 43) as i64 >> 31;
+            let page = (a & !0xfff).wrapping_add(imm as u64);
+            let target = page + ((w2 >> 10) & 0xfff) as u64;
+            let mut b = [0u8; 160];
+            if crate::guestmem::read(target, &mut b) {
+                let len = b.iter().position(|&c| c == 0).unwrap_or(0);
+                if len >= 6 && b[..len].iter().all(|&c| (0x20..0x7f).contains(&c)) {
+                    eprintln!("  message? \"{}\"", String::from_utf8_lossy(&b[..len]));
+                }
+            }
+        }
+    }
+    // Registers that look like C strings often carry the crash reason.
+    for i in 0..31 {
+        let mut b = [0u8; 96];
+        if crate::guestmem::read(cpu.x[i], &mut b) {
+            let len = b.iter().position(|&c| c == 0).unwrap_or(0);
+            if len >= 6 && b[..len].iter().all(|&c| (0x20..0x7f).contains(&c) || c == b'\n') {
+                eprintln!("  x{i} -> \"{}\"", String::from_utf8_lossy(&b[..len]));
+            }
+        }
+    }
     std::process::exit(134);
+}
+
+fn read_insn(a: u64) -> Option<u32> {
+    let w = crate::guestmem::read_u64(a & !7)?;
+    Some(if a & 4 != 0 { (w >> 32) as u32 } else { w as u32 })
 }
 
 /// Plain interpreter loop (used by `--interp` and as the reference path).

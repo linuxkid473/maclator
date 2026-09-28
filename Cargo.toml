@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/maclator", "crates/difftest"]
+
+[profile.release]
+debug = 1
+opt-level = 3
+panic = "abort"
+
+[profile.dev]
+opt-level = 1
+panic = "abort"

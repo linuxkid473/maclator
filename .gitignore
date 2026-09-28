@@ -1,0 +1,4 @@
+/target
+/ref/tree_*.json
+/tests/guest/*
+!/tests/guest/*.c

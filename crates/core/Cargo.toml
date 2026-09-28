@@ -1,0 +1,9 @@
+[package]
+name = "maclator-core"
+version = "0.1.0"
+edition = "2021"
+description = "Guest ARM64 CPU model, decoder and reference interpreter for Maclator"
+
+[dependencies]
+yaxpeax-arch = "0.3"
+yaxpeax-arm = "0.5"

@@ -86,7 +86,7 @@ pub fn vfp_expand_imm(imm8: u32) -> u64 {
     (a << 63) | (exp << 52) | (efgh << 48)
 }
 
-fn adv_simd_expand_imm(op: u32, cmode: u32, imm8: u32) -> u64 {
+pub fn adv_simd_expand_imm(op: u32, cmode: u32, imm8: u32) -> u64 {
     let imm8 = imm8 as u64;
     let rep32 = |v: u64| v | (v << 32);
     let rep16 = |v: u64| v | (v << 16) | (v << 32) | (v << 48);

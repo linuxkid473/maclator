@@ -47,7 +47,7 @@ pub fn run_selftest(class: &str, count: usize) {
             (u32::from_str_radix(p[0], 16).unwrap(), u32::from_str_radix(p[1], 16).unwrap())
         }
     };
-    let is_mem = class == "ldst";
+    let is_mem = class == "ldst" || std::env::var_os("MACLATOR_SELFTEST_MEM").is_some();
     let page = unsafe {
         libc::mmap(std::ptr::null_mut(), 0x1000, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0) as u64
     };
@@ -83,7 +83,7 @@ pub fn run_selftest(class: &str, count: usize) {
             }
         }
         // SIMD structure loads/stores with register post-increment
-        if is_mem && insn & 0xBF00_0000 == 0x0C00_0000 {
+        if is_mem && insn & 0xBF00_0000 == 0x0C00_0000 && std::env::var_os("MACLATOR_SELFTEST_SIMDMEM").is_none() {
             skipped += 1;
             continue;
         }
@@ -166,4 +166,21 @@ fn clone_cpu(c: &Cpu) -> Cpu {
     n.tpidr_el0 = c.tpidr_el0;
     n.tpidrro_el0 = c.tpidrro_el0;
     n
+}
+
+
+/// `maclator --jit-dump <hex insn>...`: translate the instructions as one block and print the
+/// generated x86 code as hex (disassemble with objdump on a .byte file).
+pub fn dump_block(words: &[u32]) {
+    let page = unsafe {
+        libc::mmap(std::ptr::null_mut(), 0x1000, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0) as u64
+    };
+    for (i, w) in words.iter().enumerate() {
+        unsafe { *((page + 4 * i as u64) as *mut u32) = *w };
+    }
+    unsafe { *((page + 4 * words.len() as u64) as *mut u32) = 0xD400_1001 };
+    let host = translate(page);
+    let bytes = unsafe { std::slice::from_raw_parts(host as *const u8, 512) };
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    println!("{hex}");
 }

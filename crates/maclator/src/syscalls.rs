@@ -207,9 +207,15 @@ fn bsd_inner(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
             crate::signals::sigreturn(cpu, args[0], args[1] as i32);
         }
         SYS_MMAP => {
+            let was_exec = args[2] & PROT_EXEC != 0;
             args[2] &= !PROT_EXEC;
             args[3] &= !MAP_JIT;
             let r = mmap_16k(&args);
+            // dyld maps a library's __TEXT (file offset 0, executable) at its final address:
+            // register it with the AOT cache so translations persist across runs.
+            if !r.carry && was_exec && args[5] == 0 && (args[4] as i64) >= 0 && args[1] >= 0x1000 {
+                crate::aot::register_image_at(r.rax);
+            }
             set_res(cpu, r);
         }
         SYS_MPROTECT => {
@@ -462,6 +468,47 @@ fn mach_trap(cpu: &mut Cpu, n: u64) {
         _ => {}
     }
     let args = [cpu.x[0], cpu.x[1], cpu.x[2], cpu.x[3], cpu.x[4], cpu.x[5], cpu.x[6], cpu.x[7]];
+    if n == 10 && args[3] & 1 != 0 && args[1] != 0 && args[2] != 0 {
+        // mach_vm_allocate(VM_FLAGS_ANYWHERE): place it from a deterministic arena so that
+        // dyld-loaded libraries land at the same addresses every run (persistent AOT cache).
+        // The arena is a large PROT_NONE reservation; allocations overwrite pieces of it.
+        const ARENA_SIZE: u64 = 64 << 30;
+        static ARENA: std::sync::OnceLock<(u64, std::sync::atomic::AtomicU64)> = std::sync::OnceLock::new();
+        let (base, next) = ARENA.get_or_init(|| {
+            for cand in [0x40_0000_0000u64, 0x20_0000_0000, 0x10_0000_0000, 0x0c_0000_0000, 0x08_0000_0000] {
+                let p = unsafe {
+                    libc::mmap(cand as *mut _, ARENA_SIZE as usize, libc::PROT_NONE, libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE, -1, 0)
+                };
+                if p as u64 == cand {
+                    return (cand, std::sync::atomic::AtomicU64::new(0));
+                }
+                if p != libc::MAP_FAILED {
+                    unsafe { libc::munmap(p, ARENA_SIZE as usize) };
+                }
+            }
+            (0, std::sync::atomic::AtomicU64::new(0))
+        });
+        let sz = (args[2] + 0x3fff) & !0x3fff;
+        if *base != 0 {
+            let off = next.fetch_add(sz, Ordering::SeqCst);
+            if off + sz <= ARENA_SIZE {
+                let at = base + off;
+                let orig_hint = unsafe { *(args[1] as *const u64) };
+                unsafe { *(args[1] as *mut u64) = at };
+                let mut fixed = args;
+                fixed[3] = (fixed[3] & !1) | 0x4000; // fixed + VM_FLAGS_OVERWRITE
+                let r = hostsys::mach(n, &fixed);
+                if r.rax == 0 {
+                    cpu.x[0] = 0;
+                    return;
+                }
+                if trace {
+                    eprintln!("[mach] arena vm_allocate at {at:#x} size {sz:#x} failed: {:#x}", r.rax);
+                }
+                unsafe { *(args[1] as *mut u64) = orig_hint };
+            }
+        }
+    }
     if n == 47 && crate::iokit::intercept(args[0], args[1]) {
         if trace {
             eprintln!("[mach] msg2 answered by iokit shim");

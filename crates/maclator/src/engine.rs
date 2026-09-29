@@ -62,6 +62,19 @@ extern "C" fn dump_current(_: i32) {
             cpu.x[22],
         );
         libc::write(2, buf.as_ptr() as *const libc::c_void, n.max(0) as usize);
+        let (blocks, ms, interp, entries, fb) = crate::jit::stats_snapshot();
+        let n = libc::snprintf(
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            b"[stats] pid %d translated=%llu blocks in %llu ms, cold-interpreted=%llu blocks, block-entries=%llu, fallback-insns=%llu\n\0".as_ptr() as *const libc::c_char,
+            libc::getpid(),
+            blocks,
+            ms,
+            interp,
+            entries,
+            fb,
+        );
+        libc::write(2, buf.as_ptr() as *const libc::c_void, n.max(0) as usize);
     }
 }
 

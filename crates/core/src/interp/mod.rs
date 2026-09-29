@@ -116,7 +116,7 @@ pub(crate) fn add_with_carry(x: u64, y: u64, carry: u64, sf: bool) -> (u64, u32)
 }
 
 /// DecodeBitMasks from the ARM ARM. Returns (wmask, tmask).
-pub(crate) fn decode_bit_masks(n: u32, imms: u32, immr: u32, immediate: bool, datasize: u32) -> Option<(u64, u64)> {
+pub fn decode_bit_masks(n: u32, imms: u32, immr: u32, immediate: bool, datasize: u32) -> Option<(u64, u64)> {
     let combined = (n << 6) | (!imms & 0x3f);
     if combined == 0 {
         return None;

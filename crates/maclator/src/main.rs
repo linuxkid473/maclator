@@ -91,6 +91,12 @@ fn main() {
                     }
                 }
             }
+            "--jit-dump" => {
+                aot::set_enabled(false);
+                let words: Vec<u32> = args[1..].iter().filter_map(|w| u32::from_str_radix(w.trim_start_matches("0x"), 16).ok()).collect();
+                jit::selftest::dump_block(&words);
+                std::process::exit(0);
+            }
             "--selftest-jit" => {
                 let class = args.get(1).cloned().unwrap_or_else(|| "dpreg".into());
                 let n = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(20000);
@@ -130,7 +136,7 @@ fn main() {
     }
     let exe = resolve_path(&args[0]);
     let envp: Vec<String> = std::env::vars()
-        .filter(|(k, _)| !k.starts_with("MACLATOR_") || k == "MACLATOR_DUMP_ON_FAULT")
+        .filter(|(k, _)| !k.starts_with("MACLATOR_") || matches!(k.as_str(), "MACLATOR_DUMP_ON_FAULT" | "MACLATOR_JIT_THRESHOLD" | "MACLATOR_STATS" | "MACLATOR_FALLBACK_HIST"))
         .map(|(k, v)| format!("{k}={v}"))
         .collect();
 

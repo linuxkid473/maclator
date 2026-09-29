@@ -10,11 +10,29 @@ use maclator_core::cpu::Cpu;
 use maclator_core::interp::{self, Exit};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+
+/// Cheap multiplicative hasher for u64 keys (guest pcs / host addresses).
+#[derive(Default, Clone, Copy)]
+pub struct Fx(u64);
+impl std::hash::Hasher for Fx {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, b: &[u8]) {
+        for &x in b {
+            self.0 = (self.0.rotate_left(5) ^ x as u64).wrapping_mul(0x517c_c1b7_2722_0a95);
+        }
+    }
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0.rotate_left(5) ^ i).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
+type FastMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<Fx>>;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
 
 /// Entries in each thread's indirect-branch translation cache.
-pub const IBTC_SIZE: usize = 8192;
+pub const IBTC_SIZE: usize = 32768;
 
 const CODE_CACHE_SIZE: u64 = 4 << 30;
 
@@ -61,23 +79,35 @@ pub struct CodeCache {
 
 static CODE: OnceLock<CodeCache> = OnceLock::new();
 /// guest pc -> host code
-static BLOCKS: RwLock<Option<HashMap<u64, u64>>> = RwLock::new(None);
-/// (slot address, default continuation) for every patchable exit.
-static SLOTS: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+static BLOCKS: RwLock<Option<FastMap<u64, u64>>> = RwLock::new(None);
 static TRANSLATE: Mutex<()> = Mutex::new(());
-/// 16 KiB guest pages that hold (or may hold) translated code, so that
-/// executable-permission changes and icache flushes elsewhere are free.
-static TRANSLATED_PAGES: Mutex<Option<std::collections::HashSet<u64>>> = Mutex::new(None);
-
-fn note_pages(pc: u64) {
-    let mut g = TRANSLATED_PAGES.lock().unwrap();
-    let set = g.get_or_insert_with(std::collections::HashSet::new);
-    set.insert(pc >> 14);
-    // A block can run past its first page.
-    set.insert((pc + emit::MAX_BLOCK_INSNS as u64 * 4) >> 14);
-}
 static EPOCH: AtomicU64 = AtomicU64::new(0);
 pub static JIT_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// One translated unit: the guest range it was built from and where its code lives.
+struct UnitRec {
+    entry: u64,
+    host: u64,
+    /// Guest byte range [lo, hi) the unit's instructions may come from.
+    lo: u64,
+    hi: u64,
+    alive: bool,
+}
+
+/// Bookkeeping that makes invalidation precise: which units cover which guest
+/// pages, which chained exit slots jump into which unit, and each slot's
+/// default (return-to-dispatcher) continuation.
+#[derive(Default)]
+struct JitIndex {
+    units: Vec<UnitRec>,
+    /// 16 KiB guest page -> unit ids overlapping it.
+    pages: FastMap<u64, Vec<u32>>,
+    /// unit entry host address -> chain slots currently pointing at it.
+    incoming: FastMap<u64, Vec<u64>>,
+    slot_cont: FastMap<u64, u64>,
+}
+
+static INDEX: Mutex<Option<JitIndex>> = Mutex::new(None);
 static STATS_BLOCKS: AtomicU64 = AtomicU64::new(0);
 static STATS_INSNS: AtomicU64 = AtomicU64::new(0);
 static STATS_FALLBACK: AtomicU64 = AtomicU64::new(0);
@@ -93,7 +123,7 @@ fn hot_threshold() -> u32 {
 }
 
 thread_local! {
-    static HOT: RefCell<HashMap<u64, u32>> = RefCell::new(HashMap::new());
+    static HOT: RefCell<FastMap<u64, u32>> = RefCell::new(FastMap::default());
     static PENDING: Cell<Option<Exit>> = const { Cell::new(None) };
     static IBTC: RefCell<Option<Box<[[u64; 2]]>>> = const { RefCell::new(None) };
     static MY_EPOCH: Cell<u64> = const { Cell::new(0) };
@@ -133,14 +163,44 @@ pub fn lookup(pc: u64) -> Option<u64> {
 
 /// Register externally produced code (AOT) for `pc`.
 pub fn register_block(pc: u64, host: u64) {
-    note_pages(pc);
     let mut g = BLOCKS.write().unwrap();
-    g.get_or_insert_with(HashMap::new).entry(pc).or_insert(host);
+    g.get_or_insert_with(FastMap::default).entry(pc).or_insert(host);
 }
 
 // ---------------- helpers called from generated code ----------------
 
+static HIST_ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("MACLATOR_FALLBACK_HIST").is_some());
+static HIST: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+static HIST_N: AtomicU64 = AtomicU64::new(0);
+
+/// Count executions of instructions that fall back to the interpreter, by mnemonic,
+/// and periodically write the top of the histogram to /tmp/maclator-hist-<pid>.txt.
+fn note_fallback_exec(insn: u32) {
+    thread_local! { static TICK: Cell<u32> = const { Cell::new(0) }; }
+    // Sample 1 in 16 executions to keep the overhead small.
+    let t = TICK.with(|c| { c.set(c.get().wrapping_add(1)); c.get() });
+    if t % 16 != 0 {
+        return;
+    }
+    let text = maclator_core::disasm::disasm(insn);
+    let mn = text.split_whitespace().next().unwrap_or("?").to_string();
+    let mut g = HIST.lock().unwrap();
+    *g.get_or_insert_with(HashMap::new).entry(mn).or_insert(0) += 1;
+    if HIST_N.fetch_add(1, Ordering::Relaxed) % 5_000 == 4_999 {
+        let mut v: Vec<_> = g.as_ref().unwrap().iter().collect();
+        v.sort_by(|a, b| b.1.cmp(a.1));
+        let mut out = String::new();
+        for (k, n) in v.iter().take(60) {
+            out.push_str(&format!("{n:>12} {k}\n"));
+        }
+        let _ = std::fs::write(format!("/tmp/maclator-hist-{}.txt", std::process::id()), out);
+    }
+}
+
 extern "C" fn helper_interp(cpu: *mut Cpu, insn: u32, pc: u64) -> u64 {
+    if *HIST_ON {
+        note_fallback_exec(insn);
+    }
     let cpu = unsafe { &mut *cpu };
     cpu.pc = pc;
     match interp::exec(cpu, insn) {
@@ -229,20 +289,30 @@ fn translate_inner(pc: u64) -> u64 {
     let at = cc.alloc(bytes.len() as u64);
     assert_eq!(at, ip, "code cache raced");
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), at as *mut u8, bytes.len()) };
-    let mut slots = SLOTS.lock().unwrap();
+    let mut ix_guard = INDEX.lock().unwrap();
+    let ix = ix_guard.get_or_insert_with(JitIndex::default);
     for s in &u.finished_stubs {
         let cont = res.label_ip(&s.cont).expect("stub label");
         let slot = res.label_ip(&s.slot).expect("slot label");
         unsafe { std::ptr::write_volatile(slot as *mut u64, cont) };
-        slots.push((slot, cont));
+        ix.slot_cont.insert(slot, cont);
     }
-    drop(slots);
     crate::aot::note_translated(pc);
+    let (mut lo, mut hi) = (pc, pc);
     for &lpc in u.labels.keys() {
-        note_pages(lpc);
+        lo = lo.min(lpc);
+        hi = hi.max(lpc);
     }
+    // The last block can run up to MAX_BLOCK_INSNS instructions past its label.
+    let hi = hi + (emit::MAX_BLOCK_INSNS as u64 + 1) * 4;
+    let id = ix.units.len() as u32;
+    ix.units.push(UnitRec { entry: pc, host: at, lo, hi, alive: true });
+    for page in (lo >> 14)..=((hi - 1) >> 14) {
+        ix.pages.entry(page).or_default().push(id);
+    }
+    drop(ix_guard);
     let mut g = BLOCKS.write().unwrap();
-    g.get_or_insert_with(HashMap::new).insert(pc, at);
+    g.get_or_insert_with(FastMap::default).insert(pc, at);
     at
 }
 
@@ -250,35 +320,98 @@ fn lookup_or_translate(pc: u64) -> u64 {
     lookup(pc).unwrap_or_else(|| translate(pc))
 }
 
-/// Drop every translation (self-modifying code, new executable mappings).
-/// Threads currently inside old code leave it through their exit slots.
+/// Drop the translations built from guest code in [addr, addr+len) (self-modifying code,
+/// JIT-generated code being rewritten). Chained jumps into dropped units are reset to
+/// return to the dispatcher; threads currently inside old code leave it through their
+/// exit slots.
 pub fn invalidate_range(addr: u64, len: u64) {
     let _g = TRANSLATE.lock().unwrap();
-    {
-        // Nothing translated on these pages: nothing to drop.
-        let mut pg = TRANSLATED_PAGES.lock().unwrap();
-        let Some(set) = pg.as_mut() else { return };
-        let p0 = addr >> 14;
-        let p1 = (addr.saturating_add(len.max(1)) - 1) >> 14;
-        let n = p1 - p0 + 1;
-        let hit = if n as usize <= set.len() { (p0..=p1).any(|p| set.contains(&p)) } else { set.iter().any(|&p| p >= p0 && p <= p1) };
-        if !hit {
-            return;
+    let mut ix_guard = INDEX.lock().unwrap();
+    let Some(ix) = ix_guard.as_mut() else { return };
+    let end = addr.saturating_add(len.max(1));
+    let (p0, p1) = (addr >> 14, (end - 1) >> 14);
+    let mut victims: Vec<u32> = Vec::new();
+    if p1 - p0 < ix.pages.len() as u64 {
+        for p in p0..=p1 {
+            if let Some(v) = ix.pages.get(&p) {
+                victims.extend(v.iter().copied());
+            }
         }
-        set.clear();
+    } else {
+        for (p, v) in ix.pages.iter() {
+            if *p >= p0 && *p <= p1 {
+                victims.extend(v.iter().copied());
+            }
+        }
     }
-    let has_any = BLOCKS.read().unwrap().as_ref().map(|m| !m.is_empty()).unwrap_or(false);
-    if !has_any {
+    victims.retain(|&id| {
+        let u = &ix.units[id as usize];
+        u.alive && u.lo < end && u.hi > addr
+    });
+    if victims.is_empty() {
         return;
     }
+    victims.sort_unstable();
+    victims.dedup();
     if std::env::var_os("MACLATOR_TRACE").is_some() {
-        eprintln!("[maclator] invalidating translations ({:#x}+{:#x})", addr, len);
+        eprintln!("[maclator] invalidating {} units ({:#x}+{:#x})", victims.len(), addr, len);
     }
-    for (slot, cont) in SLOTS.lock().unwrap().iter() {
-        unsafe { std::ptr::write_volatile(*slot as *mut u64, *cont) };
+    let mut blocks = BLOCKS.write().unwrap();
+    for id in victims {
+        let (entry, host) = {
+            let u = &mut ix.units[id as usize];
+            u.alive = false;
+            (u.entry, u.host)
+        };
+        if let Some(m) = blocks.as_mut() {
+            if m.get(&entry) == Some(&host) {
+                m.remove(&entry);
+            }
+        }
+        if let Some(slots) = ix.incoming.remove(&host) {
+            for slot in slots {
+                if let Some(cont) = ix.slot_cont.get(&slot) {
+                    unsafe { std::ptr::write_volatile(slot as *mut u64, *cont) };
+                }
+            }
+        }
     }
-    *BLOCKS.write().unwrap() = Some(HashMap::new());
+    drop(blocks);
+    // Stale pages entries (dead units) are dropped lazily.
+    for p in p0..=p1.min(p0 + 64) {
+        if let Some(v) = ix.pages.get_mut(&p) {
+            let units = &ix.units;
+            v.retain(|&id| units[id as usize].alive);
+        }
+    }
     EPOCH.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Point an exit slot straight at the block for `pc`, remembering the link so the
+/// target can be unlinked if it is invalidated.
+fn chain_slot(slot: u64, pc: u64, target: u64) {
+    let _g = TRANSLATE.lock().unwrap();
+    if lookup(pc) != Some(target) {
+        return;
+    }
+    let mut ix_guard = INDEX.lock().unwrap();
+    let ix = ix_guard.get_or_insert_with(JitIndex::default);
+    if !ix.slot_cont.contains_key(&slot) {
+        return; // not a slot we own (AOT code)
+    }
+    unsafe { std::ptr::write_volatile(slot as *mut u64, target) };
+    ix.incoming.entry(target).or_default().push(slot);
+}
+
+/// (blocks translated, ms translating, cold blocks interpreted, translated-block entries, fallback insns)
+pub fn stats_snapshot() -> (u64, u64, u64, u64, u64) {
+    (
+        STATS_BLOCKS.load(Ordering::Relaxed),
+        STATS_TRANSLATE_NS.load(Ordering::Relaxed) / 1_000_000,
+        STATS_INTERP_BLOCKS.load(Ordering::Relaxed),
+        STATS_JIT_ENTRIES.load(Ordering::Relaxed),
+        STATS_FALLBACK.load(Ordering::Relaxed),
+    )
 }
 
 pub fn flush_profile() {
@@ -487,6 +620,9 @@ pub fn run(cpu: &mut Cpu) {
                     *c += 1;
                     *c
                 });
+                if n == 1 {
+                    crate::aot::note_translated(pc);
+                }
                 if n < hot_threshold() {
                     STATS_INTERP_BLOCKS.fetch_add(1, Ordering::Relaxed);
                     if !interp_block(cpu) {
@@ -510,9 +646,7 @@ pub fn run(cpu: &mut Cpu) {
                 if slot != 0 && !verify_mode() {
                     // Chain: point the exit slot straight at the target block.
                     let target = lookup_or_translate(cpu.pc);
-                    if EPOCH.load(Ordering::Relaxed) == epoch {
-                        unsafe { std::ptr::write_volatile(slot as *mut u64, target) };
-                    }
+                    chain_slot(slot, cpu.pc, target);
                 }
             }
             EXIT_SVC => {

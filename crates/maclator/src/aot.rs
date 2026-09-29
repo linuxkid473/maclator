@@ -21,9 +21,9 @@ use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-const MAGIC: &[u8; 8] = b"MCLAOT03";
+const MAGIC: &[u8; 8] = b"MCLAOT04";
 /// Bump when the translator's output changes.
-const TRANSLATOR_VERSION: u32 = 4;
+const TRANSLATOR_VERSION: u32 = 9;
 
 #[derive(Clone)]
 struct Image {
@@ -95,6 +95,67 @@ pub fn register_cache(uuid: [u8; 16], start: u64, end: u64) {
     ensure_loaded();
 }
 
+/// Register the arm64 Mach-O whose header is mapped at `addr` (a dyld-loaded library or
+/// helper image). Keyed by UUID and load address, so it only hits the cache when the
+/// library loads at the same place again.
+pub fn register_image_at(addr: u64) {
+    if !ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let rd = |o: u64| unsafe { std::ptr::read_unaligned((addr + o) as *const u32) };
+    // mach_header_64: magic, cputype, ..., ncmds at +16, sizeofcmds at +20
+    if rd(0) != 0xfeed_facf || rd(4) != 0x0100_000c {
+        if std::env::var_os("MACLATOR_STATS").is_some() {
+            eprintln!("[maclator] aot: mmap exec at {addr:#x} not an arm64 mach-o ({:#x} {:#x})", rd(0), rd(4));
+        }
+        return;
+    }
+    let ncmds = rd(16);
+    let mut off = 32u64;
+    let mut uuid = [0u8; 16];
+    let (mut text_vm, mut lo, mut hi) = (u64::MAX, u64::MAX, 0u64);
+    for _ in 0..ncmds.min(512) {
+        let cmd = rd(off);
+        let size = rd(off + 4) as u64;
+        if size < 8 || off + size > 0x4000 {
+            return;
+        }
+        if cmd == 0x1b {
+            for i in 0..16 {
+                uuid[i] = unsafe { *((addr + off + 8 + i as u64) as *const u8) };
+            }
+        } else if cmd == 0x19 {
+            let mut name = [0u8; 16];
+            for i in 0..16 {
+                name[i] = unsafe { *((addr + off + 8 + i as u64) as *const u8) };
+            }
+            let vmaddr = unsafe { std::ptr::read_unaligned((addr + off + 24) as *const u64) };
+            let vmsize = unsafe { std::ptr::read_unaligned((addr + off + 32) as *const u64) };
+            if name.starts_with(b"__PAGEZERO") {
+                off += size;
+                continue;
+            }
+            if name.starts_with(b"__TEXT\0") {
+                text_vm = vmaddr;
+            }
+            lo = lo.min(vmaddr);
+            hi = hi.max(vmaddr + vmsize);
+        }
+        off += size;
+    }
+    if text_vm == u64::MAX || uuid == [0u8; 16] || hi <= lo {
+        return;
+    }
+    let slide = addr.wrapping_sub(text_vm);
+    let (start, end) = (lo.wrapping_add(slide), hi.wrapping_add(slide));
+    let key = format!("lib-{}-{:x}", hex(&uuid), start);
+    if std::env::var_os("MACLATOR_STATS").is_some() {
+        eprintln!("[maclator] aot: registered image {key} [{start:#x}, {end:#x})");
+    }
+    add_image(Image { name: format!("lib-{}", &hex(&uuid)[..8]), key, start, end, entries: vec![], loaded: false });
+    ensure_loaded();
+}
+
 fn add_image(img: Image) {
     let mut v = IMAGES.lock().unwrap();
     if v.iter().any(|i| i.key == img.key) {
@@ -104,14 +165,55 @@ fn add_image(img: Image) {
     SEEN.lock().unwrap().push(HashSet::new());
 }
 
+thread_local! {
+    /// (start, end, image index) of the image this thread last recorded a block in.
+    static LAST_IMG: std::cell::Cell<(u64, u64, usize)> = const { std::cell::Cell::new((1, 0, 0)) };
+    static PENDING: std::cell::RefCell<Vec<(usize, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Record that the guest block at `pc` executed (JIT-translated or cold-interpreted), so the
+/// next AOT build covers it.
 pub fn note_translated(pc: u64) {
     if !ENABLED.load(Ordering::Relaxed) {
         return;
     }
-    let imgs = IMAGES.lock().unwrap();
-    if let Some(i) = imgs.iter().position(|im| pc >= im.start && pc < im.end) {
-        drop(imgs);
-        SEEN.lock().unwrap()[i].insert(pc);
+    let (start, end, idx) = LAST_IMG.with(|l| l.get());
+    let idx = if pc >= start && pc < end {
+        idx
+    } else {
+        let imgs = IMAGES.lock().unwrap();
+        match imgs.iter().position(|im| pc >= im.start && pc < im.end) {
+            Some(i) => {
+                LAST_IMG.with(|l| l.set((imgs[i].start, imgs[i].end, i)));
+                i
+            }
+            None => return,
+        }
+    };
+    // Batch inserts so the global lock is taken once per 256 blocks.
+    let flush = PENDING.with(|p| {
+        let mut p = p.borrow_mut();
+        p.push((idx, pc));
+        if p.len() >= 256 {
+            Some(std::mem::take(&mut *p))
+        } else {
+            None
+        }
+    });
+    if let Some(batch) = flush {
+        let mut seen = SEEN.lock().unwrap();
+        for (i, pc) in batch {
+            seen[i].insert(pc);
+        }
+    }
+}
+
+/// Publish this thread's not-yet-flushed blocks (called before saving the profile).
+pub fn flush_pending() {
+    let batch = PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()));
+    let mut seen = SEEN.lock().unwrap();
+    for (i, pc) in batch {
+        seen[i].insert(pc);
     }
 }
 
@@ -141,31 +243,45 @@ pub fn ensure_loaded() {
     }
 }
 
+const CODE_ALIGN: usize = 0x4000;
+
+fn code_offset(n: usize) -> usize {
+    (32 + n * 16 + CODE_ALIGN - 1) & !(CODE_ALIGN - 1)
+}
+
 fn load_file(path: &std::path::Path) -> std::io::Result<usize> {
+    use std::os::unix::io::AsRawFd;
     let mut f = std::fs::File::open(path)?;
-    let mut data = Vec::new();
-    f.read_to_end(&mut data)?;
-    if data.len() < 32 || &data[..8] != MAGIC {
+    let mut head = [0u8; 32];
+    if f.read_exact(&mut head).is_err() || &head[..8] != MAGIC {
         return Ok(0);
     }
-    let rd32 = |o: usize| u32::from_le_bytes(data[o..o + 4].try_into().unwrap());
-    let rd64 = |o: usize| u64::from_le_bytes(data[o..o + 8].try_into().unwrap());
-    if rd32(8) != TRANSLATOR_VERSION || rd32(12) != flags_word() {
+    let rd32 = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+    let rd64 = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+    if rd32(&head, 8) != TRANSLATOR_VERSION || rd32(&head, 12) != flags_word() {
         return Ok(0);
     }
-    let n = rd64(16) as usize;
-    let code_len = rd64(24) as usize;
-    let idx = 32;
-    let code_off = idx + n * 16;
-    if data.len() < code_off + code_len {
+    let n = rd64(&head, 16) as usize;
+    let code_len = rd64(&head, 24) as usize;
+    let code_off = code_offset(n);
+    let mut idx = vec![0u8; n * 16];
+    f.read_exact(&mut idx)?;
+    if f.metadata()?.len() < (code_off + code_len) as u64 {
         return Ok(0);
     }
-    let cc = crate::jit::code_cache();
-    let base = cc.alloc(code_len as u64);
-    unsafe { std::ptr::copy_nonoverlapping(data[code_off..].as_ptr(), base as *mut u8, code_len) };
+    // Map the code straight from the file: pages are shared between processes and
+    // only faulted in when used.
+    let map_len = (code_len + CODE_ALIGN - 1) & !(CODE_ALIGN - 1);
+    let base = unsafe {
+        libc::mmap(std::ptr::null_mut(), map_len, libc::PROT_READ | libc::PROT_EXEC, libc::MAP_PRIVATE, f.as_raw_fd(), code_off as i64)
+    };
+    if base == libc::MAP_FAILED {
+        return Ok(0);
+    }
+    let base = base as u64;
     for i in 0..n {
-        let pc = rd64(idx + i * 16);
-        let off = rd64(idx + i * 16 + 8);
+        let pc = rd64(&idx, i * 16);
+        let off = rd64(&idx, i * 16 + 8);
         crate::jit::register_block(pc, base + off);
     }
     Ok(n)
@@ -187,6 +303,7 @@ pub fn save_profile() {
     if !ENABLED.load(Ordering::Relaxed) || SAVED.swap(true, Ordering::SeqCst) {
         return;
     }
+    flush_pending();
     let imgs = IMAGES.lock().unwrap().clone();
     let seen = SEEN.lock().unwrap().clone();
     let _ = std::fs::create_dir_all(cache_dir());
@@ -333,6 +450,9 @@ fn build(img: &Image, profile: &BTreeSet<u64>) -> std::io::Result<()> {
     for (pc, off) in &index {
         hdr.extend_from_slice(&pc.to_le_bytes());
         hdr.extend_from_slice(&off.to_le_bytes());
+    }
+    while hdr.len() < code_offset(index.len()) {
+        hdr.push(0);
     }
     f.write_all(&hdr)?;
     f.write_all(&code)?;

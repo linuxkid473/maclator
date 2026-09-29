@@ -409,6 +409,8 @@ pub fn is_terminator(insn: u32) -> bool {
 pub fn emit_block(u: &mut Unit, pc: u64, read: &dyn Fn(u64) -> Option<u32>) -> u64 {
     let mut label = *u.labels.get(&pc).expect("block label");
     u.a.set_label(&mut label).unwrap();
+    // set_label updates the label; keep the updated value for label_ip().
+    u.labels.insert(pc, label);
     let mut cur = pc;
     let mut count = 0;
     loop {

@@ -127,6 +127,9 @@ fn main() {
         let (lo, hi) = m.vm_range();
         let entries = aot::function_starts(&exe, m, loaded.main.slide);
         aot::register_main(&exe, m.uuid, lo.wrapping_add(loaded.main.slide), hi.wrapping_add(loaded.main.slide), entries);
+        let d = &loaded.dyld.macho;
+        let (lo, hi) = d.vm_range();
+        aot::register_dyld(&dyld, d.uuid, lo.wrapping_add(loaded.dyld.slide), hi.wrapping_add(loaded.dyld.slide));
     }
     engine::run_thread(&mut cpu);
     // The main thread ended (pthread_exit on main): wait for other threads.

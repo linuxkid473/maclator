@@ -82,6 +82,12 @@ pub fn register_main(path: &str, uuid: [u8; 16], start: u64, end: u64, entries: 
     add_image(Image { name: path.rsplit('/').next().unwrap_or(path).to_string(), key, start, end, entries, loaded: false });
 }
 
+/// Register dyld (also mapped at a fixed address).
+pub fn register_dyld(path: &str, uuid: [u8; 16], start: u64, end: u64) {
+    let key = format!("dyld-{}-{}", hex(&uuid), fnv(&[path.as_bytes()]));
+    add_image(Image { name: "dyld".into(), key, start, end, entries: vec![], loaded: false });
+}
+
 /// Register the shared cache once dyld has had us map it.
 pub fn register_cache(uuid: [u8; 16], start: u64, end: u64) {
     let key = format!("dsc-{}", hex(&uuid));

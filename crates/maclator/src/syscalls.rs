@@ -145,6 +145,10 @@ fn bsd(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
         }
         SYS_SYSCTLBYNAME => {
             let name = cstr_at(args[0]);
+            if name == "hw.machine" {
+                write_sysctl_str(cpu, args[2], args[3], "arm64");
+                return;
+            }
             if let Some(v) = sysctl_override(&name) {
                 write_sysctl_int(cpu, args[2], args[3], v);
                 return;
@@ -153,6 +157,12 @@ fn bsd(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
             set_res(cpu, r);
         }
         SYS_SYSCTL => {
+            // hw.machine (CTL_HW=6, HW_MACHINE=1) is what uname() reports.
+            let mib = unsafe { std::slice::from_raw_parts(args[0] as *const i32, (args[1] as usize).min(8)) };
+            if args[1] == 2 && mib == [6, 1] {
+                write_sysctl_str(cpu, args[2], args[3], "arm64");
+                return;
+            }
             let r = hostsys::unix(n, &args);
             set_res(cpu, r);
         }
@@ -224,6 +234,24 @@ fn bsd(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
             set_res(cpu, r);
         }
     }
+}
+
+fn write_sysctl_str(cpu: &mut Cpu, oldp: u64, oldlenp: u64, v: &str) {
+    let bytes = [v.as_bytes(), &[0]].concat();
+    unsafe {
+        if oldlenp != 0 {
+            let len = *(oldlenp as *const u64) as usize;
+            if oldp != 0 {
+                if len < bytes.len() {
+                    set_err(cpu, libc::ENOMEM as u64);
+                    return;
+                }
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), oldp as *mut u8, bytes.len());
+            }
+            *(oldlenp as *mut u64) = bytes.len() as u64;
+        }
+    }
+    set_ok(cpu, 0, 0);
 }
 
 fn write_sysctl_int(cpu: &mut Cpu, oldp: u64, oldlenp: u64, v: i64) {

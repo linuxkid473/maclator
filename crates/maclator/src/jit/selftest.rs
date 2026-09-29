@@ -55,6 +55,7 @@ pub fn run_selftest(class: &str, count: usize) {
     let bufp = buf.as_mut_ptr() as u64;
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
     let (mut ok, mut bad, mut skipped) = (0, 0, 0);
+    let mut native = 0u64;
     for _ in 0..count {
         let mut insn = (rng.next() as u32 & !mask) | val;
         let branch = class == "branch";
@@ -116,7 +117,11 @@ pub fn run_selftest(class: &str, count: usize) {
         let mut j = Cpu::new();
         *j = clone_cpu(&init);
         setup_cpu(&mut j);
+        let fb0 = STATS_FALLBACK.load(Ordering::Relaxed);
         let host = lookup_or_translate(page);
+        if STATS_FALLBACK.load(Ordering::Relaxed) == fb0 {
+            native += 1;
+        }
         unsafe { maclator_jit_enter(&mut *j, host) };
         let pending = PENDING.with(|p| p.take());
         if j.exit_reason == EXIT_PENDING || pending.is_some() {
@@ -153,7 +158,7 @@ pub fn run_selftest(class: &str, count: usize) {
         }
         buf.copy_from_slice(&mem0);
     }
-    println!("jit selftest [{class}]: ok={ok} mismatch={bad} skipped={skipped}");
+    println!("jit selftest [{class}]: ok={ok} mismatch={bad} skipped={skipped} native={native}");
 }
 
 fn clone_cpu(c: &Cpu) -> Cpu {

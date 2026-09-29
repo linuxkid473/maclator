@@ -183,7 +183,9 @@ fn note_fallback_exec(insn: u32) {
         return;
     }
     let text = maclator_core::disasm::disasm(insn);
-    let mn = text.split_whitespace().next().unwrap_or("?").to_string();
+    // mnemonic plus operand shape (register numbers and immediates collapsed)
+    let mn: String = text.chars().map(|c| if c.is_ascii_digit() { 'N' } else { c }).collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ");
+    let mn = if mn.len() > 60 { mn[..60].to_string() } else { mn };
     let mut g = HIST.lock().unwrap();
     *g.get_or_insert_with(HashMap::new).entry(mn).or_insert(0) += 1;
     if HIST_N.fetch_add(1, Ordering::Relaxed) % 5_000 == 4_999 {

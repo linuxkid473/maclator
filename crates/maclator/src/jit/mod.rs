@@ -16,7 +16,7 @@ use std::sync::{Mutex, OnceLock, RwLock};
 /// Entries in each thread's indirect-branch translation cache.
 pub const IBTC_SIZE: usize = 8192;
 
-const CODE_CACHE_SIZE: u64 = 1 << 30;
+const CODE_CACHE_SIZE: u64 = 4 << 30;
 
 std::arch::global_asm!(
     ".globl _maclator_jit_enter",
@@ -65,6 +65,17 @@ static BLOCKS: RwLock<Option<HashMap<u64, u64>>> = RwLock::new(None);
 /// (slot address, default continuation) for every patchable exit.
 static SLOTS: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 static TRANSLATE: Mutex<()> = Mutex::new(());
+/// 16 KiB guest pages that hold (or may hold) translated code, so that
+/// executable-permission changes and icache flushes elsewhere are free.
+static TRANSLATED_PAGES: Mutex<Option<std::collections::HashSet<u64>>> = Mutex::new(None);
+
+fn note_pages(pc: u64) {
+    let mut g = TRANSLATED_PAGES.lock().unwrap();
+    let set = g.get_or_insert_with(std::collections::HashSet::new);
+    set.insert(pc >> 14);
+    // A block can run past its first page.
+    set.insert((pc + emit::MAX_BLOCK_INSNS as u64 * 4) >> 14);
+}
 static EPOCH: AtomicU64 = AtomicU64::new(0);
 pub static JIT_ENABLED: AtomicBool = AtomicBool::new(true);
 static STATS_BLOCKS: AtomicU64 = AtomicU64::new(0);
@@ -122,6 +133,7 @@ pub fn lookup(pc: u64) -> Option<u64> {
 
 /// Register externally produced code (AOT) for `pc`.
 pub fn register_block(pc: u64, host: u64) {
+    note_pages(pc);
     let mut g = BLOCKS.write().unwrap();
     g.get_or_insert_with(HashMap::new).entry(pc).or_insert(host);
 }
@@ -226,6 +238,9 @@ fn translate_inner(pc: u64) -> u64 {
     }
     drop(slots);
     crate::aot::note_translated(pc);
+    for &lpc in u.labels.keys() {
+        note_pages(lpc);
+    }
     let mut g = BLOCKS.write().unwrap();
     g.get_or_insert_with(HashMap::new).insert(pc, at);
     at
@@ -239,6 +254,19 @@ fn lookup_or_translate(pc: u64) -> u64 {
 /// Threads currently inside old code leave it through their exit slots.
 pub fn invalidate_range(addr: u64, len: u64) {
     let _g = TRANSLATE.lock().unwrap();
+    {
+        // Nothing translated on these pages: nothing to drop.
+        let mut pg = TRANSLATED_PAGES.lock().unwrap();
+        let Some(set) = pg.as_mut() else { return };
+        let p0 = addr >> 14;
+        let p1 = (addr.saturating_add(len.max(1)) - 1) >> 14;
+        let n = p1 - p0 + 1;
+        let hit = if n as usize <= set.len() { (p0..=p1).any(|p| set.contains(&p)) } else { set.iter().any(|&p| p >= p0 && p <= p1) };
+        if !hit {
+            return;
+        }
+        set.clear();
+    }
     let has_any = BLOCKS.read().unwrap().as_ref().map(|m| !m.is_empty()).unwrap_or(false);
     if !has_any {
         return;

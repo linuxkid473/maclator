@@ -72,6 +72,14 @@ pub fn install_debug_handler() {
 }
 
 extern "C" fn fault_dump(sig: i32) {
+    // Helper processes often have stderr closed or /dev/null: write the dump to a file.
+    unsafe {
+        let path = format!("/tmp/maclator-fault-{}.log\0", libc::getpid());
+        let fd = libc::open(path.as_ptr() as *const libc::c_char, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC, 0o644);
+        if fd >= 0 {
+            libc::dup2(fd, 2);
+        }
+    }
     eprintln!("maclator: host signal {sig} in emulator; guest state:");
     dump_threads(sig);
     unsafe { libc::_exit(128 + sig) };

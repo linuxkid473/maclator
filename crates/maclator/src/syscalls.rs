@@ -25,6 +25,7 @@ const SYS_SIGALTSTACK: u64 = 53;
 const SYS_MPROTECT: u64 = 74;
 const SYS_SIGRETURN: u64 = 184;
 const SYS_MMAP: u64 = 197;
+const SYS_MUNMAP: u64 = 73;
 const SYS_SYSCTL: u64 = 202;
 const SYS_SYSCTLBYNAME: u64 = 274;
 const SYS_SHARED_REGION_CHECK_NP: u64 = 294;
@@ -197,7 +198,7 @@ fn bsd_inner(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
         SYS_MMAP => {
             args[2] &= !PROT_EXEC;
             args[3] &= !MAP_JIT;
-            let r = hostsys::unix(n, &args);
+            let r = mmap_16k(&args);
             set_res(cpu, r);
         }
         SYS_MPROTECT => {
@@ -320,6 +321,49 @@ fn bsd_inner(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
     }
 }
 
+/// arm64 macOS has 16 KiB pages; the Intel host has 4 KiB. Guest allocators (V8,
+/// PartitionAlloc, libmalloc) rely on mmap returning 16 KiB-aligned, 16 KiB-sized
+/// regions, so over-reserve, align, and trim.
+fn mmap_16k(args: &[u64; 8]) -> hostsys::SysResult {
+    const PAGE: u64 = 0x4000;
+    const MAP_FIXED: u64 = 0x10;
+    const MAP_ANON: u64 = 0x1000;
+    const MAP_PRIVATE: u64 = 0x2;
+    let (len, flags, fd) = (args[1], args[3], args[4] as i64);
+    if len == 0 || flags & MAP_FIXED != 0 {
+        return hostsys::unix(SYS_MMAP, args);
+    }
+    let len16 = (len + PAGE - 1) & !(PAGE - 1);
+    // Reserve len16 + one page of slack, address space only.
+    let reserve = hostsys::unix(SYS_MMAP, &[0, len16 + PAGE, 0, MAP_ANON | MAP_PRIVATE, u64::MAX, 0, 0, 0]);
+    if reserve.carry {
+        return reserve;
+    }
+    let base = reserve.rax;
+    let aligned = (base + PAGE - 1) & !(PAGE - 1);
+    // Map the real thing over the aligned window.
+    let mut a = *args;
+    a[0] = aligned;
+    a[1] = len16;
+    a[3] = flags | MAP_FIXED;
+    let _ = fd;
+    let r = hostsys::unix(SYS_MMAP, &a);
+    if r.carry {
+        hostsys::unix(SYS_MUNMAP, &[base, len16 + PAGE, 0, 0, 0, 0, 0, 0]);
+        return r;
+    }
+    // Give back the slack before and after the aligned window.
+    if aligned > base {
+        hostsys::unix(SYS_MUNMAP, &[base, aligned - base, 0, 0, 0, 0, 0, 0]);
+    }
+    let end = aligned + len16;
+    let reserve_end = base + len16 + PAGE;
+    if reserve_end > end {
+        hostsys::unix(SYS_MUNMAP, &[end, reserve_end - end, 0, 0, 0, 0, 0, 0]);
+    }
+    r
+}
+
 fn write_sysctl_str(cpu: &mut Cpu, oldp: u64, oldlenp: u64, v: &str) {
     let bytes = [v.as_bytes(), &[0]].concat();
     unsafe {
@@ -384,6 +428,7 @@ fn sysctl_override(name: &str) -> Option<i64> {
         | "hw.optional.arm.FEAT_AES" | "hw.optional.arm.FEAT_PMULL" | "hw.optional.arm.FEAT_SHA1"
         | "hw.optional.arm.FEAT_AFP" | "hw.optional.arm.FEAT_RPRES" | "hw.optional.arm.FEAT_ECV"
         | "hw.optional.arm.FEAT_WFxT" | "hw.optional.arm.FEAT_CSSC" | "hw.optional.arm.FEAT_HBC" => 0,
+        "hw.pagesize" | "hw.pagesize32" | "vm.pagesize" => 16384,
         "hw.cpufamily" => crate::commpage::CPUFAMILY as i64,
         "hw.optional.x86_64" | "hw.optional.sse" | "hw.optional.sse2" | "hw.optional.sse3"
         | "hw.optional.supplementalsse3" | "hw.optional.sse4_1" | "hw.optional.sse4_2"

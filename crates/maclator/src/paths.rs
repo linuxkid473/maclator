@@ -31,3 +31,7 @@ pub fn redirect(path: &str) -> Option<String> {
     }
     None
 }
+
+pub fn cache_dir() -> Option<String> {
+    CACHE_DIR.lock().unwrap().clone()
+}

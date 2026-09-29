@@ -37,6 +37,10 @@ fn main() {
     let mut dyld = std::env::var("MACLATOR_DYLD").unwrap_or_else(|_| "/usr/lib/dyld".to_string());
     while let Some(a) = args.first().cloned() {
         match a.as_str() {
+            "--dump-on-fault" => {
+                std::env::set_var("MACLATOR_DUMP_ON_FAULT", "1");
+                args.remove(0);
+            }
             "--trace" => {
                 syscalls::TRACE.store(true, Ordering::Relaxed);
                 args.remove(0);
@@ -95,12 +99,30 @@ fn main() {
     if args.is_empty() {
         usage();
     }
+    {
+        // Options that re-launched arm64 children must inherit.
+        let mut fwd: Vec<String> = vec!["--dyld".into(), dyld.clone()];
+        if let Some(d) = paths::cache_dir() {
+            fwd.push("--sysroot".into());
+            fwd.push(d);
+        }
+        if !jit::JIT_ENABLED.load(Ordering::Relaxed) {
+            fwd.push("--interp".into());
+        }
+        if syscalls::TRACE.load(Ordering::Relaxed) {
+            fwd.push("--trace".into());
+        }
+        if std::env::var_os("MACLATOR_DUMP_ON_FAULT").is_some() {
+            fwd.push("--dump-on-fault".into());
+        }
+        spawn::configure(fwd);
+    }
     if std::env::var_os("MACLATOR_TRACE").is_some() {
         syscalls::TRACE.store(true, Ordering::Relaxed);
     }
     let exe = resolve_path(&args[0]);
     let envp: Vec<String> = std::env::vars()
-        .filter(|(k, _)| !k.starts_with("MACLATOR_"))
+        .filter(|(k, _)| !k.starts_with("MACLATOR_") || k == "MACLATOR_DUMP_ON_FAULT")
         .map(|(k, v)| format!("{k}={v}"))
         .collect();
 

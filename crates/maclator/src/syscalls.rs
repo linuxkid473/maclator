@@ -402,14 +402,45 @@ fn mach_trap(cpu: &mut Cpu, n: u64) {
         _ => {}
     }
     let args = [cpu.x[0], cpu.x[1], cpu.x[2], cpu.x[3], cpu.x[4], cpu.x[5], cpu.x[6], cpu.x[7]];
+    if n == 47 && crate::iokit::intercept(args[0], args[1]) {
+        if trace {
+            eprintln!("[mach] msg2 answered by iokit shim");
+        }
+        cpu.x[0] = 0;
+        return;
+    }
     // mach_msg2: remember the request id/size before the reply overwrites the header.
     let req_id = if n == 47 && args[0] != 0 { unsafe { *((args[0] + 20) as *const u32) } } else { 0 };
+    if trace && n == 47 && args[0] != 0 {
+        unsafe {
+            let h = args[0] as *const u32;
+            let size = (*h.add(1)).min(512) as usize;
+            let body = std::slice::from_raw_parts(args[0] as *const u8, size);
+            let mut strs = String::new();
+            let mut cur = String::new();
+            for &b in body {
+                if (0x20..0x7f).contains(&b) {
+                    cur.push(b as char);
+                } else {
+                    if cur.len() >= 4 {
+                        strs.push_str(&format!(" \"{cur}\""));
+                    }
+                    cur.clear();
+                }
+            }
+            eprintln!("[mach] msg2> bits={:#x} size={} rport={:#x} lport={:#x} id={} opt={:#x}{}", *h, *h.add(1), *h.add(2), *h.add(3), *h.add(5), args[1], strs);
+        }
+    }
     let r = hostsys::mach(n, &args);
     if n == 47 && args[0] != 0 {
         let reply_id = unsafe { *((args[0] + 20) as *const u32) };
         let retcode = unsafe { *((args[0] + 32) as *const u32) };
         if trace {
             eprintln!("[mach] msg2 id={req_id} reply_id={reply_id} retcode={retcode:#x}");
+            if (2800..3000).contains(&req_id) {
+                let w: Vec<String> = (0..16).map(|i| format!("{:08x}", unsafe { *((args[0] + i * 4) as *const u32) })).collect();
+                eprintln!("[mach] reply words: {}", w.join(" "));
+            }
         }
         // task_restartable_ranges_register: the Intel host kernel does not support it, and
         // libobjc treats failure as fatal. Restartable ranges only matter for arm64 threads

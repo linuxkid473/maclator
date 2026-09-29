@@ -6,6 +6,7 @@ mod commpage;
 mod engine;
 mod guestmem;
 mod hostsys;
+mod iokit;
 mod jit;
 mod loader;
 mod macho;

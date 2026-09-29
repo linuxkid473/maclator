@@ -8,9 +8,9 @@ set -e
 cd "$(dirname "$0")"
 OUT=${OUT:-out}
 mkdir -p $OUT
-clang -arch x86_64 -dynamiclib -fobjc-arc -O2 -framework Foundation -framework Metal \
+clang -arch x86_64 -dynamiclib -fobjc-arc -O2 -framework Foundation -framework Metal -framework IOSurface \
   -install_name @rpath/libmclbridge.dylib mclbridge.m -o $OUT/libmclbridge.dylib
-clang -arch arm64 -dynamiclib -fno-objc-arc -O2 -framework Foundation -framework Metal \
+clang -arch arm64 -dynamiclib -fno-objc-arc -O2 -framework Foundation -framework Metal -framework IOSurface \
   -install_name @rpath/libmclmetal.dylib mclmetal.m -o $OUT/libmclmetal.dylib
 codesign -f -s - $OUT/libmclbridge.dylib $OUT/libmclmetal.dylib
 if [ "$(uname -m)" = arm64 ]; then

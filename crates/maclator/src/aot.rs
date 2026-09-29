@@ -250,7 +250,6 @@ fn code_offset(n: usize) -> usize {
 }
 
 fn load_file(path: &std::path::Path) -> std::io::Result<usize> {
-    use std::os::unix::io::AsRawFd;
     let mut f = std::fs::File::open(path)?;
     let mut head = [0u8; 32];
     if f.read_exact(&mut head).is_err() || &head[..8] != MAGIC {
@@ -269,16 +268,16 @@ fn load_file(path: &std::path::Path) -> std::io::Result<usize> {
     if f.metadata()?.len() < (code_off + code_len) as u64 {
         return Ok(0);
     }
-    // Map the code straight from the file: pages are shared between processes and
-    // only faulted in when used.
-    let map_len = (code_len + CODE_ALIGN - 1) & !(CODE_ALIGN - 1);
-    let base = unsafe {
-        libc::mmap(std::ptr::null_mut(), map_len, libc::PROT_READ | libc::PROT_EXEC, libc::MAP_PRIVATE, f.as_raw_fd(), code_off as i64)
-    };
-    if base == libc::MAP_FAILED {
-        return Ok(0);
+    // Copy the code into the JIT code cache. (Mapping the file itself PROT_EXEC makes macOS
+    // run a Gatekeeper assessment on every cache file and pop up "could not verify" dialogs.)
+    let cc = crate::jit::code_cache();
+    let base = cc.alloc(code_len as u64);
+    {
+        use std::io::Seek;
+        f.seek(std::io::SeekFrom::Start(code_off as u64))?;
+        let dst = unsafe { std::slice::from_raw_parts_mut(base as *mut u8, code_len) };
+        f.read_exact(dst)?;
     }
-    let base = base as u64;
     for i in 0..n {
         let pc = rd64(&idx, i * 16);
         let off = rd64(&idx, i * 16 + 8);

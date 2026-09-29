@@ -125,6 +125,27 @@ pub fn intercept(msg_addr: u64, options: u64) -> bool {
             }
         }
     }
-    let _ = KERN_SUCCESS;
+    // Thread suspend/resume/get_state on guest threads (Chromium's stack-sampling profiler).
+    // Host threads run guest code, so suspending one can deadlock the whole process and the
+    // host register state is meaningless to the guest: make suspend/resume no-ops and
+    // get_state a failure.
+    if msg_addr != 0 && options & 3 == 3 {
+        let m = msg_addr as *mut u32;
+        unsafe {
+            let id = *m.add(5);
+            let lport = *m.add(3);
+            match id {
+                3605 | 3606 => {
+                    write_error_reply(m, id, lport, KERN_SUCCESS);
+                    return true;
+                }
+                3603 => {
+                    write_error_reply(m, id, lport, 5 /* KERN_FAILURE */);
+                    return true;
+                }
+                _ => {}
+            }
+        }
+    }
     false
 }

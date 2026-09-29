@@ -37,6 +37,12 @@ fn main() {
     let mut dyld = std::env::var("MACLATOR_DYLD").unwrap_or_else(|_| "/usr/lib/dyld".to_string());
     while let Some(a) = args.first().cloned() {
         match a.as_str() {
+            "--trace-file" => {
+                // Trace to /tmp/maclator-trace-<pid>.log (helper processes have no usable stderr).
+                syscalls::TRACE.store(true, Ordering::Relaxed);
+                std::env::set_var("MACLATOR_TRACE_FILE", "1");
+                args.remove(0);
+            }
             "--dump-on-fault" => {
                 std::env::set_var("MACLATOR_DUMP_ON_FAULT", "1");
                 args.remove(0);
@@ -109,7 +115,9 @@ fn main() {
         if !jit::JIT_ENABLED.load(Ordering::Relaxed) {
             fwd.push("--interp".into());
         }
-        if syscalls::TRACE.load(Ordering::Relaxed) {
+        if std::env::var_os("MACLATOR_TRACE_FILE").is_some() {
+            fwd.push("--trace-file".into());
+        } else if syscalls::TRACE.load(Ordering::Relaxed) {
             fwd.push("--trace".into());
         }
         if std::env::var_os("MACLATOR_DUMP_ON_FAULT").is_some() {
@@ -126,6 +134,15 @@ fn main() {
         .map(|(k, v)| format!("{k}={v}"))
         .collect();
 
+    if std::env::var_os("MACLATOR_TRACE_FILE").is_some() {
+        unsafe {
+            let path = format!("/tmp/maclator-trace-{}.log\0", libc::getpid());
+            let fd = libc::open(path.as_ptr() as *const libc::c_char, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC, 0o644);
+            if fd >= 0 {
+                libc::dup2(fd, 2);
+            }
+        }
+    }
     engine::install_debug_handler();
     let cp = commpage::CommPage::install();
     if syscalls::TRACE.load(Ordering::Relaxed) {

@@ -451,7 +451,26 @@ pub fn run(cpu: &mut Cpu) {
     }
     crate::aot::ensure_loaded();
     setup_cpu(cpu);
+    let (mut last_pc, mut repeats) = (u64::MAX, 0u64);
     loop {
+        if cpu.pc == last_pc {
+            repeats += 1;
+            if repeats == 20000 && std::env::var_os("MACLATOR_SPIN_DEBUG").is_some() {
+                let found = lookup(cpu.pc);
+                let hot = HOT.with(|h| h.borrow().get(&cpu.pc).copied());
+                let msg = format!("[spin] pc={:#x} lookup={:?} hot={:?} exit_reason={} exit_data={:#x} epoch={} my_epoch={}\n", cpu.pc, found, hot, cpu.exit_reason, cpu.exit_data, EPOCH.load(Ordering::Relaxed), MY_EPOCH.with(|e| e.get()));
+                unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()) };
+                if let Some(h) = found {
+                    let bytes = unsafe { std::slice::from_raw_parts(h as *const u8, 160) };
+                    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+                    let m2 = format!("[spin] code {hex}\n");
+                    unsafe { libc::write(2, m2.as_ptr() as *const libc::c_void, m2.len()) };
+                }
+            }
+        } else {
+            last_pc = cpu.pc;
+            repeats = 0;
+        }
         let epoch = EPOCH.load(Ordering::Relaxed);
         if MY_EPOCH.with(|e| e.get()) != epoch {
             ibtc_clear();

@@ -168,10 +168,21 @@ fn bsd(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
 
 fn bsd_inner(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
     match n {
-        SYS_VFORK => {
-            // vfork shares our address space and stack: use fork instead.
-            let r = hostsys::unix(SYS_FORK, &args);
-            set_res(cpu, r);
+        SYS_VFORK | SYS_FORK => {
+            // vfork shares our address space and stack: use fork instead. Go through libc's
+            // fork (not the raw syscall) so the host libSystem re-initialises in the child
+            // (mach_task_self, MIG reply ports, ...); the JIT reads guest memory through
+            // mach_vm_read with the cached task port.
+            crate::engine::flush_profile();
+            let pid = unsafe { libc::fork() };
+            if pid < 0 {
+                set_err(cpu, unsafe { *libc::__error() } as u64);
+            } else if pid == 0 {
+                // Child: XNU returns the parent's pid with the "is child" flag in x1.
+                set_ok(cpu, unsafe { libc::getppid() } as u64, 1);
+            } else {
+                set_ok(cpu, pid as u64, 0);
+            }
         }
         SYS_EXIT => {
             crate::engine::flush_profile();

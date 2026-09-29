@@ -28,7 +28,45 @@ pub fn flush_profile() {
 /// Registry of running guest CPUs (for SIGUSR1 diagnostics).
 static CPUS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 
+thread_local! {
+    static CURRENT_CPU: Cell<usize> = const { Cell::new(0) };
+}
+
+/// SIGUSR2: print this thread's guest registers without taking any locks
+/// (usable in forked children where other threads' locks may be stuck).
+extern "C" fn dump_current(_: i32) {
+    let p = CURRENT_CPU.with(|c| c.get());
+    if p == 0 {
+        return;
+    }
+    let cpu = unsafe { &*(p as *const Cpu) };
+    let mut buf = [0u8; 1024];
+    unsafe {
+        let n = libc::snprintf(
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            b"[usr2] pid %d pc=%llx lr=%llx sp=%llx x0=%llx x1=%llx x2=%llx x3=%llx x8=%llx x16=%llx x19=%llx x20=%llx x21=%llx x22=%llx\n\0".as_ptr() as *const libc::c_char,
+            libc::getpid(),
+            cpu.pc,
+            cpu.x[30],
+            cpu.x[31],
+            cpu.x[0],
+            cpu.x[1],
+            cpu.x[2],
+            cpu.x[3],
+            cpu.x[8],
+            cpu.x[16],
+            cpu.x[19],
+            cpu.x[20],
+            cpu.x[21],
+            cpu.x[22],
+        );
+        libc::write(2, buf.as_ptr() as *const libc::c_void, n.max(0) as usize);
+    }
+}
+
 pub fn run_thread(cpu: &mut Cpu) {
+    CURRENT_CPU.with(|c| c.set(cpu as *mut Cpu as usize));
     EXIT_REQUESTED.with(|f| f.set(false));
     let key = cpu as *mut Cpu as usize;
     CPUS.lock().unwrap().push(key);
@@ -63,6 +101,7 @@ extern "C" fn dump_threads(_: i32) {
 
 pub fn install_debug_handler() {
     unsafe { libc::signal(libc::SIGUSR1, dump_threads as usize) };
+    unsafe { libc::signal(libc::SIGUSR2, dump_current as usize) };
     if std::env::var_os("MACLATOR_DUMP_ON_FAULT").is_some() {
         unsafe {
             libc::signal(libc::SIGSEGV, fault_dump as usize);

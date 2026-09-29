@@ -62,6 +62,74 @@ pub struct Unit {
     pub finished_stubs: Vec<Stub>,
     pub insns_translated: u64,
     pub insns_fallback: u64,
+    /// Set by a flag-setting instruction whose x86 flags are still live (nothing emitted after it
+    /// touches them); consumed by the very next instruction of the block to branch/select on the
+    /// x86 flags directly instead of re-deriving the condition from the stored NZCV bytes.
+    pub fuse: Option<FuseKind>,
+    /// Write-through cache of guest general registers in callee-saved x86 registers that the JIT
+    /// never uses otherwise (see `CREGS`). Memory stays authoritative, so faults, signals and
+    /// helper calls always see current values; the cache only saves reloads. Compile-time state,
+    /// reset at every block start.
+    pub rc: RegCache,
+    /// Set once an instruction has created an internal label (conditional code follows): cached
+    /// state may then be used but not extended, or paths could disagree about what is cached.
+    pub rc_frozen: bool,
+    /// The next few instruction words of the current block (up to and including a terminator):
+    /// only used to decide whether caching a register is worthwhile.
+    pub look: Vec<u32>,
+    /// The flag-setting instruction being translated feeds a fused branch/select and its NZCV bytes
+    /// are dead afterwards: skip the four flag stores.
+    pub dead_flags: bool,
+}
+
+pub const NCREGS: usize = 5;
+pub static DEAD_FLAG_SKIPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const LOOKAHEAD: usize = 10;
+
+#[derive(Clone, Copy, Default)]
+pub struct RegCache {
+    /// Guest register held in each slot (0xff = empty).
+    pub reg: [u8; NCREGS],
+    pub stamp: [u32; NCREGS],
+    pub tick: u32,
+}
+
+impl RegCache {
+    fn new() -> RegCache {
+        RegCache { reg: [0xff; NCREGS], stamp: [0; NCREGS], tick: 0 }
+    }
+}
+
+/// Which x86 operation produced the live flags (decides how ARM conditions map onto x86 ones).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum FuseKind {
+    Add,
+    Sub,
+    Logic,
+}
+
+/// x86 condition codes used for fused compare-and-branch / select.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Cc {
+    E, Ne, B, Ae, S, Ns, O, No, A, Be, L, Ge, G, Le,
+}
+
+/// The x86 condition equivalent to ARM condition `cond` (0..=13) for flags produced by `kind`,
+/// if there is a single one.
+pub fn x86_cc(kind: FuseKind, cond: u32) -> Option<Cc> {
+    use Cc::*;
+    const SUB: [Option<Cc>; 14] = [Some(E), Some(Ne), Some(Ae), Some(B), Some(S), Some(Ns), Some(O), Some(No), Some(A), Some(Be), Some(Ge), Some(L), Some(G), Some(Le)];
+    const ADD: [Option<Cc>; 14] = [Some(E), Some(Ne), Some(B), Some(Ae), Some(S), Some(Ns), Some(O), Some(No), None, None, Some(Ge), Some(L), Some(G), Some(Le)];
+    // and/test clear CF and OF, so the carry/overflow/unsigned conditions are constants: not fused.
+    const LOGIC: [Option<Cc>; 14] = [Some(E), Some(Ne), None, None, Some(S), Some(Ns), None, None, None, None, Some(Ge), Some(L), Some(G), Some(Le)];
+    if cond >= 14 {
+        return None;
+    }
+    match kind {
+        FuseKind::Sub => SUB[cond as usize],
+        FuseKind::Add => ADD[cond as usize],
+        FuseKind::Logic => LOGIC[cond as usize],
+    }
 }
 
 impl Unit {
@@ -81,6 +149,11 @@ impl Unit {
             finished_stubs: Vec::new(),
             insns_translated: 0,
             insns_fallback: 0,
+            fuse: None,
+            rc: RegCache::new(),
+            rc_frozen: false,
+            look: Vec::new(),
+            dead_flags: false,
         }
     }
 
@@ -193,17 +266,85 @@ fn sext(v: u64, n: u32) -> i64 {
 struct E<'a> {
     u: &'a mut Unit,
     pc: u64,
+    /// Flag producer of the immediately preceding instruction (see `Unit::fuse`).
+    fuse_in: Option<FuseKind>,
 }
+
+/// Callee-saved x86 registers the JIT keeps guest registers in (see `RegCache`).
+const CREGS: [R64; NCREGS] = [rbx, rbp, r12, r13, r14];
+const CREGS32: [R32; NCREGS] = [ebx, ebp, r12d, r13d, r14d];
 
 macro_rules! a {
     ($e:expr, $m:ident ( $($arg:expr),* )) => { $e.u.a.$m($($arg),*).unwrap() };
 }
 
 impl<'a> E<'a> {
+    fn rc_find(&self, n: u32) -> Option<usize> {
+        self.u.rc.reg.iter().position(|&r| r as u32 == n)
+    }
+    fn rc_touch(&mut self, s: usize) {
+        self.u.rc.tick += 1;
+        self.u.rc.stamp[s] = self.u.rc.tick;
+    }
+    /// Slot for guest register `n` (least recently used one is evicted; memory is up to date).
+    fn rc_alloc(&mut self, n: u32) -> usize {
+        let rc = &self.u.rc;
+        let s = (0..NCREGS).find(|&i| rc.reg[i] == 0xff).unwrap_or_else(|| (0..NCREGS).min_by_key(|&i| rc.stamp[i]).unwrap());
+        self.u.rc.reg[s] = n as u8;
+        self.rc_touch(s);
+        s
+    }
+    fn rc_inval(&mut self, n: u32) {
+        if let Some(s) = self.rc_find(n) {
+            self.u.rc.reg[s] = 0xff;
+        }
+    }
+    fn rc_clear(&mut self) {
+        self.u.rc = RegCache::new();
+    }
+    /// Does a later instruction of this block name guest register `n` in any register field?
+    /// (Heuristic: false positives only cost performance.)
+    fn used_soon(&self, n: u32) -> bool {
+        self.u.look.iter().any(|&w| (w & 31) == n || ((w >> 5) & 31) == n || ((w >> 10) & 31) == n || ((w >> 16) & 31) == n)
+    }
+    /// A label is about to be created: code after it may be conditional.
+    fn new_label(&mut self) -> CodeLabel {
+        self.u.rc_frozen = true;
+        self.u.a.create_label()
+    }
+    /// Guest register `n` was just written from `r` (already stored to memory).
+    fn rc_wrote(&mut self, n: u32, r: R64) {
+        let soon = self.used_soon(n);
+        if let Some(s) = self.rc_find(n) {
+            if self.u.rc_frozen || !soon {
+                self.u.rc.reg[s] = 0xff;
+            } else {
+                a!(self, mov(CREGS[s], r));
+                self.rc_touch(s);
+            }
+        } else if !self.u.rc_frozen && soon {
+            let s = self.rc_alloc(n);
+            a!(self, mov(CREGS[s], r));
+        }
+    }
+
     /// Load Xn (31 = XZR or SP) into `r`.
     fn ldx(&mut self, r: R64, n: u32, use_sp: bool) {
         if n == 31 && !use_sp {
             a!(self, xor(r32_of(r), r32_of(r)));
+        } else {
+            self.ldx_nf(r, n);
+        }
+    }
+    /// Load Xn without touching the x86 flags (n = 31 must be SP).
+    fn ldx_nf(&mut self, r: R64, n: u32) {
+        if let Some(s) = self.rc_find(n) {
+            self.rc_touch(s);
+            a!(self, mov(r, CREGS[s]));
+        } else if !self.u.rc_frozen && self.used_soon(n) {
+            let s = self.rc_alloc(n);
+            a!(self, mov(CREGS[s], qword_ptr(r15 + xoff(n))));
+            a!(self, mov(r, CREGS[s]));
         } else {
             a!(self, mov(r, qword_ptr(r15 + xoff(n))));
         }
@@ -212,6 +353,18 @@ impl<'a> E<'a> {
     fn ldw(&mut self, r: R64, n: u32, use_sp: bool) {
         if n == 31 && !use_sp {
             a!(self, xor(r32_of(r), r32_of(r)));
+        } else {
+            self.ldw_nf(r, n);
+        }
+    }
+    fn ldw_nf(&mut self, r: R64, n: u32) {
+        if let Some(s) = self.rc_find(n) {
+            self.rc_touch(s);
+            a!(self, mov(r32_of(r), CREGS32[s]));
+        } else if !self.u.rc_frozen && self.used_soon(n) {
+            let s = self.rc_alloc(n);
+            a!(self, mov(CREGS[s], qword_ptr(r15 + xoff(n))));
+            a!(self, mov(r32_of(r), CREGS32[s]));
         } else {
             a!(self, mov(r32_of(r), dword_ptr(r15 + xoff(n))));
         }
@@ -229,6 +382,7 @@ impl<'a> E<'a> {
             return;
         }
         a!(self, mov(qword_ptr(r15 + xoff(n)), r));
+        self.rc_wrote(n, r);
     }
     fn mov_imm(&mut self, r: R64, v: u64) {
         if v == 0 {
@@ -243,6 +397,7 @@ impl<'a> E<'a> {
         if n == 31 {
             return;
         }
+        self.rc_inval(n);
         if v as i64 >= i32::MIN as i64 && v as i64 <= i32::MAX as i64 {
             a!(self, mov(qword_ptr(r15 + xoff(n)), v as i64 as i32));
         } else {
@@ -254,22 +409,85 @@ impl<'a> E<'a> {
 
     /// Store NZCV from the x86 flags of a preceding add/sub/logic op.
     fn flags_add(&mut self) {
+        if self.u.dead_flags {
+            return;
+        }
         a!(self, sets(byte_ptr(r15 + off::NF)));
         a!(self, sete(byte_ptr(r15 + off::ZF)));
         a!(self, setb(byte_ptr(r15 + off::CF)));
         a!(self, seto(byte_ptr(r15 + off::VF)));
     }
     fn flags_sub(&mut self) {
+        if self.u.dead_flags {
+            return;
+        }
         a!(self, sets(byte_ptr(r15 + off::NF)));
         a!(self, sete(byte_ptr(r15 + off::ZF)));
         a!(self, setae(byte_ptr(r15 + off::CF)));
         a!(self, seto(byte_ptr(r15 + off::VF)));
     }
     fn flags_logic(&mut self) {
+        if self.u.dead_flags {
+            return;
+        }
         a!(self, sets(byte_ptr(r15 + off::NF)));
         a!(self, sete(byte_ptr(r15 + off::ZF)));
         a!(self, mov(byte_ptr(r15 + off::CF), 0));
         a!(self, mov(byte_ptr(r15 + off::VF), 0));
+    }
+
+    /// Like `ld` but never touches the x86 flags (no xor-zeroing).
+    fn ld_nf(&mut self, r: R64, n: u32, sf: bool) {
+        if n == 31 {
+            a!(self, mov(r32_of(r), 0u32));
+        } else if sf {
+            self.ldx_nf(r, n);
+        } else {
+            self.ldw_nf(r, n);
+        }
+    }
+
+    fn jcc(&mut self, cc: Cc, l: CodeLabel) {
+        match cc {
+            Cc::E => a!(self, je(l)),
+            Cc::Ne => a!(self, jne(l)),
+            Cc::B => a!(self, jb(l)),
+            Cc::Ae => a!(self, jae(l)),
+            Cc::S => a!(self, js(l)),
+            Cc::Ns => a!(self, jns(l)),
+            Cc::O => a!(self, jo(l)),
+            Cc::No => a!(self, jno(l)),
+            Cc::A => a!(self, ja(l)),
+            Cc::Be => a!(self, jbe(l)),
+            Cc::L => a!(self, jl(l)),
+            Cc::Ge => a!(self, jge(l)),
+            Cc::G => a!(self, jg(l)),
+            Cc::Le => a!(self, jle(l)),
+        }
+    }
+
+    /// dst = src if `cc` holds.
+    fn cmov(&mut self, cc: Cc, d: R64, s: R64, sf: bool) {
+        let (d32, s32) = (r32_of(d), r32_of(s));
+        macro_rules! cm {
+            ($m:ident) => { if sf { a!(self, $m(d, s)) } else { a!(self, $m(d32, s32)) } };
+        }
+        match cc {
+            Cc::E => cm!(cmove),
+            Cc::Ne => cm!(cmovne),
+            Cc::B => cm!(cmovb),
+            Cc::Ae => cm!(cmovae),
+            Cc::S => cm!(cmovs),
+            Cc::Ns => cm!(cmovns),
+            Cc::O => cm!(cmovo),
+            Cc::No => cm!(cmovno),
+            Cc::A => cm!(cmova),
+            Cc::Be => cm!(cmovbe),
+            Cc::L => cm!(cmovl),
+            Cc::Ge => cm!(cmovge),
+            Cc::G => cm!(cmovg),
+            Cc::Le => cm!(cmovle),
+        }
     }
 
     /// Evaluate condition `cond` into `al` (0/1).
@@ -310,6 +528,7 @@ impl<'a> E<'a> {
         a!(self, mov(esi, insn));
         self.mov_imm(rdx, self.pc);
         a!(self, call(qword_ptr(r15 + off::helper(HELPER_INTERP))));
+        self.rc_clear();   // the interpreter may have written any guest register
         a!(self, test(eax, eax));
         let exit = self.u.exit_label;
         a!(self, jnz(exit));
@@ -368,6 +587,77 @@ impl<'a> E<'a> {
     }
 }
 
+
+/// The kind of flags produced by a fusable flag-setting instruction (the encodings that set
+/// `Unit::fuse`), if `insn` is one.
+fn fusable_setter(insn: u32) -> Option<FuseKind> {
+    let sub = |i: u32| if i >> 30 & 1 != 0 { FuseKind::Sub } else { FuseKind::Add };
+    if insn & 0x3F80_0000 == 0x3100_0000 {
+        return Some(sub(insn)); // add/sub (immediate), S
+    }
+    if insn & 0x3F20_0000 == 0x2B00_0000 && (insn >> 22) & 3 != 3 {
+        return Some(sub(insn)); // add/sub (shifted register), S
+    }
+    if insn & 0x3F20_0000 == 0x2B20_0000 {
+        return Some(sub(insn)); // add/sub (extended register), S
+    }
+    if insn & 0x7F80_0000 == 0x7200_0000 || insn & 0x7F00_0000 == 0x6A00_0000 {
+        return Some(FuseKind::Logic); // ANDS / BICS (immediate, shifted register)
+    }
+    None
+}
+
+/// Does `insn` read NZCV?
+fn reads_flags(insn: u32) -> bool {
+    insn & 0xFF00_0010 == 0x5400_0000          // B.cond
+        || insn & 0xFF00_0010 == 0x5400_0010   // BC.cond
+        || insn & 0x3FE0_0800 == 0x1A80_0000   // CSEL/CSINC/CSINV/CSNEG (CSET, CINC, ...)
+        || insn & 0x1FE0_0400 == 0x1A40_0000   // CCMP/CCMN
+        || insn & 0x1FE0_0000 == 0x1A00_0000   // ADC/SBC (+S)
+        || insn & 0xFF20_0C00 == 0x1E20_0C00   // FCSEL
+        || insn & 0xFF20_0400 == 0x1E20_0400   // FCCMP/FCCMPE
+        || insn & 0xFFF0_0000 == 0xD530_0000   // MRS (any system register, conservative)
+}
+
+/// Does `insn` overwrite all of NZCV unconditionally (and not read it)?
+fn writes_all_flags(insn: u32) -> bool {
+    insn & 0x3F80_0000 == 0x3100_0000                                   // ADDS/SUBS imm
+        || (insn & 0x3F20_0000 == 0x2B00_0000 && (insn >> 22) & 3 != 3) // ADDS/SUBS shifted
+        || insn & 0x3F20_0000 == 0x2B20_0000                            // ADDS/SUBS extended
+        || insn & 0x7F80_0000 == 0x7200_0000                            // ANDS imm
+        || insn & 0x7F00_0000 == 0x6A00_0000                            // ANDS/BICS shifted
+        || insn & 0xFF20_FC07 == 0x1E20_2000                            // FCMP/FCMPE
+}
+
+/// Are the flags dead at `pc`: overwritten before anything reads them, looking at most a few
+/// straight-line instructions ahead (unconditional direct branches are followed).
+fn flags_dead_at(mut pc: u64, read: &dyn Fn(u64) -> Option<u32>) -> bool {
+    let mut hops = 0;
+    for _ in 0..24 {
+        let Some(w) = read(pc) else { return false };
+        if writes_all_flags(w) {
+            return true;
+        }
+        if reads_flags(w) {
+            return false;
+        }
+        if w & 0xFC00_0000 == 0x1400_0000 {
+            // B: follow
+            hops += 1;
+            if hops > 3 {
+                return false;
+            }
+            pc = pc.wrapping_add((sext((w & 0x03ff_ffff) as u64, 26) << 2) as u64);
+            continue;
+        }
+        if is_terminator(w) {
+            return false;
+        }
+        pc += 4;
+    }
+    false
+}
+
 /// Debugging aid: MACLATOR_JIT_DISABLE=dpimm,branch,ldst,dpreg routes those
 /// instruction classes to the interpreter.
 fn disabled_classes() -> u32 {
@@ -411,6 +701,21 @@ pub fn is_terminator(insn: u32) -> bool {
 /// created and registered the label for `pc` if it wants intra-unit jumps.
 /// Returns the guest address just past the block.
 pub fn emit_block(u: &mut Unit, pc: u64, read: &dyn Fn(u64) -> Option<u32>) -> u64 {
+    u.fuse = None;
+    u.rc = RegCache::new();
+    u.rc_frozen = false;
+    u.look.clear();
+    {
+        let mut c2 = pc + 4;
+        while u.look.len() < LOOKAHEAD {
+            let Some(w) = read(c2) else { break };
+            u.look.push(w);
+            if is_terminator(w) {
+                break;
+            }
+            c2 += 4;
+        }
+    }
     let mut label = *u.labels.get(&pc).expect("block label");
     u.a.set_label(&mut label).unwrap();
     // set_label updates the label; keep the updated value for label_ip().
@@ -420,14 +725,37 @@ pub fn emit_block(u: &mut Unit, pc: u64, read: &dyn Fn(u64) -> Option<u32>) -> u
     loop {
         let Some(insn) = read(cur) else {
             // Unreadable: let the dispatcher fault properly.
-            let mut e = E { u, pc: cur };
+            let mut e = E { u, pc: cur, fuse_in: None };
             e.st_pc_and_exit(cur);
             return cur;
         };
-        let mut e = E { u, pc: cur };
+        let fuse_in = u.fuse.take();
+        u.rc_frozen = false;
+        u.dead_flags = false;
+        if let Some(kind) = fusable_setter(insn) {
+            if let Some(&nx) = u.look.first() {
+                if nx & 0xFF00_0010 == 0x5400_0000
+                    && (nx & 15) < 14
+                    && x86_cc(kind, nx & 15).is_some()
+                    && !u.labels.contains_key(&(cur + 4))
+                    && count + 1 < MAX_BLOCK_INSNS
+                    && disabled_classes() & 32 == 0
+                {
+                    // cmp/adds/ands feeding B.cond: the flags are dead if both successors overwrite them
+                    let target = (cur + 4).wrapping_add((sext(((nx >> 5) & 0x7ffff) as u64, 19) << 2) as u64);
+                    if flags_dead_at(target, read) && flags_dead_at(cur + 8, read) {
+                        u.dead_flags = true;
+                        DEAD_FLAG_SKIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+        let mut e = E { u, pc: cur, fuse_in };
         let term = is_terminator(insn);
         e.u.insns_translated += 1;
-        if !e.translate(insn) {
+        let translated = e.translate(insn);
+        e.u.dead_flags = false;
+        if !translated {
             if term {
                 e.fallback_terminator(insn);
             } else {
@@ -439,14 +767,24 @@ pub fn emit_block(u: &mut Unit, pc: u64, read: &dyn Fn(u64) -> Option<u32>) -> u
         if term {
             return cur;
         }
+        // slide the lookahead window to start at the next instruction
+        if !u.look.is_empty() {
+            let last_was_term = is_terminator(*u.look.last().unwrap());
+            u.look.remove(0);
+            if !last_was_term && u.look.len() < LOOKAHEAD {
+                if let Some(w) = read(cur + 4 * u.look.len() as u64 + 4) {
+                    u.look.push(w);
+                }
+            }
+        }
         if count >= MAX_BLOCK_INSNS {
-            let mut e = E { u, pc: cur };
+            let mut e = E { u, pc: cur, fuse_in: None };
             e.goto(cur);
             return cur;
         }
         // Stop before running into another block of this unit: jump to it.
         if u.labels.contains_key(&cur) {
-            let mut e = E { u, pc: cur };
+            let mut e = E { u, pc: cur, fuse_in: None };
             e.goto(cur);
             return cur;
         }
@@ -523,7 +861,7 @@ impl<'a> E<'a> {
                     a!(self, sub(eax, imm as i32))
                 }
                 if s {
-                    if op == 0 { self.flags_add() } else { self.flags_sub() }
+                    if op == 0 { self.flags_add(); self.u.fuse = Some(FuseKind::Add) } else { self.flags_sub(); self.u.fuse = Some(FuseKind::Sub) }
                 }
                 self.stx(rd, rax, !s);
                 true
@@ -552,6 +890,7 @@ impl<'a> E<'a> {
                 }
                 if opc == 3 {
                     self.flags_logic();
+                    self.u.fuse = Some(FuseKind::Logic);
                     self.stx(rd, rax, false);
                 } else {
                     self.stx(rd, rax, true);
@@ -824,6 +1163,7 @@ impl<'a> E<'a> {
             }
             if opc == 3 {
                 self.flags_logic();
+                self.u.fuse = Some(FuseKind::Logic);
             }
             self.stx(rd, rax, false);
             return true;
@@ -890,8 +1230,8 @@ impl<'a> E<'a> {
             let cond = bits(insn, 15, 12);
             let nzcv = bits(insn, 3, 0);
             let imm = bit(insn, 11) != 0;
-            let mut l_else = self.u.a.create_label();
-            let mut l_end = self.u.a.create_label();
+            let mut l_else = self.new_label();
+            let mut l_end = self.new_label();
             self.cond_to_al(cond);
             a!(self, test(al, al));
             a!(self, jz(l_else));
@@ -923,6 +1263,24 @@ impl<'a> E<'a> {
             let op = bit(insn, 30);
             let o2 = bit(insn, 10);
             let cond = bits(insn, 15, 12);
+            if let Some(k) = self.fuse_in {
+                if let Some(cc_false) = x86_cc(k, cond ^ 1) {
+                    // Select on the live x86 flags: nothing below may modify them (no xor/inc/neg).
+                    self.ld_nf(rcx, rn, sf);
+                    self.ld_nf(rdx, rm, sf);
+                    match (op, o2) {
+                        (0, 0) => {}
+                        (0, _) => if sf { a!(self, lea(rdx, qword_ptr(rdx + 1))) } else { a!(self, lea(edx, dword_ptr(rdx + 1))) },
+                        (_, 0) => if sf { a!(self, not(rdx)) } else { a!(self, not(edx)) },
+                        _ => {
+                            if sf { a!(self, not(rdx)); a!(self, lea(rdx, qword_ptr(rdx + 1))) } else { a!(self, not(edx)); a!(self, lea(edx, dword_ptr(rdx + 1))) }
+                        }
+                    }
+                    self.cmov(cc_false, rcx, rdx, sf);
+                    self.stx(rd, rcx, false);
+                    return true;
+                }
+            }
             self.cond_to_al(cond);
             self.ld(rcx, rn, false, sf);
             self.ld(rdx, rm, false, sf);
@@ -1018,7 +1376,7 @@ impl<'a> E<'a> {
             a!(self, sub(eax, ecx))
         }
         if s {
-            if op == 0 { self.flags_add() } else { self.flags_sub() }
+            if op == 0 { self.flags_add(); self.u.fuse = Some(FuseKind::Add) } else { self.flags_sub(); self.u.fuse = Some(FuseKind::Sub) }
         }
     }
 
@@ -1028,9 +1386,9 @@ impl<'a> E<'a> {
             0b000010 | 0b000011 => {
                 // UDIV / SDIV (x86 faults on /0 and INT_MIN/-1; ARM does not)
                 let signed = opcode == 3;
-                let mut l_zero = self.u.a.create_label();
-                let mut l_neg = self.u.a.create_label();
-                let mut l_end = self.u.a.create_label();
+                let mut l_zero = self.new_label();
+                let mut l_neg = self.new_label();
+                let mut l_end = self.new_label();
                 self.ld(rax, rn, false, sf);
                 self.ld(rcx, rm, false, sf);
                 if sf { a!(self, test(rcx, rcx)) } else { a!(self, test(ecx, ecx)) }
@@ -1102,7 +1460,7 @@ impl<'a> E<'a> {
                 16 => {
                     // XPACI: clear PAC bits 63:56,54:47 (bit 55 clear => user pointer)
                     self.ldx(rax, rd, false);
-                    let mut l = self.u.a.create_label();
+                    let mut l = self.new_label();
                     a!(self, bt(rax, 55));
                     a!(self, jc(l));
                     self.mov_imm(rcx, 0x0000_7FFF_FFFF_FFFF);
@@ -1114,7 +1472,7 @@ impl<'a> E<'a> {
                 }
                 17 => {
                     self.ldx(rax, rd, false);
-                    let mut l = self.u.a.create_label();
+                    let mut l = self.new_label();
                     a!(self, bt(rax, 55));
                     a!(self, jc(l));
                     self.mov_imm(rcx, !0x007F_8000_0000_0000u64);
@@ -1167,8 +1525,8 @@ impl<'a> E<'a> {
             0b000100 => {
                 // CLZ via BSR
                 self.ld(rax, rn, false, sf);
-                let mut l_zero = self.u.a.create_label();
-                let mut l_end = self.u.a.create_label();
+                let mut l_zero = self.new_label();
+                let mut l_end = self.new_label();
                 if sf {
                     a!(self, bsr(rcx, rax));
                     a!(self, jz(l_zero));
@@ -1223,6 +1581,17 @@ impl<'a> E<'a> {
             if cond >= 14 {
                 self.goto(target);
                 return true;
+            }
+            if let Some(k) = self.fuse_in {
+                if let Some(cc_nt) = x86_cc(k, cond ^ 1) {
+                    // x86 flags of the preceding compare are still live: branch on them directly.
+                    let mut l_nt = self.new_label();
+                    self.jcc(cc_nt, l_nt);
+                    self.goto(target);
+                    self.u.a.set_label(&mut l_nt).unwrap();
+                    self.goto(next);
+                    return true;
+                }
             }
             self.cond_to_al(cond);
             self.cond_branch(target, next);
@@ -1338,7 +1707,7 @@ impl<'a> E<'a> {
 
     /// al holds the condition; emit taken/not-taken successors.
     fn cond_branch(&mut self, taken: u64, not_taken: u64) {
-        let mut l_nt = self.u.a.create_label();
+        let mut l_nt = self.new_label();
         a!(self, test(al, al));
         a!(self, jz(l_nt));
         self.goto(taken);
@@ -1349,7 +1718,7 @@ impl<'a> E<'a> {
     /// Indirect branch to the guest address in rax via the per-thread
     /// indirect-branch table; misses go to the dispatcher.
     fn indirect(&mut self, _is_ret: bool) {
-        let mut l_miss = self.u.a.create_label();
+        let mut l_miss = self.new_label();
         a!(self, mov(rcx, rax));
         a!(self, shr(ecx, 2));
         a!(self, and(ecx, (crate::jit::IBTC_SIZE - 1) as i32));
@@ -1458,7 +1827,7 @@ impl<'a> E<'a> {
                 2 => a!(self, mov(eax, dword_ptr(rsi))),
                 _ => a!(self, mov(rax, qword_ptr(rsi))),
             }
-            let mut retry = self.u.a.create_label();
+            let mut retry = self.new_label();
             self.u.a.set_label(&mut retry).unwrap();
             self.mov_rr(rdx, rax);
             match opc {
@@ -1557,6 +1926,7 @@ impl<'a> E<'a> {
                     }
                     a!(self, add(r8, imm as i32));
                     a!(self, mov(qword_ptr(r15 + xoff(rn)), r8));
+                    self.rc_wrote(rn, r8);
                     true
                 }
                 _ => {
@@ -1566,6 +1936,7 @@ impl<'a> E<'a> {
                         return false;
                     }
                     a!(self, mov(qword_ptr(r15 + xoff(rn)), r8));
+                    self.rc_wrote(rn, r8);
                     true
                 }
             }
@@ -1744,6 +2115,7 @@ impl<'a> E<'a> {
         }
         if idx == 1 || idx == 3 {
             a!(self, mov(qword_ptr(r15 + xoff(rn)), r8));
+            self.rc_wrote(rn, r8);
         }
         true
     }
@@ -1872,7 +2244,7 @@ impl<'a> E<'a> {
 
     /// Replace the x86 "real indefinite" NaN produced by invalid operations with the ARM default NaN.
     fn fix_default_nan(&mut self, double: bool) {
-        let mut skip = self.u.a.create_label();
+        let mut skip = self.new_label();
         if double {
             a!(self, movq(rax, xmm0));
             self.mov_imm(rcx, 0xFFF8_0000_0000_0000);
@@ -2369,8 +2741,8 @@ impl<'a> E<'a> {
             let double = ftype == 1;
             self.ld(rax, rn, false, sf);
             if unsigned && sf {
-                let mut neg = self.u.a.create_label();
-                let mut done = self.u.a.create_label();
+                let mut neg = self.new_label();
+                let mut done = self.new_label();
                 a!(self, test(rax, rax));
                 a!(self, js(neg));
                 if double { a!(self, cvtsi2sd(xmm0, rax)); } else { a!(self, cvtsi2ss(xmm0, rax)); }
@@ -2431,10 +2803,10 @@ impl<'a> E<'a> {
                 }
                 a!(self, ucomiss(xmm0, xmm1));
             }
-            let mut un = self.u.a.create_label();
-            let mut lt = self.u.a.create_label();
-            let mut eq = self.u.a.create_label();
-            let mut end = self.u.a.create_label();
+            let mut un = self.new_label();
+            let mut lt = self.new_label();
+            let mut eq = self.new_label();
+            let mut end = self.new_label();
             a!(self, jp(un));
             a!(self, jb(lt));
             a!(self, je(eq));
@@ -2472,9 +2844,9 @@ impl<'a> E<'a> {
                 if sf { a!(self, cvttss2si(rax, xmm0)); } else { a!(self, cvttss2si(eax, xmm0)); }
             }
             // x86 returns the "integer indefinite" value on overflow/NaN; ARM saturates (NaN -> 0).
-            let mut ok = self.u.a.create_label();
-            let mut nan = self.u.a.create_label();
-            let mut neg = self.u.a.create_label();
+            let mut ok = self.new_label();
+            let mut nan = self.new_label();
+            let mut neg = self.new_label();
             if sf {
                 self.mov_imm(rcx, 0x8000_0000_0000_0000);
                 a!(self, cmp(rax, rcx));
@@ -2507,8 +2879,8 @@ impl<'a> E<'a> {
             let cond = bits(insn, 15, 12);
             let nzcv = bits(insn, 3, 0);
             let double = ftype == 1;
-            let mut cmp_it = self.u.a.create_label();
-            let mut end = self.u.a.create_label();
+            let mut cmp_it = self.new_label();
+            let mut end = self.new_label();
             self.cond_to_al(cond);
             a!(self, test(al, al));
             a!(self, jnz(cmp_it));
@@ -2524,9 +2896,9 @@ impl<'a> E<'a> {
                 a!(self, movss(xmm1, dword_ptr(r15 + voff(rm))));
                 a!(self, ucomiss(xmm0, xmm1));
             }
-            let mut un = self.u.a.create_label();
-            let mut lt = self.u.a.create_label();
-            let mut eq = self.u.a.create_label();
+            let mut un = self.new_label();
+            let mut lt = self.new_label();
+            let mut eq = self.new_label();
             a!(self, jp(un));
             a!(self, jb(lt));
             a!(self, je(eq));
@@ -2549,8 +2921,8 @@ impl<'a> E<'a> {
             let cond = bits(insn, 15, 12);
             let double = ftype == 1;
             self.cond_to_al(cond);
-            let mut use_m = self.u.a.create_label();
-            let mut end = self.u.a.create_label();
+            let mut use_m = self.new_label();
+            let mut end = self.new_label();
             a!(self, test(al, al));
             a!(self, jz(use_m));
             if double { a!(self, mov(rax, qword_ptr(r15 + voff(rn)))); } else { a!(self, mov(eax, dword_ptr(r15 + voff(rn)))); }
@@ -3076,10 +3448,10 @@ impl<'a> E<'a> {
                     (_, false) => a!(self, mov(rax, qword_ptr(r15 + vo))),
                 }
                 a!(self, movsx(ecx, byte_ptr(r15 + voff(rm) + eo)));
-                let mut right = self.u.a.create_label();
-                let mut zero = self.u.a.create_label();
-                let mut right_big = self.u.a.create_label();
-                let mut done = self.u.a.create_label();
+                let mut right = self.new_label();
+                let mut zero = self.new_label();
+                let mut right_big = self.new_label();
+                let mut done = self.new_label();
                 a!(self, test(cl, cl));
                 a!(self, js(right));
                 a!(self, cmp(cl, bitsz as i32));

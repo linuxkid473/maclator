@@ -111,6 +111,11 @@ fn main() {
     if args.is_empty() {
         usage();
     }
+    if paths::cache_dir().is_none() && !std::path::Path::new("/System/Library/dyld/dyld_shared_cache_arm64e").exists() {
+        if let Some(d) = paths::discover_sysroot() {
+            paths::set_cache_dir(&d);
+        }
+    }
     {
         // Options that re-launched arm64 children must inherit.
         let mut fwd: Vec<String> = vec!["--dyld".into(), dyld.clone()];

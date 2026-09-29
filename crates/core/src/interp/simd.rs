@@ -200,6 +200,9 @@ fn frint_n<T: Fp>(x: T, mode: u32, n: u32) -> T {
 // ---------------- dispatch ----------------
 
 pub(crate) fn simd_fp(cpu: &mut Cpu, insn: u32) -> R {
+    if let Some(r) = super::fp16::try_exec(cpu, insn) {
+        return r;
+    }
     // Scalar FP (incl. conversions, which use bit 31 as sf)
     if insn & 0x7F00_0000 == 0x1E00_0000 {
         return fp_scalar(cpu, insn);

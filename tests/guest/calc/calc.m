@@ -59,6 +59,20 @@
     [_win makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
     _fresh = YES;
+    if (getenv("CALC_SNAPSHOT")) {
+        // Press 7 x 6 =, let AppKit draw, then dump the window contents to a PNG.
+        for (NSString *k in @[@"7", @"×", @"6", @"="]) [self press:k];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            NSView *cv = self.win.contentView.superview ?: self.win.contentView;
+            NSBitmapImageRep *rep = [cv bitmapImageRepForCachingDisplayInRect:cv.bounds];
+            [cv cacheDisplayInRect:cv.bounds toBitmapImageRep:rep];
+            NSData *png = [rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
+            [png writeToFile:@"/tmp/calc_snapshot.png" atomically:YES];
+            printf("snapshot: display=%s png=%lu bytes\n", self.display.stringValue.UTF8String, (unsigned long)png.length);
+            fflush(stdout);
+            [NSApp terminate:nil];
+        });
+    }
     if (getenv("CALC_SELFTEST")) {
         for (NSString *k in @[@"2", @"+", @"3", @"×", @"4", @"="]) [self press:k];
         printf("selftest 2+3x4 (left-to-right) = %s\n", _display.stringValue.UTF8String);

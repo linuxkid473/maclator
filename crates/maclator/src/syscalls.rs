@@ -295,6 +295,10 @@ fn bsd_inner(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
             let r = crate::workq::kevent_redirect(n, &args).unwrap_or_else(|| hostsys::unix(n, &args));
             set_res(cpu, r);
         }
+        // bsdthread_ctl(BSDTHREAD_CTL_SET_SELF): thread QoS/priority/voucher. Guest threads are
+        // host threads we schedule ourselves, and the host kernel rejects some arm64-era
+        // priority combinations with EINVAL (libdispatch then aborts), so just accept it.
+        478 if args[0] == 0x100 => set_ok(cpu, 0, 0),
         92 if matches!(args[1], 59 | 61 | 97 | 98 | 103) => {
             // Code-signing fcntls (F_ADDSIGS, F_ADDFILESIGS[_RETURN/_INFO], F_CHECK_LV):
             // the Intel host kernel cannot validate arm64 signatures, so accept them.

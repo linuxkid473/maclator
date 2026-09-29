@@ -5,6 +5,7 @@
 //! checks it against real hardware.
 
 mod dp;
+mod fp16;
 mod ldst;
 pub mod simd;
 mod sys;

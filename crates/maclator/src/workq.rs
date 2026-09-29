@@ -54,6 +54,7 @@ const KEVENT_FLAG_PARKING: u64 = 0x800;
 
 const EVFILT_READ: i16 = -1;
 const EVFILT_WORKLOOP: i16 = -17;
+const EVFILT_USER_: i16 = -10;
 const EV_ADD: u16 = 0x1;
 const EV_DELETE: u16 = 0x2;
 const EV_ENABLE: u16 = 0x4;
@@ -239,6 +240,7 @@ fn spawn_worker_thread(w: Worker, job: Job, rx: Receiver<Job>) {
                 cpu.tpidrro_el0 = pthread + tsd_off;
                 cpu.x[31] = job.stack_top & !0xf;
                 PARK.with(|p| p.set(false));
+                IS_MANAGER.with(|m| m.set(job.flags & WQ_FLAG_THREAD_EVENT_MANAGER != 0));
                 BOUND_WL.with(|b| b.set(job.wl));
                 if let Some(id) = job.wl {
                     if let Some(st) = WL.lock().unwrap().as_mut() {
@@ -280,7 +282,97 @@ fn flags_for(pp: u64) -> u64 {
     f
 }
 
+// ---- single event-manager thread ----
+
+/// libdispatch requires at most one event-manager thread at a time; the
+/// kernel keeps the manager's events pending while one is bound. Events that
+/// fire while the manager runs are held here and handed over when it parks.
+#[derive(Default)]
+struct ManagerState {
+    active: bool,
+    pending: Vec<Kev>,
+}
+
+static MANAGER: Mutex<Option<ManagerState>> = Mutex::new(None);
+
+thread_local! {
+    static IS_MANAGER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Claim the manager slot for a new manager thread. Returns false when one is
+/// already running (the event, if any, is queued for later).
+fn claim_manager(ev: Option<Kev>) -> bool {
+    let mut g = MANAGER.lock().unwrap();
+    let st = g.get_or_insert_with(ManagerState::default);
+    if st.active {
+        if let Some(ev) = ev {
+            // EV_CLEAR user events coalesce; other events are kept in order.
+            if !st.pending.iter().any(|k| k.filter == ev.filter && k.ident == ev.ident && ev.filter == EVFILT_USER_) {
+                st.pending.push(ev);
+            }
+        }
+        return false;
+    }
+    st.active = true;
+    true
+}
+
+/// The manager thread is parking: release the slot and start a new manager
+/// for any events that fired meanwhile.
+fn release_manager() {
+    let pending = {
+        let mut g = MANAGER.lock().unwrap();
+        let st = g.get_or_insert_with(ManagerState::default);
+        st.active = false;
+        std::mem::take(&mut st.pending)
+    };
+    if pending.is_empty() {
+        return;
+    }
+    let Some(w) = take_worker() else { return };
+    if !claim_manager(None) {
+        IDLE.lock().unwrap().push(w);
+        return;
+    }
+    let list = w.kevent_list();
+    let n = pending.len().min(WQ_KEVENT_LIST_LEN as usize);
+    for (i, k) in pending.iter().take(n).enumerate() {
+        unsafe { k.write(list + i as u64 * KEV_SIZE) };
+    }
+    let flags = flags_for(PP_EVENT_MANAGER) | WQ_FLAG_THREAD_KEVENT;
+    let stack_top = w.data_buf() + WQ_KEVENT_DATA_SIZE;
+    start_job(w, Job { flags, kevent_list: list, nevents: n as u64, stack_top, wl: None });
+}
+
 // ---- the anonymous workq kqueue ----
+
+/// QoS/priority each knote on the workq kqueue was registered with, keyed by
+/// (filter, ident). The host kernel does not hand the guest's pthread priority
+/// (e.g. the event-manager flag) back on fired events, but the thread we start
+/// for the event depends on it.
+static ANON_QOS: Mutex<Option<HashMap<(i16, u64), i32>>> = Mutex::new(None);
+
+fn record_anon_qos(changes: u64, nchanges: u64) {
+    let mut g = ANON_QOS.lock().unwrap();
+    let m = g.get_or_insert_with(HashMap::new);
+    for i in 0..nchanges {
+        let ke = unsafe { Kev::read(changes + i * KEV_SIZE) };
+        if ke.flags & EV_DELETE != 0 {
+            m.remove(&(ke.filter, ke.ident));
+        } else if ke.flags & EV_ADD != 0 {
+            m.insert((ke.filter, ke.ident), ke.qos);
+        }
+    }
+}
+
+fn restore_anon_qos(k: &mut Kev) {
+    if k.qos != 0 {
+        return;
+    }
+    if let Some(q) = ANON_QOS.lock().unwrap().as_ref().and_then(|m| m.get(&(k.filter, k.ident)).copied()) {
+        k.qos = q;
+    }
+}
 
 static ANON_KQ: AtomicI32 = AtomicI32::new(-1);
 static ANON_MONITOR: Once = Once::new();
@@ -308,9 +400,20 @@ fn anon_monitor() {
             IDLE.lock().unwrap().push(w);
             continue;
         }
-        let qos = unsafe { Kev::read(list) }.qos as u32 as u64;
+        let mut ev = unsafe { Kev::read(list) };
+        restore_anon_qos(&mut ev);
+        unsafe { ev.write(list) };
+        let qos = ev.qos as u32 as u64;
         let flags = flags_for(qos) | WQ_FLAG_THREAD_KEVENT;
+        if crate::syscalls::TRACE.load(Ordering::Relaxed) {
+            let k = unsafe { Kev::read(list) };
+            eprintln!("[workq] anon event ident={:#x} filter={} flags={:#x} qos={:#x} fflags={:#x} data={:#x} udata={:#x} -> thread flags={:#x} n={}", k.ident, k.filter, k.flags, k.qos, k.fflags, k.data, k.udata, flags, r.rax);
+        }
         let stack_top = w.data_buf() + avail;
+        if flags & WQ_FLAG_THREAD_EVENT_MANAGER != 0 && !claim_manager(Some(ev)) {
+            IDLE.lock().unwrap().push(w);
+            continue;
+        }
         start_job(w, Job { flags, kevent_list: list, nevents: r.rax, stack_top, wl: None });
     }
 }
@@ -612,6 +715,9 @@ fn kevent_id(args: &[u64; 8]) -> hostsys::SysResult {
         for i in 0..nchanges {
             let ke = unsafe { Kev::read(changes + i * KEV_SIZE) };
             let err = wl_apply(st, wl_id, &ke);
+            if crate::syscalls::TRACE.load(std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("[kev]   wl={:#x} chg ident={:#x} filter={} flags={:#x} fflags={:#x} data={:#x} qos={:#x} -> err={}", wl_id, ke.ident, ke.filter, ke.flags, ke.fflags, ke.data, ke.qos, err);
+            }
             if err == 0 && ke.filter == EVFILT_WORKLOOP && ke.fflags & NOTE_WL_COMMANDS_MASK == NOTE_WL_SYNC_WAIT && ke.flags & EV_DELETE == 0 {
                 wait_on = Some(ke.ident);
             }
@@ -667,6 +773,7 @@ pub fn kevent_redirect(n: u64, args: &[u64; 8]) -> Option<hostsys::SysResult> {
             if flags & KEVENT_FLAG_WORKQ == 0 {
                 return None;
             }
+            record_anon_qos(args[1], args[2]);
             let mut a = *args;
             a[0] = anon_kq() as u64;
             a[7] = flags & !(KEVENT_FLAG_WORKQ | KEVENT_FLAG_PARKING);
@@ -691,6 +798,10 @@ pub fn kernreturn(_cpu: &mut Cpu, a: &[u64; 8]) -> Result<u64, u64> {
             for _ in 0..count {
                 let Some(w) = take_worker() else { return Err(libc::EAGAIN as u64) };
                 let mut flags = flags_for(pp);
+                if flags & WQ_FLAG_THREAD_EVENT_MANAGER != 0 && !claim_manager(None) {
+                    IDLE.lock().unwrap().push(w);
+                    continue;
+                }
                 if flags & WQ_FLAG_THREAD_EVENT_MANAGER == 0 {
                     flags &= !WQ_FLAG_THREAD_KEVENT;
                 }
@@ -702,6 +813,7 @@ pub fn kernreturn(_cpu: &mut Cpu, a: &[u64; 8]) -> Result<u64, u64> {
         WQOPS_THREAD_KEVENT_RETURN | WQOPS_THREAD_RETURN => {
             if a[0] == WQOPS_THREAD_KEVENT_RETURN && a[1] != 0 && (a[2] as i64) > 0 {
                 let kq = anon_kq();
+                record_anon_qos(a[1], a[2]);
                 kevent_qos(kq, a[1], a[2], 0, 0, 0, 0, KEVENT_FLAG_IMMEDIATE);
             }
             park();
@@ -756,6 +868,9 @@ pub fn kernreturn(_cpu: &mut Cpu, a: &[u64; 8]) -> Result<u64, u64> {
 }
 
 fn park() {
+    if IS_MANAGER.with(|m| m.replace(false)) {
+        release_manager();
+    }
     PARK.with(|p| p.set(true));
     BOUND_WL.with(|b| b.set(None));
     crate::engine::exit_current_thread();

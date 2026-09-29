@@ -215,7 +215,9 @@ fn system(cpu: &mut Cpu, insn: u32) -> R {
                 (4, 1) => {
                     // DC ZVA: zero 64-byte block
                     let base = addr & !63;
-                    unsafe { std::ptr::write_bytes(mem::host(base), 0, 64) };
+                    for i in 0..4 {
+                        unsafe { mem::w128(base + i * 16, 0) };
+                    }
                 }
                 (5, 1) => {
                     // IC IVAU: let the runtime invalidate translations

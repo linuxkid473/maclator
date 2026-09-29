@@ -25,9 +25,37 @@ pub fn flush_profile() {
     crate::jit::flush_profile();
 }
 
+/// Registry of running guest CPUs (for SIGUSR1 diagnostics).
+static CPUS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
 pub fn run_thread(cpu: &mut Cpu) {
     EXIT_REQUESTED.with(|f| f.set(false));
+    let key = cpu as *mut Cpu as usize;
+    CPUS.lock().unwrap().push(key);
     crate::jit::run(cpu);
+    CPUS.lock().unwrap().retain(|&k| k != key);
+}
+
+extern "C" fn dump_threads(_: i32) {
+    crate::workq::dump_log();
+    // Best effort, racy by design: this is a debugging aid.
+    let list = CPUS.try_lock().map(|g| g.clone()).unwrap_or_default();
+    for (i, &p) in list.iter().enumerate() {
+        let cpu = unsafe { &*(p as *const Cpu) };
+        eprintln!("=== guest thread {i}: pc {:#x} {}  lr {}", cpu.pc, crate::symbols::describe(cpu.pc), crate::symbols::describe(cpu.x[30]));
+        eprintln!("{}", cpu.dump());
+        crate::symbols::backtrace(cpu);
+        for r in [0usize, 1, 19, 20, 21, 22] {
+            if let Some(v) = crate::guestmem::read_u64(cpu.x[r]) {
+                let v2 = crate::guestmem::read_u64(cpu.x[r] + 8).unwrap_or(0);
+                eprintln!("  [x{r}] = {:#x} {:#x}", v, v2);
+            }
+        }
+    }
+}
+
+pub fn install_debug_handler() {
+    unsafe { libc::signal(libc::SIGUSR1, dump_threads as usize) };
 }
 
 /// Handle an exit from interpreter/JIT. Returns false when the thread should stop.

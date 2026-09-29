@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 maclator-core = { path = "../core" }
 libc = "0.2"
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "code_asm", "encoder", "block_encoder"] }

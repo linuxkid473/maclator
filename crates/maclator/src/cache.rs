@@ -124,7 +124,12 @@ pub fn map_and_slide_2(files_count: u32, files: u64, mappings_count: u32, mappin
     if std::env::var_os("MACLATOR_TRACE").is_some() {
         eprintln!("[maclator] mapped arm64 shared cache at {:#x} (slide {:#x}), {} regions", CACHE_BASE, slide, ranges.len());
     }
+    let end = ranges.iter().map(|(a, s)| a + s).max().unwrap_or(CACHE_BASE);
     *guard = Some(MappedCache { base: CACHE_BASE, slide, ranges });
+    drop(guard);
+    let mut uuid = [0u8; 16];
+    unsafe { std::ptr::copy_nonoverlapping((CACHE_BASE + 88) as *const u8, uuid.as_mut_ptr(), 16) };
+    crate::aot::register_cache(uuid, CACHE_BASE, end);
     0
 }
 

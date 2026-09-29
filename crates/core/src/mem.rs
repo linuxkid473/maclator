@@ -32,6 +32,40 @@ pub fn host(addr: u64) -> *mut u8 {
     addr as *mut u8
 }
 
+// ---- write logging (JIT verification) ----
+
+use std::cell::{Cell, RefCell};
+
+thread_local! {
+    static LOGGING: Cell<bool> = const { Cell::new(false) };
+    /// (address, previous 16 bytes, length)
+    static WLOG: RefCell<Vec<(u64, [u8; 16], usize)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Start recording the prior contents of every guest write on this thread.
+pub fn log_start() {
+    WLOG.with(|l| l.borrow_mut().clear());
+    LOGGING.with(|f| f.set(true));
+}
+
+/// Stop recording and return the log (in write order).
+pub fn log_stop() -> Vec<(u64, [u8; 16], usize)> {
+    LOGGING.with(|f| f.set(false));
+    WLOG.with(|l| std::mem::take(&mut *l.borrow_mut()))
+}
+
+/// Global switch so the common path costs a single relaxed load.
+pub static LOGGING_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[inline(always)]
+fn note_write(addr: u64, len: usize) {
+    if LOGGING_ENABLED.load(Ordering::Relaxed) && LOGGING.with(|f| f.get()) {
+        let mut old = [0u8; 16];
+        unsafe { std::ptr::copy_nonoverlapping(host(addr), old.as_mut_ptr(), len) };
+        WLOG.with(|l| l.borrow_mut().push((addr, old, len)));
+    }
+}
+
 macro_rules! rw {
     ($r:ident, $w:ident, $t:ty) => {
         #[inline(always)]
@@ -40,6 +74,7 @@ macro_rules! rw {
         }
         #[inline(always)]
         pub unsafe fn $w(addr: u64, v: $t) {
+            note_write(addr, std::mem::size_of::<$t>());
             std::ptr::write_unaligned(host(addr) as *mut $t, v)
         }
     };
@@ -75,6 +110,7 @@ pub unsafe fn write_sized(addr: u64, size: u32, v: u64) {
 #[inline(always)]
 pub unsafe fn cas_sized(addr: u64, size: u32, expected: u64, new: u64) -> u64 {
     use std::sync::atomic::*;
+    note_write(addr, size as usize);
     let p = host(addr);
     match size {
         1 => match (*(p as *const AtomicU8)).compare_exchange(expected as u8, new as u8, Ordering::SeqCst, Ordering::SeqCst) { Ok(v) | Err(v) => v as u64 },
@@ -87,6 +123,7 @@ pub unsafe fn cas_sized(addr: u64, size: u32, expected: u64, new: u64) -> u64 {
 /// 128-bit compare-and-swap (for CASP / STXP). Returns old value.
 #[inline(always)]
 pub unsafe fn cas128(addr: u64, expected: u128, new: u128) -> u128 {
+    note_write(addr, 16);
     let p = host(addr) as *mut u128;
     #[cfg(target_arch = "x86_64")]
     {

@@ -65,7 +65,9 @@ const NOTE_WL_SYNC_WAIT: u32 = 0x4;
 const NOTE_WL_SYNC_WAKE: u32 = 0x8;
 const NOTE_WL_SYNC_IPC: u32 = 0x8000_0000;
 const NOTE_WL_END_OWNERSHIP: u32 = 0x20;
+const NOTE_WL_DISCOVER_OWNER: u32 = 0x80;
 const NOTE_WL_IGNORE_ESTALE: u32 = 0x100;
+const NOTE_WL_COMMANDS_MASK: u32 = 0x8000_000f;
 
 const SYS_KEVENT_QOS: u64 = 374;
 const SYS_KEVENT_ID: u64 = 375;
@@ -238,6 +240,13 @@ fn spawn_worker_thread(w: Worker, job: Job, rx: Receiver<Job>) {
                 cpu.x[31] = job.stack_top & !0xf;
                 PARK.with(|p| p.set(false));
                 BOUND_WL.with(|b| b.set(job.wl));
+                if let Some(id) = job.wl {
+                    if let Some(st) = WL.lock().unwrap().as_mut() {
+                        if let Some(w) = st.loops.get_mut(&id) {
+                            w.servicer = owner_key(port);
+                        }
+                    }
+                }
                 crate::engine::run_thread(&mut cpu);
                 if !PARK.with(|p| p.get()) {
                     break;
@@ -312,17 +321,66 @@ fn anon_monitor() {
 struct Workloop {
     /// Host kqueue holding this workloop's regular knotes (-1 until needed).
     kq: i32,
-    /// Pending thread request (the EVFILT_WORKLOOP knote), if any.
+    /// The thread-request knote (EVFILT_WORKLOOP), if any.
     thread_request: Option<Kev>,
+    /// The thread request is active (fired and not yet delivered). Each
+    /// delivery hands libdispatch a +1 reference, so it must be delivered
+    /// once per activation.
+    tr_active: bool,
     /// A servicer thread is currently bound.
     bound: bool,
     /// Regular knotes have fired and need a servicer.
     needs_service: bool,
+    /// Thread (mach port name) that owns the workloop, e.g. a dispatch_sync
+    /// drainer. No async servicer is started while there is an owner.
+    owner: u64,
+    /// Port of the bound servicer thread.
+    servicer: u64,
 }
 
+/// A NOTE_WL_SYNC_WAIT/WAKE knote (ident = waiter thread id).
 #[derive(Default)]
 struct SyncKnote {
+    /// NOTE_WL_SYNC_WAKE has been applied (sticky until the knote is deleted).
     woken: bool,
+}
+
+static WLOG: Mutex<std::collections::VecDeque<String>> = Mutex::new(std::collections::VecDeque::new());
+
+pub fn wlog_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("MACLATOR_WL_LOG").is_some())
+}
+
+pub fn wlog(msg: String) {
+    let mut l = WLOG.lock().unwrap();
+    if l.len() >= 600 {
+        l.pop_front();
+    }
+    l.push_back(msg);
+}
+
+pub fn dump_log() {
+    if let Ok(l) = WLOG.try_lock() {
+        for m in l.iter() {
+            eprintln!("  wl| {m}");
+        }
+    }
+}
+
+fn owner_tracking() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("MACLATOR_WL_NO_OWNER").is_none())
+}
+
+/// Thread identity as stored in dispatch locks: the port name with its low
+/// two bits masked off (the kernel's ipc_entry_name_mask undoes this).
+fn current_port() -> u64 {
+    owner_key(unsafe { libc::pthread_mach_thread_np(libc::pthread_self()) as u64 })
+}
+
+fn owner_key(port: u64) -> u64 {
+    port & !3
 }
 
 struct WlState {
@@ -387,17 +445,20 @@ fn watch_wl_kq(fd: i32, wl_id: u64, first: bool) {
 /// If the workloop needs a servicer and has none, bind a worker to it.
 fn schedule(st: &mut WlState, wl_id: u64) {
     let Some(wl) = st.loops.get_mut(&wl_id) else { return };
-    if wl.bound || (wl.thread_request.is_none() && !wl.needs_service) {
+    let tr_pending = wl.thread_request.is_some() && wl.tr_active;
+    let owned = wl.owner != 0 && owner_tracking();
+    if wl.bound || owned || (!tr_pending && !wl.needs_service) {
         return;
     }
     let Some(w) = take_worker() else { return };
     let list = w.kevent_list();
     let mut n: u64 = 0;
     let mut qos: u64 = 0;
-    if let Some(tr) = wl.thread_request {
+    if let (Some(tr), true) = (wl.thread_request, wl.tr_active) {
         unsafe { tr.write(list) };
         qos = tr.qos as u32 as u64;
         n = 1;
+        wl.tr_active = false; // delivery deactivates the knote
     }
     // kqueue id lives just below the event list; data goes below that.
     unsafe { *((list - 8) as *mut u64) = wl_id };
@@ -421,6 +482,7 @@ fn schedule(st: &mut WlState, wl_id: u64) {
         return;
     }
     wl.bound = true;
+    if wlog_enabled() { wlog(format!("schedule wl{:x}: deliver n={} (tr={})", wl_id & 0xffffff, n, wl.thread_request.is_some())); }
     let flags = (flags_for(qos) & !(WQ_FLAG_THREAD_EVENT_MANAGER)) | WQ_FLAG_THREAD_KEVENT | WQ_FLAG_THREAD_WORKLOOP;
     start_job(w, Job { flags, kevent_list: list, nevents: n, stack_top: data_buf + avail, wl: Some(wl_id) });
 }
@@ -459,51 +521,84 @@ fn wl_apply(st: &mut WlState, wl_id: u64, ke: &Kev) -> i64 {
         return 0;
     }
     let ff = ke.fflags;
-    if ff & NOTE_WL_SYNC_IPC != 0 {
+    let cmd = ff & NOTE_WL_COMMANDS_MASK;
+    if cmd == NOTE_WL_SYNC_IPC {
         return libc::ENOENT as i64;
     }
-    if ff & NOTE_WL_THREAD_REQUEST != 0 {
-        // Stale-state check: *(ext[0]) & mask must equal value & mask.
-        let (addr, mask, value) = (ke.ext[0], ke.ext[1], ke.ext[2]);
-        if addr != 0 && mask != 0 {
-            let cur = crate::guestmem::read_u64(addr).unwrap_or(0);
-            if cur & mask != value & mask {
-                return if ff & NOTE_WL_IGNORE_ESTALE != 0 { 0 } else { libc::ESTALE as i64 };
+    let me = current_port();
+    let wl = st.loops.entry(wl_id).or_insert_with(|| Workloop { kq: -1, ..Default::default() });
+    // State check and owner discovery (filt_wlupdate).
+    // EV_EXTIDX_WL_ADDR = 1, _MASK = 2, _VALUE = 3 (0 is the lane)
+    let (addr, mask, value) = (ke.ext[1], ke.ext[2], ke.ext[3]);
+    let mut err: i64 = 0;
+    let mut new_owner = wl.owner;
+    if addr != 0 {
+        match crate::guestmem::read_u64(addr) {
+            None => return libc::EFAULT as i64,
+            Some(cur) => {
+                if cur & mask != value & mask {
+                    err = libc::ESTALE as i64;
+                } else if ff & NOTE_WL_DISCOVER_OWNER != 0 {
+                    let name = (cur as u32 & !3) as u64;
+                    if name != 0 {
+                        new_owner = name;
+                    }
+                }
             }
         }
-        let wl = st.loops.entry(wl_id).or_insert_with(|| Workloop { kq: -1, ..Default::default() });
-        if ke.flags & EV_DELETE != 0 {
-            wl.thread_request = None;
-        } else if ke.flags & EV_ADD != 0 {
-            let mut tr = *ke;
-            tr.flags = EV_ADD | EV_ENABLE;
-            wl.thread_request = Some(tr);
+    }
+    if ff & NOTE_WL_END_OWNERSHIP != 0 && new_owner == me {
+        new_owner = 0;
+    }
+    if wl.bound && new_owner == wl.servicer {
+        new_owner = 0;
+    }
+    let owner_released = wl.owner != 0 && new_owner == 0;
+    if wlog_enabled() { wlog(format!("t{:x} wl{:x} apply id={:x} fl={:x} ff={:x} qos={:x} err={} owner {:x}->{:x} bound={} tr={}/{}", me, wl_id & 0xffffff, ke.ident & 0xffffff, ke.flags, ke.fflags, ke.qos, err, wl.owner, new_owner, wl.bound, wl.thread_request.is_some(), wl.tr_active)); }
+    wl.owner = new_owner;
+    if err == libc::ESTALE as i64 && ff & NOTE_WL_IGNORE_ESTALE != 0 {
+        // The update is dropped silently.
+        if owner_released {
             schedule(st, wl_id);
         }
         return 0;
     }
-    let key = (wl_id, ke.ident);
-    if ff & NOTE_WL_SYNC_WAKE != 0 {
-        if ke.flags & EV_DELETE != 0 {
-            if st.sync.remove(&key).is_none() && ff & NOTE_WL_END_OWNERSHIP != 0 {
-                return libc::ENOENT as i64;
+    let mut result: i64 = err;
+    if err == 0 {
+        if cmd == NOTE_WL_THREAD_REQUEST {
+            if ke.flags & EV_DELETE != 0 {
+                wl.thread_request = None;
+                wl.tr_active = false;
+            } else if ke.flags & EV_ADD != 0 {
+                // Attaching or touching the thread request fires it.
+                let mut tr = *ke;
+                tr.flags = EV_ADD | EV_ENABLE;
+                wl.thread_request = Some(tr);
+                wl.tr_active = true;
             }
-            WL_CV.notify_all();
-            return 0;
+        } else if cmd == NOTE_WL_SYNC_WAKE || cmd == NOTE_WL_SYNC_WAIT || cmd == 0 {
+            let key = (wl_id, ke.ident);
+            if ke.flags & EV_DELETE != 0 {
+                // Dropping a waiter knote wakes the waiter.
+                if st.sync.remove(&key).is_none() {
+                    result = libc::ENOENT as i64;
+                }
+                WL_CV.notify_all();
+            } else if cmd == NOTE_WL_SYNC_WAKE {
+                st.sync.entry(key).or_default().woken = true;
+                WL_CV.notify_all();
+            } else if cmd == NOTE_WL_SYNC_WAIT {
+                st.sync.entry(key).or_default();
+            } else {
+                result = libc::EINVAL as i64;
+            }
+        } else {
+            result = libc::EINVAL as i64;
         }
-        st.sync.entry(key).or_default().woken = true;
-        WL_CV.notify_all();
-        return 0;
     }
-    if ff & NOTE_WL_SYNC_WAIT != 0 {
-        // handled by the caller (it blocks)
-        return 0;
-    }
-    if ke.flags & EV_DELETE != 0 {
-        st.sync.remove(&key);
-        return 0;
-    }
-    libc::EINVAL as i64
+    schedule(st, wl_id);
+    let _ = owner_released;
+    result
 }
 
 /// kevent_id() on a workloop.
@@ -516,11 +611,10 @@ fn kevent_id(args: &[u64; 8]) -> hostsys::SysResult {
         let st = g.get_or_insert_with(|| WlState { loops: HashMap::new(), sync: HashMap::new(), by_fd: HashMap::new() });
         for i in 0..nchanges {
             let ke = unsafe { Kev::read(changes + i * KEV_SIZE) };
-            if ke.filter == EVFILT_WORKLOOP && ke.fflags & NOTE_WL_SYNC_WAIT != 0 && ke.flags & EV_DELETE == 0 {
-                wait_on = Some(ke.ident);
-                continue;
-            }
             let err = wl_apply(st, wl_id, &ke);
+            if err == 0 && ke.filter == EVFILT_WORKLOOP && ke.fflags & NOTE_WL_COMMANDS_MASK == NOTE_WL_SYNC_WAIT && ke.flags & EV_DELETE == 0 {
+                wait_on = Some(ke.ident);
+            }
             if err != 0 && flags & KEVENT_FLAG_ERROR_EVENTS != 0 && nerr < nout {
                 let mut e = ke;
                 e.flags |= EV_ERROR;
@@ -529,12 +623,9 @@ fn kevent_id(args: &[u64; 8]) -> hostsys::SysResult {
                 nerr += 1;
             }
         }
-        if let Some(tid) = wait_on {
-            // Register the waiter (a wake may already be preposted).
-            st.sync.entry((wl_id, tid)).or_default();
-        }
     }
     if let Some(tid) = wait_on {
+        if wlog_enabled() { wlog(format!("t{:x} wl{:x} SYNC_WAIT id={:x} begin", current_port(), wl_id & 0xffffff, tid & 0xffffff)); }
         // dispatch_sync waiter: block until SYNC_WAKE for our tid.
         let g = WL.lock().unwrap();
         return finish_wait(g, (wl_id, tid), nerr);
@@ -553,9 +644,8 @@ fn kevent_id(args: &[u64; 8]) -> hostsys::SysResult {
 fn finish_wait(mut g: std::sync::MutexGuard<'_, Option<WlState>>, key: (u64, u64), nerr: u64) -> hostsys::SysResult {
     loop {
         let st = g.as_mut().unwrap();
-        match st.sync.get_mut(&key) {
+        match st.sync.get(&key) {
             Some(k) if k.woken => {
-                k.woken = false;
                 return hostsys::SysResult { rax: nerr, rdx: 0, carry: false };
             }
             // Deleted by the waker: also a wake-up.
@@ -628,8 +718,14 @@ pub fn kernreturn(_cpu: &mut Cpu, a: &[u64; 8]) -> Result<u64, u64> {
                         wl_apply(st, wl_id, &ke);
                     }
                 }
+                let me = current_port();
+                if wlog_enabled() { wlog(format!("t{:x} wl{:x} WORKLOOP_RETURN nchanges={}", me, wl_id & 0xffffff, a[2])); }
                 let kq = if let Some(w) = st.loops.get_mut(&wl_id) {
                     w.bound = false;
+                    w.servicer = 0;
+                    if w.owner == me {
+                        w.owner = 0;
+                    }
                     w.kq
                 } else {
                     -1

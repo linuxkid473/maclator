@@ -1,5 +1,6 @@
 //! Maclator: run arm64 macOS programs on x86-64 Macs.
 
+mod aot;
 mod cache;
 mod commpage;
 mod engine;
@@ -8,6 +9,7 @@ mod hostsys;
 mod jit;
 mod loader;
 mod macho;
+mod paths;
 mod signals;
 mod spawn;
 mod symbols;
@@ -18,7 +20,14 @@ mod workq;
 use std::sync::atomic::Ordering;
 
 fn usage() -> ! {
-    eprintln!("usage: maclator [--trace] [--dyld PATH] <arm64-program> [args...]");
+    eprintln!("usage: maclator [options] <arm64-program> [args...]");
+    eprintln!("       maclator --aot <arm64-program>     translate ahead of time and exit");
+    eprintln!("options:");
+    eprintln!("  --interp        interpreter only (no JIT/AOT)");
+    eprintln!("  --no-aot        JIT only: don't load or build AOT translations");
+    eprintln!("  --dyld PATH     arm64 dyld to use (default /usr/lib/dyld)");
+    eprintln!("  --sysroot DIR   directory with the arm64 dyld shared cache files");
+    eprintln!("  --trace         trace system calls");
     std::process::exit(2);
 }
 
@@ -38,6 +47,46 @@ fn main() {
                 }
                 dyld = args.remove(0);
             }
+            "--interp" => {
+                jit::JIT_ENABLED.store(false, Ordering::Relaxed);
+                aot::set_enabled(false);
+                args.remove(0);
+            }
+            "--no-aot" => {
+                aot::set_enabled(false);
+                args.remove(0);
+            }
+            "--sysroot" => {
+                args.remove(0);
+                if args.is_empty() {
+                    usage();
+                }
+                paths::set_cache_dir(&args.remove(0));
+            }
+            "--aot" => {
+                args.remove(0);
+                if args.is_empty() {
+                    usage();
+                }
+                let exe = resolve_path(&args[0]);
+                match aot::build_standalone(&exe) {
+                    Ok(n) => {
+                        eprintln!("maclator: translated {n} blocks of {exe} ahead of time");
+                        std::process::exit(0);
+                    }
+                    Err(e) => {
+                        eprintln!("maclator: aot: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            "--selftest-jit" => {
+                let class = args.get(1).cloned().unwrap_or_else(|| "dpreg".into());
+                let n = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(20000);
+                aot::set_enabled(false);
+                jit::selftest::run_selftest(&class, n);
+                std::process::exit(0);
+            }
             "-h" | "--help" => usage(),
             _ => break,
         }
@@ -54,6 +103,7 @@ fn main() {
         .map(|(k, v)| format!("{k}={v}"))
         .collect();
 
+    engine::install_debug_handler();
     let cp = commpage::CommPage::install();
     if syscalls::TRACE.load(Ordering::Relaxed) {
         eprintln!("[maclator] commpage {} at {:#x}", if cp.in_place { "in place" } else { "redirected" }, cp.base);
@@ -71,6 +121,12 @@ fn main() {
     symbols::add_image(lo.wrapping_add(loaded.dyld.slide), hi.wrapping_add(loaded.dyld.slide), "dyld");
     if syscalls::TRACE.load(Ordering::Relaxed) {
         eprintln!("[maclator] main at {:#x}, dyld entry {:#x}, sp {:#x}", loaded.main.base, loaded.entry, loaded.sp);
+    }
+    {
+        let m = &loaded.main.macho;
+        let (lo, hi) = m.vm_range();
+        let entries = aot::function_starts(&exe, m, loaded.main.slide);
+        aot::register_main(&exe, m.uuid, lo.wrapping_add(loaded.main.slide), hi.wrapping_add(loaded.main.slide), entries);
     }
     engine::run_thread(&mut cpu);
     // The main thread ended (pthread_exit on main): wait for other threads.

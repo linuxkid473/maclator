@@ -201,7 +201,9 @@ fn bsd(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
             Err(e) => set_err(cpu, e),
         },
         SYS_EXECVE | SYS_POSIX_SPAWN => {
-            crate::engine::flush_profile();
+            if n == SYS_EXECVE {
+                crate::engine::flush_profile();
+            }
             let r = crate::spawn::exec_like(n, &args);
             set_res(cpu, r);
         }

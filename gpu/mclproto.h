@@ -36,6 +36,7 @@ enum {
     MCL_A_PLIST = 6,   // binary plist of an encoded object graph (descriptors, arrays, ...)
     MCL_A_STRING = 7,  // utf8 NSString
     MCL_A_DESC = 8,    // binary descriptor (see desc_emit in mclmetal.m)
+    MCL_A_BLOCK = 9,   // completion handler: u64 block id, u8 n, n type chars of the block arguments
 };
 
 enum {

@@ -1,9 +1,13 @@
 #!/bin/zsh
 # Launch the arm64 Chromium snapshot with GPU acceleration (ANGLE/Metal -> host GPU via Maclator).
 # Usage: chromium-gpu [extra chromium args] [url]
+# The lean flags (one renderer, no extensions/sync/component updater, a few unused features off) cut the
+# process count from 13 to 10 and page-load time by ~40% on the 4-core hack (see docs/HANDOFF.md).
 pkill -f "maclator.*Chromium" 2>/dev/null
 cd "$HOME/Downloads/chromium-arm64/chrome-mac/Chromium.app/Contents/MacOS" || exit 1
 exec "$HOME/bin/maclator" --gpu --gpu-only --type=gpu-process ./Chromium --no-sandbox --disable-gpu-sandbox --disable-gpu-watchdog \
   --use-angle=metal --use-gl=angle --enable-gpu --ignore-gpu-blocklist \
+  --renderer-process-limit=1 --disable-extensions --disable-sync --disable-background-networking --disable-component-update \
+  --disable-features=Translate,OptimizationHints,MediaRouter,AutofillServerCommunication,SpareRendererForSitePerProcess,GlobalMediaControls \
   --user-data-dir="${CHROMIUM_DATA:-$HOME/chromium-data}" --no-first-run --no-default-browser-check \
   --remote-debugging-port=9333 "$@"

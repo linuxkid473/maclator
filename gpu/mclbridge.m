@@ -759,6 +759,16 @@ static void *execCall(const uint8_t *rec, uint32_t reclen, uint8_t kind, uint32_
             [inv setArgument:&o atIndex:idx];
             break;
         }
+        case MCL_A_BLOCK: {
+            uint64_t bid; memcpy(&bid, pl, 8);
+            uint8_t nt = pl[8];
+            NSMutableArray *types = [NSMutableArray new];
+            for (uint8_t k = 0; k < nt; k++) [types addObject:[NSString stringWithFormat:@"%c", pl[9 + k]]];
+            id blk = makeBlock(@{@"blk": @(bid), @"sig": types});
+            if (blk) [keep addObject:blk];
+            [inv setArgument:&blk atIndex:idx];
+            break;
+        }
         case MCL_A_SCALAR: setBytesRaw(inv, idx, t, pl, alen); break;
         case MCL_A_IDARRAY: {
             uint32_t n = alen / 8;

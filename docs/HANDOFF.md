@@ -1,6 +1,6 @@
 # Maclator — handoff / continuation notes
 
-_Last updated 2026-09-29. Latest commit at time of writing: `ea182b8`._
+_Last updated 2026-09-29 (evening). See `git log` for the latest commit; the GPU fast path and the JIT register cache landed after `c09b49c`._
 
 Maclator runs **arm64 macOS programs on Intel (x86-64) Macs**, "reverse Rosetta". It loads
 the arm64 Mach-O plus the real arm64 macOS userland (dyld + the arm64e dyld shared cache
@@ -23,8 +23,9 @@ Test machine ("the hack"): Intel Core i5-4440 (Haswell, 4 cores, AVX2), 12 GB, m
 | `tests/guest/{timer,forktest}` | pass |
 
 Not done / not attempted: Overcast (iOS-on-Mac, FairPlay-encrypted, not obtainable here; decided
-not to pursue DRM circumvention), GPU/Metal (everything renders in software, `--disable-gpu`),
-audio, most IOKit hardware, sandboxed apps, Swift-heavy Apple apps.
+not to pursue DRM circumvention), audio, most IOKit hardware, sandboxed apps, Swift-heavy Apple apps.
+GPU/Metal is bridged to the host GPU (`--gpu`, see "GPU passthrough"); without it everything renders in
+software.
 
 ## Quick start
 
@@ -113,7 +114,9 @@ a 64 GB arena (`syscalls.rs`, candidate bases tried in order). Every block that 
 (cold-interpreted or JIT-translated) is recorded; on exit `save_profile()` forks a builder that
 writes `<key>.aot` (position-independent x86 + index). Loaded by **copying into the JIT code
 cache** — do NOT mmap the files PROT_EXEC (macOS Gatekeeper pops "Apple could not verify…"
-dialogs for every file). Bump `TRANSLATOR_VERSION` (currently **12**) whenever codegen changes.
+dialogs for every file). Bump `TRANSLATOR_VERSION` (currently **15**) whenever codegen changes. Every
+version bump invalidates the *whole* cache (files are shared between binaries: two builds with different versions on
+the same machine keep overwriting each other's cache, so A/B-test translators with `--no-aot`).
 Processes that are killed (`kill -9`) do not save profiles; quit gracefully (e.g. DevTools
 `Browser.close`, see `wsonly.py`) to build the cache. Rebuilds can take several minutes.
 
@@ -161,7 +164,15 @@ shared-cache addresses to symbols (unslid vaddr = `0x180000000 + (pc - 0x6000000
 MACLATOR_SELFTEST_MEM=1 MACLATOR_SELFTEST_SIMDMEM=1 \
   maclator --selftest-jit MASK:VALUE 8000      # hex mask/value of the encoding class
 # also classes: dpimm dpreg ldst branch
+maclator --selftest-jit fuse   200000   # (flag setter, b.cond | csel) pairs: compare+branch/select fusion
+maclator --selftest-jit fuse2  200000   # [setter, b.cond, A, B, svc] with A/B overwriting all flags, run to the svc:
+                                        #   exercises dead-flag-store elimination (prints dead_flag_skips)
+maclator --selftest-jit blocks 300000   # random straight-line blocks over a small register set (reuse!) incl.
+                                        #   loads/stores/pre/post-index writeback: exercises the register cache
 ```
+`ldst` reports ~13 mismatches, all `ldr <v>, literal` (`$+0x…`): a harness artifact (the literal pool is outside the test
+page); the pre-change tree shows the same. Sensitivity check of `blocks`: removing one `rc_inval` gives ~60 mismatches
+per 200k blocks. All three new classes also pass on the hack's real Haswell.
 Prints `ok= mismatch= skipped= native=`. **Always check `native=`**: an instruction that falls
 back to the interpreter trivially matches it (that hid four bugs for a while). Masks must leave
 the U bit (29) and Q bit (30) free when testing both variants. Known accepted mismatch: the sNaN
@@ -191,13 +202,65 @@ Chromium trace method: DevTools `Tracing.start` (cats `toplevel,cc,viz,gpu,blink
 `disabled-by-default-cc.debug.display_items`, which inflates costs) over the *browser* websocket,
 type keys, `Tracing.end`, then rank slice durations by thread.
 
+### JIT code quality work (2026-09-29 evening; `TRANSLATOR_VERSION` 13→15)
+Three changes in `jit/emit.rs`, measured with `bench/bench.c` (deterministic, `--no-aot`, hack; ms):
+
+| kernel | before | after all three |
+|---|---|---|
+| qsort 1.5M | 759 | 610 |
+| sieve 30M | 721 | 683 |
+| crc32 80 MB | 888 | 539 |
+| list walk | 576 | 574 (latency bound) |
+| matmul 300 | 639 | 595–630 |
+| memops | 489 | 486 |
+| **total** | **4126** | **3520–3660 (−11…−15 %)** |
+Chromium JS test (fib(27)+sort+loop in the renderer, warm AOT): ~1600 → ~1450 ms. VS Code (`bench/vscode-run.sh`,
+`typebench.py`, warm process): in-page 3e6 loop (`--jitless`) 708 → 545 ms, median frame after a keystroke 38 ms,
+key dispatch median 47 ms, idle frame 29 ms (the older "~100 ms" figure above was measured under other conditions
+and is not directly comparable).
+
+1. **Compare + branch/select fusion.** A flag-setting instruction (`adds/subs/ands/bics`, imm/shifted/extended) records
+   `Unit::fuse` (which x86 op produced the flags); if the *next* instruction is `b.cond` or `csel/csinc/csinv/csneg`
+   it branches/`cmov`s on the still-live x86 flags instead of re-deriving the condition from the four NZCV bytes
+   (`x86_cc` maps ARM conditions per producer kind; add-HI/LS and logic-carry conditions are constant/unmappable and
+   fall back). The stored NZCV bytes are still written unless (3) applies.
+2. **Write-through guest register cache** (`RegCache`, `CREGS = rbx, rbp, r12, r13, r14` — callee-saved x86 registers the
+   JIT never used; `maclator_jit_enter` already saves them). All guest GPR access goes through `ldx/ldw/ld_nf/stx/st_imm`
+   plus three base-register writeback sites; each read/write updates a per-block, compile-time map guest reg → x86 reg.
+   Memory stays authoritative (every write is still stored), so faults, signals and helper calls see current state;
+   the cache only removes reloads (store-forwarding latency on dependent chains). It is cleared at block start and after
+   interpreter fallbacks; after any internal label is created in an instruction (`new_label()` sets `rc_frozen`)
+   nothing new is cached in that instruction because code after a join may run on paths that did not execute the
+   caching code. Allocation is driven by a 10-instruction **lookahead** (`Unit::look`): a register is only cached
+   when a later instruction of the block names it (otherwise the extra moves are pure overhead — measured on the
+   sieve loop). Policy is performance-only; correctness never depends on it.
+3. **Dead flag store elimination.** For `setter; b.cond` where both successors overwrite NZCV before reading it
+   (`flags_dead_at`: straight-line scan ≤ 24 instructions, follows ≤ 3 unconditional `b`), the four `setcc` stores
+   are skipped (`Unit::dead_flags`). Guards: the branch must not be a unit leader, must fit in the block, and
+   `MACLATOR_JIT_DISABLE=branch` disables it.
+Ideas not done: carry the register cache across chained blocks/loops (loop-carried values still reload at every
+iteration), keep flags in `lahf`/`seto` form, fuse `cmp + cset`, use cache registers as direct operands.
+One unexplained event: a single Chromium launch right after the AOT version bump hung at 0 % CPU (parent in `wait4`,
+forked child in libmalloc after `fork` from a multithreaded GPU process); ~25 later launches of both the old and new
+binary were fine. Suspected fork-in-multithreaded-process/malloc lock, i.e. pre-existing; keep an eye on it.
+
+### Chromium configuration (hack, `bench/chromium-cfg.sh`; 4000-row DOM page load, idle, RSS)
+| flags | processes | page load | RSS |
+|---|---|---|---|
+| default | 13 | 5.4–6.7 s | 4.5 GB |
+| `--renderer-process-limit=1` | 11 | 4.9–5.0 s | 5.4 GB |
+| + `--disable-extensions --disable-sync --disable-background-networking --disable-component-update --disable-features=Translate,OptimizationHints,MediaRouter,AutofillServerCommunication,SpareRendererForSitePerProcess,GlobalMediaControls` | **10** | **3.4–3.6 s** | 5.2 GB |
+`--app=` (no toolbar) gave nothing; `--in-process-gpu` is not a win (same process count in practice, slower load, one
+process at 100 % idle CPU). These are now in `gpu/chromium-gpu` (deployed to `~/bin/chromium-gpu`; old copy
+`chromium-gpu.orig`). V8's JIT tiers are on in Chromium (3e6-iteration loop ≈ 120 ms in the renderer versus ~700 ms
+`--jitless`).
+
 ## Remaining hot spots / next steps (rough priority)
 
-1. **JIT code quality** (biggest remaining lever): every guest register access goes through
-   memory (`[r15+off]`); each flag-setting op does 4 `setcc` byte stores and `b.cond` re-derives
-   from bytes. Ideas: fuse `cmp/subs/adds/tst` + `b.cond` into a direct `jcc`, skipping flag stores
-   when a lookahead shows they are dead; in-block register caching; skip the TBI mask when the base
-   is SP; cheaper block-exit/IBTC paths.
+1. **JIT code quality** (still the biggest lever): the first round (fusion, dead flag stores, a write-through
+   register cache inside a block) is done, see "JIT code quality work". Remaining: registers still reload at every
+   block boundary (a loop iteration is one block), the TBI mask (`shl/shr 8`) on every access, block-exit/IBTC cost,
+   flags kept as four bytes.
 2. Still-interpreted instructions: SHA-256 (`sha256h/h2/su0/su1`), `sys` (dc zva/cvau…), `tbl`,
    FRINT*, FCVTZU, UCVTF vector, unsigned/other shifts (SQSHL…), FMAX/FMIN, FMADD (needs FMA or
    double-double), LDXR/STXR exclusives, many rarer NEON ops. Use `MACLATOR_FALLBACK_HIST` on the
@@ -207,9 +270,8 @@ type keys, `Tracing.end`, then rank slice durations by thread.
    `--disable-features=…`), persistent V8 code cache (don't wipe the profile dir).
 4. Chromium-specific: run with a real profile; check `about:blank` page target had `url ""`
    for a long time in one run (renderer for the initial page slow to start) — investigate.
-5. GPU: everything is software raster/compositing (`--disable-gpu`). A Metal/IOKit thunk layer
-   (design intent: thunks only at hardware boundaries) would be a big project; the hack has an AMD
-   RX 460/560.
+5. GPU: done for Chromium via the Metal bridge (see "GPU passthrough"); apps that present through
+   `CAMetalLayer`/`MTKView` directly still need that bridged.
 6. Robustness: stale-IBTC hazard if a thread only ever hits IBTC entries after invalidation
    (accepted risk); AOT profile saving only on graceful exit; concurrent builders write the same
    files (last writer wins, atomic rename); `MACLATOR_SPIN_DEBUG` for infinite-dispatch bugs.
@@ -240,54 +302,108 @@ type keys, `Tracing.end`, then rank slice durations by thread.
 - Exec-mmap of AOT files triggers Gatekeeper dialogs → copy into the code cache.
 - Chromium hang: profiler `thread_suspend` (msg id 3605) → no-op shim.
 
-## GPU passthrough (Metal → host GPU) — added 2026-09-29
+## GPU passthrough (Metal → host GPU) — added 2026-09-29, fast path added the same evening
 
 `maclator --gpu ./app` routes the guest's Metal API to the host's real GPU (AMD RX 460 on the hack).
 Verified: `tests/guest/metaltri` (clear + triangle + readback, `STRESS=1` for ANGLE-like load) and
-Chromium 157 with ANGLE-Metal (`chrome://gpu`-equivalent via DevTools `SystemInfo.getInfo`: GPU compositing,
-rasterization, WebGL, WebGPU, Graphite all enabled). Benchmark (animated canvas+transform page, hack):
-software 1.4 fps (median frame 1000 ms) → GPU 28 fps (18 ms).
+Chromium 157 with ANGLE-Metal (GPU compositing, rasterization, WebGL, WebGPU, Graphite enabled).
 
-Launch Chromium with acceleration: `~/bin/chromium-gpu [url]` on the hack (source: `gpu/chromium-gpu`; uses `--gpu --gpu-only --type=gpu-process` so only the GPU process loads the bridge — giving every helper the bridge starved the renderers and made clicks unresponsive; flags: `--use-angle=metal --use-gl=angle
---enable-gpu --ignore-gpu-blocklist --disable-gpu-sandbox --disable-gpu-watchdog --no-sandbox`).
+Launch Chromium with acceleration: `~/bin/chromium-gpu [url]` on the hack (source: `gpu/chromium-gpu`; uses
+`--gpu --gpu-only --type=gpu-process` so only the GPU process loads the bridge — giving every helper the bridge
+starved the renderers; flags: `--use-angle=metal --use-gl=angle --enable-gpu --ignore-gpu-blocklist
+--disable-gpu-sandbox --disable-gpu-watchdog --no-sandbox`, plus the "lean" flags, see Chromium configuration).
 
-Design (all in `gpu/` + `crates/maclator/src/gpu.rs`):
+### Results (animated 2D canvas, hack; `bench/gpubench.py`)
+| stage | median frame | notes |
+|---|---|---|
+| software raster/compositing | 1000 ms | |
+| bridge v1 (plist RPC per Metal message) | ~100 ms (10 fps) | ~100 bridged calls/frame; ~97 % of the frame was guest-side marshalling of one call: `renderCommandEncoderWithDescriptor:` (22 ms, generic descriptor introspection) |
+| bridge v2 (this section) | **16.7 ms (vsync-capped 60 fps)** | still 60 fps with 400 arcs; guest time spent in the bridge fell from ~4300 ms to ~650 ms per 5 s |
+
+### Design (all in `gpu/` + `crates/maclator/src/gpu.rs`)
 - `gpu/mclmetal.m` → **guest** arm64 `libmclmetal.dylib`, injected with `DYLD_INSERT_LIBRARIES` (maclator does this
   for `--gpu`, then the shim `unsetenv`s it). It interposes `MTLCreateSystemDefaultDevice/MTLCopyAllDevices` and
-  returns `MCLProxy` (NSProxy) objects. `forwardInvocation:` marshals every message (binary plist) using the host's
-  method type encodings; guest-side `MTL*Descriptor` objects are serialized by property introspection; blocks
-  (completion handlers) are registered and invoked later from a guest pump thread (`op 3` = wait for event).
+  returns `MCLProxy` (NSProxy) objects for host Metal objects.
 - `gpu/mclbridge.m` → **host** x86-64 `libmclbridge.dylib`, dlopen'ed by maclator (`gpu.rs`). Handle table of real
-  Metal objects, calls executed with `NSInvocation`. Guest and host share one address space, so raw pointers
+  Metal objects; calls executed with `NSInvocation`. Guest and host share one address space, so raw pointers
   (`setVertexBytes`, `getBytes`, `MTLBuffer.contents`) just work.
+- `gpu/mclproto.h`: wire format shared by both sides.
 - Transport: `svc #0x80` with x16 = `0x4D43` (`SYS_MCL_HOSTCALL`), x0=op x1=request ptr x2=len → x0=reply ptr x1=len.
+  Ops: 1 legacy plist RPC, 2 free reply, 3 wait for host event (completion handlers), 4 **batch**, 5 define selector.
+
+**Fast path (op 4).** The first message to a proxy for a selector still goes through `forwardInvocation:` (the
+signature comes from the host), but `methodSignatureForSelector:` then builds a *plan* (register classification
+per AAPCS64/Apple arm64: ints, floats, HFAs, structs by value/by reference, `const id *`/`const T *` arrays with their
+count taken from the `NSRange`/`count`/`length` argument, stack arguments, blocks) and installs a real method on
+`MCLProxy` pointing at an assembly trampoline (`mcl_tramp`, saves x0–x7/d0–d7, calls `mcl_fast_dispatch`). No
+NSProxy forwarding, no NSInvocation, no plist:
+- void calls are appended as a compact binary record to **one global, ordered command queue** (threads encode into
+  thread-local scratch and append under a short lock; ordering across threads = order the calls returned);
+- the queue is sent in a single trap on `commit`/`present*`, on the next call that returns a value, before any legacy
+  RPC, or above 96 KB; `waitUntil*` flushes then waits *outside* the lock (no deadlock with other GPU threads), and
+  waits until completion handlers of finished work have run;
+- `commandBuffer`, `*CommandEncoder…` calls get a **guest-chosen handle** (`≥ 2^40`) and stay asynchronous;
+- immutable getters (`MTLBuffer.length/contents`, `MTLTexture.width/…`, `supportsFamily:` …) are cached per proxy;
+- `MTLRenderPassDescriptor`/pipeline/sampler/… descriptors use a **binary schema encoding** (`desc_emit`): per class
+  the guest defines a schema once (getters/setters, values of a pristine instance) and the host checks *its* defaults
+  (it asks for properties whose defaults differ to be always sent); per call only properties that differ from the
+  defaults are sent, nested descriptors and unused array elements (8 colour attachments, 31 buffer/attribute slots)
+  disappear;
+- completion-handler blocks (`addCompletedHandler:` …) are registered as before but travel in the batch;
+- host-side **memo**: `newSamplerState/DepthStencilState/Function/RenderPipelineState/Library…` with identical
+  arguments return the same object (Chromium recreates identical ones constantly).
+- Pointers in batched calls are copied into the stream when small (`setVertexBytes` …); above 4 KB the call is made
+  synchronous and the host reads the guest memory directly.
+
+Also fixed on the way: `newTextureWithDescriptor:iosurface:plane:` used to pass the *guest's* IOSurfaceRef pointer to
+Metal (a bogus host CF object → crash when the texture was deallocated; this was the "unsupported IOSurface" gap).
+The guest now sends `IOSurfaceGetID`, the host does `IOSurfaceLookup`.
+
+Profiling: `MCL_STATS=1` prints, every 5 s, from the guest `[mclguest]` (calls per commit, batched/sync/async/legacy
+counts, flushes per commit, top selectors by inclusive time, top legacy selectors) and from the host `[mclstats]`
+(messages, per-selector host time, `*` = batched). In steady state on the canvas benchmark: 47 calls and 5.5 flushes
+per commit, 0 legacy calls, ~0.6 s of guest time per 5 s.
+Debug toggles (guest env): `MCL_NOFAST=1` (everything through `forwardInvocation:`; drops are disabled in this mode),
+`MCL_NOASYNC`, `MCL_NOCACHE`, `MCL_NOBATCH` (every call synchronous), `MCL_OLDDESC` (plist descriptors),
+`MCL_TRACE=1` (per message, host side also mentions/drops of handles). `MACLATOR_GPU_SPIN=caller,bridge` tunes the
+spin-before-park of the thread hand-off in `gpu.rs` (default 20,20 µs; measured: no effect at this call rate).
+
 - `gpu/build.sh` builds everything (also a native arm64 *loopback* build, `out/metaltri_loop`, which runs shim+bridge
-  in one process on an Apple Silicon Mac — debug marshalling there first, e.g. with `NSZombieEnabled=YES`).
+  in one process on an Apple Silicon Mac — debug marshalling there first; the fast path works in loopback too).
 - Install on the hack: `libmclbridge.dylib` + `libmclmetal.dylib` in `~/bin/gpu/` (also searched: next to maclator,
-  `~/.maclator/gpu`, `$MACLATOR_GPU_DIR`). Env: `MCL_TRACE=1` (log every message), `MCL_STATS=1` (per-5 s RPC table
-  in the GPU process log), `MCL_NIL=1` (debug: no device).
+  `~/.maclator/gpu`, `$MACLATOR_GPU_DIR`; the original v1 libraries are in `~/bin/gpu.orig/`).
 
 Hard-won constraints (do not regress):
 1. **Host frameworks must never run on a guest thread.** The kernel has one special reply port per thread; guest
    libxpc and host libxpc both cache/recycle it → guest XPC dies with `MACH_RCV_INVALID_NOTIFY` (0x10004007),
    seen as libdispatch "Unexpected error from mach_msg_receive" BRK in LaunchServices/CFPreferences. `gpu.rs` gives
-   every guest thread its own bridge thread.
+   every guest thread its own bridge thread (persistent hand-off slot, spin then park).
 2. Host CoreFoundation/Metal must be initialised **before the guest starts** (`--gpu` preloads the bridge and runs
    `mcl_warmup` on a scratch thread); initialising them mid-run disturbed guest XPC too.
 3. Never pass `DYLD_INSERT_LIBRARIES=<arm64 dylib>` to host processes (`spawn.rs` scrubs it; maclator re-injects).
 4. `dispatch_data_t` is toll-free bridged to NSData — check for it before NSData (`newLibraryWithData:`).
 5. Reply plists must be parsed from a private copy (parsed objects can reference the source bytes).
 6. Chromium's GPU watchdog / objc-zombie crashes look like `str wzr,[xzr]` in the Chromium Framework
-   (`--disable-gpu-watchdog`; zombies were my refcount bugs). `--dump-on-fault` now survives the guest resetting
-   SIGSEGV and marks the faulting thread `(THIS THREAD)`.
+   (`--disable-gpu-watchdog`). `--dump-on-fault` survives the guest resetting SIGSEGV and marks the faulting thread.
+7. **Command ordering across threads.** A per-thread queue looked natural but breaks as soon as one thread uses an
+   object another thread created asynchronously (ANGLE adds handlers to a command buffer from another thread): the
+   creation sat unflushed in the creator's queue. Keep the single global queue.
+8. Never let a proxy's drop be sent before the queued commands that use the handle (drops are records in the same
+   queue; drops raised while a record is being built are deferred until it is appended).
+9. Host must not release/adopt inconsistently: new-family results are +1 (the table takes its own reference, the
+   host drops its own); memoised objects are shared, the cache holds one reference.
+10. `document.visibilityState` of the hack's Chromium window is often `hidden` (no display attached to the active
+    Space); rAF then runs at 1 fps and *looks* like a GPU/emulator regression. Benchmarks use
+    `--disable-backgrounding-occluded-windows --disable-renderer-backgrounding --disable-background-timer-throttling`
+    and DevTools focus emulation.
 
-Known gaps / next steps: presentation is via IOSurface (`newTextureWithDescriptor:iosurface:plane:` works — IOSurface
-arguments are currently sent as unsupported and need the id→`IOSurfaceLookup` translation if the browser-side
-display path needs it); `CAMetalLayer` (apps that present directly, not via Chromium) is not bridged;
+Known gaps / next steps: `CAMetalLayer` (apps that present directly, not via Chromium) is not bridged;
 `MTLFunctionConstantValues`, argument buffers, `MTLSharedEvent` listeners and NSURL-based APIs are only partly covered;
-per-call cost is dominated by plist marshalling in the emulated guest (batching / binary protocol is the next
-performance lever); compile time of shaders is on the host and is one-time (~2.7 s for ANGLE's library);
-apps needing `--disable-gpu-watchdog`-like relief may still hit their own hang detectors during long inits.
+`status`/`signaledValue` polling is one synchronous round trip per frame each (~100 µs); pipeline/library compile
+caching across launches is left to Metal's own on-disk shader cache (measured: warm `newLibraryWithSource` ≈ 0.3 ms
+per call versus ~90 ms cold, ANGLE's big library ~2.7 s once) — a `MTLBinaryArchive` layer was not needed.
+Presentation: steady-state per-frame traffic contains no readbacks/uploads (`getBytes`/`replaceRegion` never appear,
+only two small buffer-to-buffer blits per frame); output goes to IOSurface-backed textures, i.e. no frame-sized copy.
 
 ## Session log summary (chronological)
 

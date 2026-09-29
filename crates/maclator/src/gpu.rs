@@ -9,7 +9,9 @@
 
 use maclator_core::cpu::Cpu;
 use std::ffi::CString;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 pub const SYS_MCL_HOSTCALL: u64 = 0x4D43;
 
@@ -91,12 +93,19 @@ fn bridge() -> Option<(CallFn, Option<extern "C" fn()>)> {
     })
 }
 
-/// One job for a bridge thread. Raw pointers are guest/host addresses valid in this process.
-struct Job {
-    op: u64,
-    input: u64,
-    len: u64,
-    reply: std::sync::mpsc::Sender<(u64, u64)>,
+/// Hand-off state between a guest thread and its dedicated bridge thread. Both sides spin briefly
+/// (a bridged call is usually answered within microseconds) and then park; `unpark` tokens make the
+/// park/unpark pairing race-free.
+struct Shared {
+    /// 0 idle, 1 request posted, 2 reply ready, 3 shut down
+    state: AtomicU32,
+    op: AtomicU64,
+    input: AtomicU64,
+    len: AtomicU64,
+    out_p: AtomicU64,
+    out_n: AtomicU64,
+    bridge_parked: AtomicBool,
+    caller_parked: AtomicBool,
 }
 
 /// Host frameworks (CoreFoundation, XPC, Metal) must never run on a guest thread: the kernel
@@ -104,24 +113,110 @@ struct Job {
 /// both cache and recycle, breaking the guest's XPC calls (MACH_RCV_INVALID_NOTIFY). So every
 /// guest thread gets its own dedicated bridge thread and hands its calls over.
 struct BridgeThread {
-    tx: std::sync::mpsc::Sender<Job>,
+    sh: Arc<Shared>,
+    bridge: std::thread::Thread,
+    caller: std::thread::Thread,
+}
+
+/// Spin budgets in microseconds, `MACLATOR_GPU_SPIN=caller,bridge` (default 20,20; 0,0 = always park).
+fn spin_budgets() -> (Duration, Duration) {
+    static B: OnceLock<(Duration, Duration)> = OnceLock::new();
+    *B.get_or_init(|| {
+        let (c, b) = std::env::var("MACLATOR_GPU_SPIN")
+            .ok()
+            .and_then(|v| {
+                let mut it = v.split(',').filter_map(|x| x.trim().parse::<u64>().ok());
+                Some((it.next()?, it.next()?))
+            })
+            .unwrap_or((20, 20));
+        (Duration::from_micros(c), Duration::from_micros(b))
+    })
+}
+
+/// Spin (bounded in time), then park, until `done()`; `flag` tells the other side an unpark is needed.
+fn wait_for(done: impl Fn() -> bool, flag: &AtomicBool, spin: Duration) {
+    let t0 = Instant::now();
+    let mut n = 0u32;
+    loop {
+        if done() {
+            return;
+        }
+        n += 1;
+        if n & 63 != 0 || t0.elapsed() < spin {
+            std::hint::spin_loop();
+            continue;
+        }
+        flag.store(true, Ordering::SeqCst);
+        if done() {
+            flag.store(false, Ordering::SeqCst);
+            return;
+        }
+        std::thread::park();
+        flag.store(false, Ordering::SeqCst);
+    }
 }
 
 impl BridgeThread {
     fn spawn(f: CallFn) -> BridgeThread {
-        let (tx, rx) = std::sync::mpsc::channel::<Job>();
-        std::thread::Builder::new()
+        let sh = Arc::new(Shared {
+            state: AtomicU32::new(0),
+            op: AtomicU64::new(0),
+            input: AtomicU64::new(0),
+            len: AtomicU64::new(0),
+            out_p: AtomicU64::new(0),
+            out_n: AtomicU64::new(0),
+            bridge_parked: AtomicBool::new(false),
+            caller_parked: AtomicBool::new(false),
+        });
+        let caller = std::thread::current();
+        let sh2 = sh.clone();
+        let h = std::thread::Builder::new()
             .name("maclator-gpu".into())
             .stack_size(8 << 20)
-            .spawn(move || {
-                while let Ok(job) = rx.recv() {
+            .spawn({
+                let caller = caller.clone();
+                move || loop {
+                    wait_for(|| matches!(sh2.state.load(Ordering::Acquire), 1 | 3), &sh2.bridge_parked, spin_budgets().1);
+                    if sh2.state.load(Ordering::Acquire) == 3 {
+                        return;
+                    }
                     let mut outlen = 0u64;
-                    let p = unsafe { f(job.op, job.input as *const u8, job.len, &mut outlen) };
-                    let _ = job.reply.send((p as u64, outlen));
+                    let p = unsafe {
+                        f(sh2.op.load(Ordering::Relaxed), sh2.input.load(Ordering::Relaxed) as *const u8, sh2.len.load(Ordering::Relaxed), &mut outlen)
+                    };
+                    sh2.out_p.store(p as u64, Ordering::Relaxed);
+                    sh2.out_n.store(outlen, Ordering::Relaxed);
+                    sh2.state.store(2, Ordering::SeqCst);
+                    if sh2.caller_parked.load(Ordering::SeqCst) {
+                        caller.unpark();
+                    }
                 }
             })
             .expect("spawn GPU bridge thread");
-        BridgeThread { tx }
+        BridgeThread { sh, bridge: h.thread().clone(), caller }
+    }
+
+    fn call(&self, op: u64, input: u64, len: u64) -> (u64, u64) {
+        let sh = &self.sh;
+        sh.op.store(op, Ordering::Relaxed);
+        sh.input.store(input, Ordering::Relaxed);
+        sh.len.store(len, Ordering::Relaxed);
+        sh.state.store(1, Ordering::SeqCst);
+        if sh.bridge_parked.load(Ordering::SeqCst) {
+            self.bridge.unpark();
+        }
+        wait_for(|| sh.state.load(Ordering::Acquire) == 2, &sh.caller_parked, spin_budgets().0);
+        let r = (sh.out_p.load(Ordering::Relaxed), sh.out_n.load(Ordering::Relaxed));
+        sh.state.store(0, Ordering::Release);
+        r
+    }
+}
+
+impl Drop for BridgeThread {
+    fn drop(&mut self) {
+        self.sh.state.store(3, Ordering::SeqCst);
+        self.bridge.unpark();
+        let _ = &self.caller;
     }
 }
 
@@ -133,9 +228,7 @@ fn call_on_bridge_thread(f: CallFn, op: u64, input: u64, len: u64) -> Option<(u6
     BRIDGE_THREAD.with(|b| {
         let mut b = b.borrow_mut();
         let bt = b.get_or_insert_with(|| BridgeThread::spawn(f));
-        let (rtx, rrx) = std::sync::mpsc::channel();
-        bt.tx.send(Job { op, input, len, reply: rtx }).ok()?;
-        rrx.recv().ok()
+        Some(bt.call(op, input, len))
     })
 }
 

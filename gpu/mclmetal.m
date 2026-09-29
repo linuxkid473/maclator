@@ -114,6 +114,7 @@ static id encodeBlock(id blk, NSString *selName);
 static NSUInteger idArrayCount(NSInvocation *inv, NSMethodSignature *sig, NSArray *parts);
 static void fastNoteResultClass(SEL sel, uint32_t cls);
 static uint64_t gLegacyCalls;
+static void legacy_note(SEL sel);
 static NSMutableDictionary *gSigCache;
 static NSLock *gSigLock;
 
@@ -186,6 +187,7 @@ static BOOL isNewFamily(const char *s) {
 - (void)forwardInvocation:(NSInvocation *)inv {
     gLegacyCalls++;
     SEL sel = inv.selector;
+    if (gStats) legacy_note(sel);
     NSMethodSignature *sig = inv.methodSignature;
     NSMutableArray *args = [NSMutableArray array];
     NSError **errOut = NULL;
@@ -502,8 +504,8 @@ static id decode(id v, BOOL nw) {
 // return immediately (the stream is sent in one trap at commit / on the next synchronous call); calls
 // with results are sent right away; a few object-creating calls (command buffers, encoders) get a
 // guest-chosen handle and stay asynchronous too. Everything else still goes through forwardInvocation:.
-typedef struct { uint8_t cls, xi, di, nmem, msz, cntArg, cntKind, pad; uint16_t size, elem; } PArg;
-enum { AK_INT, AK_FP, AK_HFA, AK_SREG, AK_SREF, AK_ID, AK_IDARR, AK_DATA };
+typedef struct { uint8_t cls, xi, di, nmem, msz, cntArg, cntKind, pad; uint16_t size, elem, soff; } PArg;
+enum { AK_INT, AK_FP, AK_HFA, AK_SREG, AK_SREF, AK_ID, AK_IDARR, AK_DATA, AK_BLOCK, AK_STK };
 enum { RK_VOID, RK_INT, RK_F32, RK_F64, RK_ID };
 
 typedef struct Plan {
@@ -918,6 +920,7 @@ static Plan *buildPlan(SEL sel, const char *enc) {
     NSArray *parts = [@(name) componentsSeparatedByString:@":"];
     const char *types[10];
     int xi = 2, di = 0;
+    unsigned soff = 0;   // bytes of stack arguments (Apple arm64: packed, naturally aligned)
     for (int i = 0; i < pl->nargs; i++) {
         const char *t = [sig getArgumentTypeAtIndex:i + 2];
         const char *b = skipQualifiers(t);
@@ -931,12 +934,14 @@ static Plan *buildPlan(SEL sel, const char *enc) {
         a->cntArg = 0xff;
         switch (b[0]) {
         case '@':
-            if (b[1] == '?') return pl;
+            if (b[1] == '?') { a->cls = AK_BLOCK; a->xi = xi++; break; }
             a->cls = AK_ID; a->xi = xi++; break;
         case 'c': case 'C': case 's': case 'S': case 'i': case 'I': case 'l': case 'L': case 'q': case 'Q':
         case 'B': case ':': case '#':
+            if (xi >= 8) { a->cls = AK_STK; soff = (soff + sz - 1) & ~(sz - 1); a->soff = soff; soff += sz; break; }
             a->cls = AK_INT; a->xi = xi++; break;
         case 'f': case 'd':
+            if (di >= 8) { a->cls = AK_STK; soff = (soff + sz - 1) & ~(sz - 1); a->soff = soff; soff += sz; break; }
             a->cls = AK_FP; a->di = di++; break;
         case '{': {
             int n = 0, m = 0;
@@ -962,7 +967,7 @@ static Plan *buildPlan(SEL sel, const char *enc) {
         default: return pl;
         }
     }
-    if (xi > 8 || di > 8) return pl;
+    if (xi > 8 || di > 8 || soff > 64) return pl;
     for (int i = 0; i < pl->nargs; i++) {
         PArg *a = &pl->a[i];
         if (a->cls != AK_IDARR && a->cls != AK_DATA) continue;
@@ -1097,7 +1102,6 @@ static _Atomic uint64_t gNextGuestHandle = MCL_GUEST_HANDLE_BASE;
 
 __attribute__((used, visibility("hidden")))
 uint64_t mcl_fast_dispatch(uint64_t *R, uint8_t *stk) {
-    (void)stk;
     MCLProxy *self = (MCLProxy *)R[0];
     Plan *pl = plan_find((SEL)R[1]);
     if (!pl) { fprintf(stderr, "[mclmetal] no plan for %s\n", sel_getName((SEL)R[1])); return 0; }
@@ -1144,6 +1148,7 @@ uint64_t mcl_fast_dispatch(uint64_t *R, uint8_t *stk) {
         switch (a->cls) {
         case AK_INT: qarg(q, MCL_A_SCALAR, &R[a->xi], a->size); break;
         case AK_FP: qarg(q, MCL_A_SCALAR, &R[8 + a->di], a->size); break;
+        case AK_STK: qarg(q, MCL_A_SCALAR, stk + a->soff, a->size); break;
         case AK_HFA: {
             uint8_t tmp[32];
             for (int k = 0; k < a->nmem; k++) memcpy(tmp + k * a->msz, &R[8 + a->di + k], a->msz);
@@ -1153,6 +1158,20 @@ uint64_t mcl_fast_dispatch(uint64_t *R, uint8_t *stk) {
         case AK_SREG: qarg(q, MCL_A_SCALAR, &R[a->xi], a->size); break;
         case AK_SREF: qarg(q, MCL_A_SCALAR, (void *)R[a->xi], a->size); break;
         case AK_ID: obj_arg(q, (id)R[a->xi]); break;
+        case AK_BLOCK: {
+            id blk = (id)R[a->xi];
+            if (!blk) { qarg(q, MCL_A_NIL, NULL, 0); break; }
+            NSDictionary *bd = encodeBlock(blk, @(pl->name));   // registers the block for the pump thread
+            uint64_t bid = [bd[@"blk"] unsignedLongLongValue];
+            NSArray *types = bd[@"sig"];
+            uint8_t buf[8 + 1 + 16];
+            memcpy(buf, &bid, 8);
+            uint32_t nt = (uint32_t)MIN(types.count, 15);
+            buf[8] = (uint8_t)nt;
+            for (uint32_t k = 0; k < nt; k++) buf[9 + k] = (uint8_t)[types[k] UTF8String][0];
+            qarg(q, MCL_A_BLOCK, buf, 9 + nt);
+            break;
+        }
         case AK_IDARR: {
             id *p = (id *)R[a->xi];
             if (!p) { qarg(q, MCL_A_NIL, NULL, 0); break; }
@@ -1276,6 +1295,14 @@ __asm__(
 // ---- profile (MCL_STATS=1) -------------------------------------------------------------------------------
 static BOOL gForceDump;
 static void stats_dump_force(void) { gLastDump = gLastDump ?: mach_absolute_time(); gForceDump = YES; stats_maybe_dump(); }
+static NSMutableDictionary *gLegacySel;
+static void legacy_note(SEL sel) {
+    @synchronized([MCLProxy class]) {
+        if (!gLegacySel) gLegacySel = [NSMutableDictionary new];
+        NSString *k = @(sel_getName(sel));
+        gLegacySel[k] = @([gLegacySel[k] unsignedLongLongValue] + 1);
+    }
+}
 static void stats_maybe_dump(void) {
     uint64_t now = mach_absolute_time();
     static mach_timebase_info_data_t tb;
@@ -1299,6 +1326,12 @@ static void stats_maybe_dump(void) {
     for (unsigned i = 0; i < n; i++) {
         Plan *p = gPlanList[idx[i]];
         fprintf(stderr, "   %-56s n=%-7llu sync=%-6llu ms=%.1f\n", p->name, p->nCalls, p->nSync, p->nNs * toMs);
+    }
+    @synchronized([MCLProxy class]) {
+        NSArray *keys = [gLegacySel keysSortedByValueUsingComparator:^NSComparisonResult(NSNumber *a, NSNumber *b) { return [b compare:a]; }];
+        for (NSUInteger i = 0; i < keys.count && i < 5; i++)
+            fprintf(stderr, "   [legacy] %-52s n=%llu\n", [keys[i] UTF8String], [gLegacySel[keys[i]] unsignedLongLongValue]);
+        [gLegacySel removeAllObjects];
     }
     for (unsigned i = 0; i < gNPlans; i++) { gPlanList[i]->nCalls = gPlanList[i]->nNs = gPlanList[i]->nSync = 0; }
     gNBatched = gNSync = gNAsync = gNFlush = gNBytes = gNCommit = gNCacheHit = gLegacyCalls = 0;

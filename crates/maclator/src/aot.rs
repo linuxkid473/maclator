@@ -23,7 +23,7 @@ use std::sync::Mutex;
 
 const MAGIC: &[u8; 8] = b"MCLAOT03";
 /// Bump when the translator's output changes.
-const TRANSLATOR_VERSION: u32 = 3;
+const TRANSLATOR_VERSION: u32 = 4;
 
 #[derive(Clone)]
 struct Image {

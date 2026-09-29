@@ -346,6 +346,9 @@ impl<'a> E<'a> {
 
     /// Guest effective address in rax; applies commpage redirection if needed.
     fn commpage_fix(&mut self) {
+        // arm64 top-byte-ignore: drop bits 63:56 (flags are dead across memory accesses).
+        a!(self, shl(rax, 8));
+        a!(self, shr(rax, 8));
         if !self.u.commpage_checks {
             return;
         }

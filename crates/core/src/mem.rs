@@ -22,6 +22,9 @@ pub static COMMPAGE_REDIRECT: AtomicU64 = AtomicU64::new(0);
 
 #[inline(always)]
 pub fn host(addr: u64) -> *mut u8 {
+    // arm64 top-byte-ignore: bits 63:56 of a data address are not translated (libobjc and
+    // libmalloc stash tags there); the Intel MMU would fault on non-canonical addresses.
+    let addr = addr & 0x00FF_FFFF_FFFF_FFFF;
     // Fast path: one compare on the high bits.
     if (addr >> 16) == 0xF_FFFF {
         let r = COMMPAGE_REDIRECT.load(Ordering::Relaxed);

@@ -99,7 +99,73 @@ pub fn handle_svc(cpu: &mut Cpu) {
     }
 }
 
+/// Guest paths of open fds under the redirected cache prefixes ("/", "/System", ...),
+/// so `openat(dirfd, "rel")` walks (as dyld does) can be resolved to a full guest path.
+static FD_VPATHS: std::sync::Mutex<Option<std::collections::HashMap<i32, String>>> = std::sync::Mutex::new(None);
+
+fn vpath_join(base: &str, rel: &str) -> String {
+    if base == "/" {
+        format!("/{rel}")
+    } else {
+        format!("{}/{rel}", base.trim_end_matches('/'))
+    }
+}
+
 fn bsd(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
+    // Path-taking syscalls: (path arg index, dirfd arg index for *at variants).
+    let (pidx, at) = match n {
+        5 | 398 => (Some(0), false),
+        33 | 58 | 188 | 190 | 220 | 338 | 340 => (Some(0), false),
+        463 | 464 | 469 | 470 => (Some(1), true),
+        _ => (None, false),
+    };
+    let mut keep: Option<std::ffi::CString> = None;
+    let mut guest_path: Option<String> = None;
+    if let Some(i) = pidx {
+        if args[i] != 0 {
+            let orig = cstr_at(args[i]);
+            let full = if orig.starts_with('/') {
+                Some(orig.clone())
+            } else if at {
+                let dfd = args[0] as i32;
+                FD_VPATHS.lock().unwrap().as_ref().and_then(|m| m.get(&dfd).map(|b| vpath_join(b, &orig)))
+            } else {
+                None
+            };
+            if TRACE.load(Ordering::Relaxed) {
+                eprintln!("[path] #{n} {orig} -> {full:?}");
+            }
+            if let Some(full) = full {
+                if let Some(new) = crate::paths::redirect(&full) {
+                    if let Ok(c) = std::ffi::CString::new(new) {
+                        args[i] = c.as_ptr() as u64;
+                        if at {
+                            args[0] = (-2i64) as u64; // AT_FDCWD; path is absolute now
+                        }
+                        keep = Some(c);
+                    }
+                }
+                guest_path = Some(full);
+            }
+        }
+    }
+    bsd_inner(cpu, n, args);
+    drop(keep);
+    if matches!(n, 5 | 398 | 463 | 464) && cpu.cf == 0 {
+        if let Some(g) = guest_path {
+            if g == "/" || g.starts_with("/System") {
+                let g = if g.len() > 1 { g.trim_end_matches('/').to_string() } else { g };
+                FD_VPATHS.lock().unwrap().get_or_insert_with(Default::default).insert(cpu.x[0] as i32, g);
+            }
+        }
+    } else if matches!(n, 6 | 399) {
+        if let Some(m) = FD_VPATHS.lock().unwrap().as_mut() {
+            m.remove(&(args[0] as i32));
+        }
+    }
+}
+
+fn bsd_inner(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
     match n {
         SYS_VFORK => {
             // vfork shares our address space and stack: use fork instead.
@@ -229,6 +295,20 @@ fn bsd(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
             let r = crate::workq::kevent_redirect(n, &args).unwrap_or_else(|| hostsys::unix(n, &args));
             set_res(cpu, r);
         }
+        92 if matches!(args[1], 59 | 61 | 97 | 98 | 103) => {
+            // Code-signing fcntls (F_ADDSIGS, F_ADDFILESIGS[_RETURN/_INFO], F_CHECK_LV):
+            // the Intel host kernel cannot validate arm64 signatures, so accept them.
+            // F_ADDFILESIGS_RETURN/_INFO report the signed extent back in fs_file_start;
+            // the signature blob sits at the tail, so everything before it is signed.
+            if matches!(args[1], 97 | 103) && args[2] != 0 {
+                unsafe {
+                    let fs = args[2] as *mut u64;
+                    let blob_off = *fs.add(1);
+                    *fs = blob_off;
+                }
+            }
+            set_ok(cpu, 0, 0);
+        }
         _ => {
             let r = hostsys::unix(n, &args);
             set_res(cpu, r);
@@ -322,7 +402,22 @@ fn mach_trap(cpu: &mut Cpu, n: u64) {
         _ => {}
     }
     let args = [cpu.x[0], cpu.x[1], cpu.x[2], cpu.x[3], cpu.x[4], cpu.x[5], cpu.x[6], cpu.x[7]];
+    // mach_msg2: remember the request id/size before the reply overwrites the header.
+    let req_id = if n == 47 && args[0] != 0 { unsafe { *((args[0] + 20) as *const u32) } } else { 0 };
     let r = hostsys::mach(n, &args);
+    if n == 47 && args[0] != 0 {
+        let reply_id = unsafe { *((args[0] + 20) as *const u32) };
+        let retcode = unsafe { *((args[0] + 32) as *const u32) };
+        if trace {
+            eprintln!("[mach] msg2 id={req_id} reply_id={reply_id} retcode={retcode:#x}");
+        }
+        // task_restartable_ranges_register: the Intel host kernel does not support it, and
+        // libobjc treats failure as fatal. Restartable ranges only matter for arm64 threads
+        // we already run in the interpreter/JIT, so pretend it worked.
+        if req_id == 8000 && reply_id == req_id + 100 && retcode == 46 {
+            unsafe { *((args[0] + 32) as *mut u32) = 0 };
+        }
+    }
     if trace {
         eprintln!("[mach] trap {}({:#x}, {:#x}, {:#x}, {:#x}) -> {:#x}", n, args[0], args[1], args[2], args[3], r.rax);
     }

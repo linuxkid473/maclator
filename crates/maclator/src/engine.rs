@@ -44,6 +44,13 @@ extern "C" fn dump_threads(_: i32) {
         let cpu = unsafe { &*(p as *const Cpu) };
         eprintln!("=== guest thread {i}: pc {:#x} {}  lr {}", cpu.pc, crate::symbols::describe(cpu.pc), crate::symbols::describe(cpu.x[30]));
         eprintln!("{}", cpu.dump());
+        for i in 0..14u64 {
+            let a = cpu.pc.wrapping_sub(10 * 4) + i * 4;
+            if let Some(w) = crate::guestmem::read_u64(a & !7) {
+                let insn = if a & 4 != 0 { (w >> 32) as u32 } else { w as u32 };
+                eprintln!("  {} {:#x}: {:08x}  {}", if a == cpu.pc { "=>" } else { "  " }, a, insn, disasm(insn));
+            }
+        }
         crate::symbols::backtrace(cpu);
         for r in [0usize, 1, 19, 20, 21, 22] {
             if let Some(v) = crate::guestmem::read_u64(cpu.x[r]) {
@@ -56,6 +63,18 @@ extern "C" fn dump_threads(_: i32) {
 
 pub fn install_debug_handler() {
     unsafe { libc::signal(libc::SIGUSR1, dump_threads as usize) };
+    if std::env::var_os("MACLATOR_DUMP_ON_FAULT").is_some() {
+        unsafe {
+            libc::signal(libc::SIGSEGV, fault_dump as usize);
+            libc::signal(libc::SIGBUS, fault_dump as usize);
+        }
+    }
+}
+
+extern "C" fn fault_dump(sig: i32) {
+    eprintln!("maclator: host signal {sig} in emulator; guest state:");
+    dump_threads(sig);
+    unsafe { libc::_exit(128 + sig) };
 }
 
 /// Handle an exit from interpreter/JIT. Returns false when the thread should stop.

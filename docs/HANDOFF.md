@@ -240,6 +240,55 @@ type keys, `Tracing.end`, then rank slice durations by thread.
 - Exec-mmap of AOT files triggers Gatekeeper dialogs → copy into the code cache.
 - Chromium hang: profiler `thread_suspend` (msg id 3605) → no-op shim.
 
+## GPU passthrough (Metal → host GPU) — added 2026-09-29
+
+`maclator --gpu ./app` routes the guest's Metal API to the host's real GPU (AMD RX 460 on the hack).
+Verified: `tests/guest/metaltri` (clear + triangle + readback, `STRESS=1` for ANGLE-like load) and
+Chromium 157 with ANGLE-Metal (`chrome://gpu`-equivalent via DevTools `SystemInfo.getInfo`: GPU compositing,
+rasterization, WebGL, WebGPU, Graphite all enabled). Benchmark (animated canvas+transform page, hack):
+software 1.4 fps (median frame 1000 ms) → GPU 28 fps (18 ms).
+
+Launch Chromium with acceleration: `~/bin/chromium-gpu [url]` on the hack (source: `gpu/chromium-gpu`; uses `--gpu --gpu-only --type=gpu-process` so only the GPU process loads the bridge — giving every helper the bridge starved the renderers and made clicks unresponsive; flags: `--use-angle=metal --use-gl=angle
+--enable-gpu --ignore-gpu-blocklist --disable-gpu-sandbox --disable-gpu-watchdog --no-sandbox`).
+
+Design (all in `gpu/` + `crates/maclator/src/gpu.rs`):
+- `gpu/mclmetal.m` → **guest** arm64 `libmclmetal.dylib`, injected with `DYLD_INSERT_LIBRARIES` (maclator does this
+  for `--gpu`, then the shim `unsetenv`s it). It interposes `MTLCreateSystemDefaultDevice/MTLCopyAllDevices` and
+  returns `MCLProxy` (NSProxy) objects. `forwardInvocation:` marshals every message (binary plist) using the host's
+  method type encodings; guest-side `MTL*Descriptor` objects are serialized by property introspection; blocks
+  (completion handlers) are registered and invoked later from a guest pump thread (`op 3` = wait for event).
+- `gpu/mclbridge.m` → **host** x86-64 `libmclbridge.dylib`, dlopen'ed by maclator (`gpu.rs`). Handle table of real
+  Metal objects, calls executed with `NSInvocation`. Guest and host share one address space, so raw pointers
+  (`setVertexBytes`, `getBytes`, `MTLBuffer.contents`) just work.
+- Transport: `svc #0x80` with x16 = `0x4D43` (`SYS_MCL_HOSTCALL`), x0=op x1=request ptr x2=len → x0=reply ptr x1=len.
+- `gpu/build.sh` builds everything (also a native arm64 *loopback* build, `out/metaltri_loop`, which runs shim+bridge
+  in one process on an Apple Silicon Mac — debug marshalling there first, e.g. with `NSZombieEnabled=YES`).
+- Install on the hack: `libmclbridge.dylib` + `libmclmetal.dylib` in `~/bin/gpu/` (also searched: next to maclator,
+  `~/.maclator/gpu`, `$MACLATOR_GPU_DIR`). Env: `MCL_TRACE=1` (log every message), `MCL_STATS=1` (per-5 s RPC table
+  in the GPU process log), `MCL_NIL=1` (debug: no device).
+
+Hard-won constraints (do not regress):
+1. **Host frameworks must never run on a guest thread.** The kernel has one special reply port per thread; guest
+   libxpc and host libxpc both cache/recycle it → guest XPC dies with `MACH_RCV_INVALID_NOTIFY` (0x10004007),
+   seen as libdispatch "Unexpected error from mach_msg_receive" BRK in LaunchServices/CFPreferences. `gpu.rs` gives
+   every guest thread its own bridge thread.
+2. Host CoreFoundation/Metal must be initialised **before the guest starts** (`--gpu` preloads the bridge and runs
+   `mcl_warmup` on a scratch thread); initialising them mid-run disturbed guest XPC too.
+3. Never pass `DYLD_INSERT_LIBRARIES=<arm64 dylib>` to host processes (`spawn.rs` scrubs it; maclator re-injects).
+4. `dispatch_data_t` is toll-free bridged to NSData — check for it before NSData (`newLibraryWithData:`).
+5. Reply plists must be parsed from a private copy (parsed objects can reference the source bytes).
+6. Chromium's GPU watchdog / objc-zombie crashes look like `str wzr,[xzr]` in the Chromium Framework
+   (`--disable-gpu-watchdog`; zombies were my refcount bugs). `--dump-on-fault` now survives the guest resetting
+   SIGSEGV and marks the faulting thread `(THIS THREAD)`.
+
+Known gaps / next steps: presentation is via IOSurface (`newTextureWithDescriptor:iosurface:plane:` works — IOSurface
+arguments are currently sent as unsupported and need the id→`IOSurfaceLookup` translation if the browser-side
+display path needs it); `CAMetalLayer` (apps that present directly, not via Chromium) is not bridged;
+`MTLFunctionConstantValues`, argument buffers, `MTLSharedEvent` listeners and NSURL-based APIs are only partly covered;
+per-call cost is dominated by plist marshalling in the emulated guest (batching / binary protocol is the next
+performance lever); compile time of shaders is on the host and is one-time (~2.7 s for ANGLE's library);
+apps needing `--disable-gpu-watchdog`-like relief may still hit their own hang detectors during long inits.
+
 ## Session log summary (chronological)
 
 1. Obtained arm64e dyld cache (macOS 26.6.2) on the hack via `ipsw` partial IPSW extraction

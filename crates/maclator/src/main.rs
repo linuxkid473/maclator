@@ -4,6 +4,7 @@ mod aot;
 mod cache;
 mod commpage;
 mod engine;
+mod gpu;
 mod guestmem;
 mod hostsys;
 mod iokit;
@@ -29,6 +30,7 @@ fn usage() -> ! {
     eprintln!("  --dyld PATH     arm64 dyld to use (default /usr/lib/dyld)");
     eprintln!("  --sysroot DIR   directory with the arm64 dyld shared cache files");
     eprintln!("  --trace         trace system calls");
+    eprintln!("  --gpu           route the guest's Metal API to the host GPU");
     std::process::exit(2);
 }
 
@@ -57,6 +59,20 @@ fn main() {
                     usage();
                 }
                 dyld = args.remove(0);
+            }
+            "--gpu" => {
+                // Route the guest's Metal API to the host GPU (see gpu.rs).
+                std::env::set_var("MACLATOR_GPU", "1");
+                args.remove(0);
+            }
+            "--gpu-only" => {
+                // Only guest processes whose arguments contain SUBSTR get the GPU (e.g. --type=gpu-process);
+                // others run untouched (saves the bridge start-up cost in every helper process).
+                args.remove(0);
+                if args.is_empty() {
+                    usage();
+                }
+                std::env::set_var("MACLATOR_GPU_ONLY", args.remove(0));
             }
             "--interp" => {
                 jit::JIT_ENABLED.store(false, Ordering::Relaxed);
@@ -126,6 +142,13 @@ fn main() {
         if !jit::JIT_ENABLED.load(Ordering::Relaxed) {
             fwd.push("--interp".into());
         }
+        if std::env::var_os("MACLATOR_GPU").is_some() {
+            fwd.push("--gpu".into());
+            if let Ok(o) = std::env::var("MACLATOR_GPU_ONLY") {
+                fwd.push("--gpu-only".into());
+                fwd.push(o);
+            }
+        }
         if std::env::var_os("MACLATOR_TRACE_FILE").is_some() {
             fwd.push("--trace-file".into());
         } else if syscalls::TRACE.load(Ordering::Relaxed) {
@@ -140,11 +163,16 @@ fn main() {
         syscalls::TRACE.store(true, Ordering::Relaxed);
     }
     let exe = resolve_path(&args[0]);
-    let envp: Vec<String> = std::env::vars()
-        .filter(|(k, _)| !k.starts_with("MACLATOR_") || matches!(k.as_str(), "MACLATOR_DUMP_ON_FAULT" | "MACLATOR_JIT_THRESHOLD" | "MACLATOR_STATS" | "MACLATOR_FALLBACK_HIST"))
+    let gpu_active = std::env::var_os("MACLATOR_GPU").is_some()
+        && std::env::var("MACLATOR_GPU_ONLY").map(|o| args.iter().skip(1).any(|a| a.contains(&o))).unwrap_or(true);
+    let mut envp: Vec<String> = std::env::vars()
+        .filter(|(k, _)| !k.starts_with("MACLATOR_") || matches!(k.as_str(), "MACLATOR_DUMP_ON_FAULT" | "MACLATOR_GPU_BRIDGE" | "MACLATOR_JIT_THRESHOLD" | "MACLATOR_STATS" | "MACLATOR_FALLBACK_HIST"))
         .map(|(k, v)| format!("{k}={v}"))
         .collect();
 
+    if gpu_active && !gpu::inject(&mut envp) {
+        eprintln!("maclator: --gpu: libmclmetal.dylib not found (looked next to maclator, in ./gpu, ~/.maclator/gpu, $MACLATOR_GPU_DIR)");
+    }
     if std::env::var_os("MACLATOR_TRACE_FILE").is_some() {
         unsafe {
             let path = format!("/tmp/maclator-trace-{}.log\0", libc::getpid());
@@ -153,6 +181,11 @@ fn main() {
                 libc::dup2(fd, 2);
             }
         }
+    }
+    if gpu_active {
+        // The host frameworks must be initialised before the guest runs: CoreFoundation's
+        // initialiser disturbs the guest's LaunchServices/XPC state when run mid-flight.
+        gpu::preload();
     }
     engine::install_debug_handler();
     let cp = commpage::CommPage::install();

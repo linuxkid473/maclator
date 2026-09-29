@@ -168,6 +168,7 @@ fn bsd(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
 
 fn bsd_inner(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
     match n {
+        crate::gpu::SYS_MCL_HOSTCALL => crate::gpu::hostcall(cpu),
         SYS_VFORK | SYS_FORK => {
             // vfork shares our address space and stack: use fork instead. Go through libc's
             // fork (not the raw syscall) so the host libSystem re-initialises in the child

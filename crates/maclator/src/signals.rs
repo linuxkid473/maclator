@@ -48,8 +48,10 @@ pub fn sigaction(sig: i32, nsa: u64, osa: u64) -> Result<(), i32> {
         acts[sig as usize] = a;
         // Mirror "ignore" and "default" dispositions on the host so that
         // e.g. SIGPIPE-ignoring programs keep working.
+        let keep_dump = matches!(sig, libc::SIGSEGV | libc::SIGBUS) && std::env::var_os("MACLATOR_DUMP_ON_FAULT").is_some();
         unsafe {
-            if a.handler == SIG_IGN {
+            if keep_dump {
+            } else if a.handler == SIG_IGN {
                 libc::signal(sig, libc::SIG_IGN);
             } else if a.handler == 0 {
                 libc::signal(sig, libc::SIG_DFL);

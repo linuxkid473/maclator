@@ -93,7 +93,8 @@ extern "C" fn dump_threads(_: i32) {
     let list = CPUS.try_lock().map(|g| g.clone()).unwrap_or_default();
     for (i, &p) in list.iter().enumerate() {
         let cpu = unsafe { &*(p as *const Cpu) };
-        eprintln!("=== guest thread {i}: pc {:#x} {}  lr {}", cpu.pc, crate::symbols::describe(cpu.pc), crate::symbols::describe(cpu.x[30]));
+        let me = CURRENT_CPU.with(|c| c.get()) == p;
+        eprintln!("=== guest thread {i}{}: pc {:#x} {}  lr {}", if me { " (THIS THREAD)" } else { "" }, cpu.pc, crate::symbols::describe(cpu.pc), crate::symbols::describe(cpu.x[30]));
         eprintln!("{}", cpu.dump());
         for i in 0..14u64 {
             let a = cpu.pc.wrapping_sub(10 * 4) + i * 4;

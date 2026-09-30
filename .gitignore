@@ -3,3 +3,4 @@
 /tests/guest/*
 !/tests/guest/*.c
 gpu/out/
+.claude/

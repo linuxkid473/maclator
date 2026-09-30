@@ -1,0 +1,5 @@
+#!/bin/zsh
+# balenaEtcher (arm64) under maclator with the Metal bridge. The Chromium sandbox cannot start under maclator.
+cd "${ETCHER_DIR:-/Applications/balenaEtcher.app/Contents/MacOS}" || exit 1
+exec "$HOME/bin/maclator" --gpu --gpu-only --type=gpu-process ./balenaEtcher --no-sandbox --disable-gpu-sandbox \
+  --disable-gpu-watchdog --use-angle=metal --use-gl=angle --enable-gpu --ignore-gpu-blocklist "$@"

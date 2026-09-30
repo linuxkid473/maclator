@@ -1,0 +1,13 @@
+Maclator is an independent project and is not affiliated with or endorsed by Apple Inc.
+Apple, macOS, Metal, Rosetta and related names are trademarks of Apple Inc.
+
+No Apple binaries or system files are included in this repository or produced by its build. The arm64 dyld
+shared cache is downloaded by the user from Apple's servers (with `ipsw`, https://github.com/blacktop/ipsw)
+and remains subject to Apple's license terms.
+
+ref/ contains excerpts of Apple open-source releases used as reference while implementing syscall and dyld
+behaviour (xnu, dyld, libpthread, libdispatch). They are distributed under their original licenses
+(Apple Public Source License 2.0, or the Apache License 2.0 for libdispatch) and keep their license
+headers; they are not compiled into Maclator.
+
+Third-party Rust crates (see Cargo.lock), notably iced-x86 (MIT) and libc (MIT/Apache-2.0).

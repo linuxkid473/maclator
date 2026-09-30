@@ -1,5 +1,5 @@
 import sys, json, time, urllib.request, urllib.parse, subprocess
-sys.path.insert(0, "/Users/vihaannathan/maclator-run")
+import os; sys.path.insert(0, os.path.expanduser("~/maclator-run"))
 from ws import *
 def idle_stats():
     out = subprocess.run("ps -Ao pcpu,rss,command | command grep '[m]aclator --dyld\\|[m]aclator --gpu' | awk '{c+=$1; r+=$2; n++} END {print n, c, int(r/1024)}'", shell=True, capture_output=True, text=True, executable="/bin/zsh").stdout.split()

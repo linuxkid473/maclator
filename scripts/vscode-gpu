@@ -3,4 +3,4 @@
 cd "${VSCODE_DIR:-$HOME/vscode-arm64}" || exit 1
 exec "$HOME/bin/maclator" --gpu --gpu-only --type=gpu-process "./Visual Studio Code.app/Contents/MacOS/Code" \
   --no-sandbox --disable-gpu-sandbox --disable-gpu-watchdog --use-angle=metal --use-gl=angle --enable-gpu \
-  --ignore-gpu-blocklist --js-flags=--jitless --user-data-dir="${VSCODE_DATA:-$HOME/vscode-data}" --disable-workspace-trust "$@"
+  --ignore-gpu-blocklist --user-data-dir="${VSCODE_DATA:-$HOME/vscode-data}" --disable-workspace-trust "$@"

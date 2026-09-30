@@ -20,4 +20,5 @@ mkdir -p "$PREFIX/gpu"
 install -m 755 "$BIN" "$PREFIX/maclator"
 install -m 755 gpu/out/libmclbridge.dylib gpu/out/libmclmetal.dylib "$PREFIX/gpu/"
 for s in gpu/chromium-gpu scripts/vscode-gpu scripts/etcher-gpu; do install -m 755 "$s" "$PREFIX/$(basename "$s")"; done
+ln -sf chromium-gpu "$PREFIX/chromium"; ln -sf vscode-gpu "$PREFIX/code"; ln -sf etcher-gpu "$PREFIX/etcher"
 echo "installed to $PREFIX (make sure it is on PATH). Next: scripts/fetch-sysroot.sh"

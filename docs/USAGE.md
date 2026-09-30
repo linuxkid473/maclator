@@ -64,13 +64,13 @@ Download the **darwin-arm64** zip (`https://update.code.visualstudio.com/latest/
 `~/vscode-arm64`, then:
 
 ```bash
-vscode-gpu                       # installed by scripts/install.sh; VSCODE_DIR / VSCODE_DATA override locations
+vscode-gpu   # also installed as `code`; by scripts/install.sh; VSCODE_DIR / VSCODE_DATA override locations
 # software rendering variant:
 cd ~/vscode-arm64 && maclator "./Visual Studio Code.app/Contents/MacOS/Code" --no-sandbox --disable-gpu \
-    --js-flags=--jitless --user-data-dir=$HOME/vscode-data --disable-workspace-trust
+    --user-data-dir=$HOME/vscode-data --disable-workspace-trust
 ```
 
-`--js-flags=--jitless` was chosen during development for stability; you can experiment without it.
+`vscode-gpu` runs with V8's JIT enabled (in-page 3e6 loop 51 ms vs 545 ms with `--js-flags=--jitless`, median frame after a keystroke 23 ms vs 38 ms). Add `--js-flags=--jitless` if you hit V8 JIT stability problems.
 The integrated terminal may warn "unable to resolve shell environment"; that only affects its environment.
 
 ## balenaEtcher

@@ -30,7 +30,7 @@ You need an Intel Mac on macOS 26 (Tahoe) with Xcode Command Line Tools and a Ru
 free disk, and an internet connection for the one-time download of the arm64 dyld shared cache.
 
 ```bash
-git clone https://github.com/OWNER/maclator && cd maclator
+git clone https://github.com/linuxkid473/maclator && cd maclator
 scripts/install.sh            # builds maclator + the GPU bridge, installs to ~/bin
 scripts/fetch-sysroot.sh      # downloads the arm64e dyld shared cache (≈5.5 GB) into ~/maclator-sysroot
 maclator ./some-arm64-binary  # that's it; the sysroot is found automatically

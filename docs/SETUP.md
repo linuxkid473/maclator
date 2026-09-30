@@ -15,7 +15,7 @@ cross-compiles, and the `bench/` scripts drive an Intel test Mac over ssh. It is
 ## 1. Build and install
 
 ```bash
-git clone https://github.com/OWNER/maclator && cd maclator
+git clone https://github.com/linuxkid473/maclator && cd maclator
 scripts/install.sh
 ```
 

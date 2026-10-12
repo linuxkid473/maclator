@@ -28,8 +28,9 @@ maclator --selftest-jit fuse2  200000   # [setter, b.cond, A, B, svc] with A/B o
 maclator --selftest-jit blocks 300000   # random straight-line blocks over a small register set (reuse!) incl.
                                         #   loads/stores/pre/post-index writeback: exercises the register cache
 ```
-`ldst` reports ~13 mismatches, all `ldr <v>, literal` (`$+0x…`): a harness artifact (the literal pool is outside the test
-page); the pre-change tree shows the same. Sensitivity check of `blocks`: removing one `rc_inval` gives ~60 mismatches
+`ldst` centres pc in a 4MB window so the `ldr <v>, literal` pool (±1MB) stays mapped: expect `mismatch=0`.
+(Before, the 4K test page left the literal pool outside it: garbage reads showed up as ~13 mismatches on some
+hosts and faulted outright on hosts with sparse mappings around the test page.) Sensitivity check of `blocks`: removing one `rc_inval` gives ~60 mismatches
 per 200k blocks. All three new classes also pass on the test Mac's real Haswell.
 Prints `ok= mismatch= skipped= native=`. **Always check `native=`**: an instruction that falls
 back to the interpreter trivially matches it (that hid four bugs for a while). Masks must leave

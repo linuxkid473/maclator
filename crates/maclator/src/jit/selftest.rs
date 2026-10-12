@@ -320,9 +320,15 @@ pub fn run_selftest(class: &str, count: usize) {
         }
     };
     let is_mem = class == "ldst" || std::env::var_os("MACLATOR_SELFTEST_MEM").is_some();
+    // The instruction under test plus an svc terminator live at pc. PC-relative
+    // literal loads (`ldr ..., $±imm19<<2`) can reach ±1MB from pc, so centre pc
+    // in a 4MB window: every literal target stays mapped (zeroed) and the result
+    // no longer depends on whatever happens to be mapped around a 4K page
+    // (unmapped -> SIGSEGV on some hosts, garbage -> spurious mismatches).
     let page = unsafe {
-        libc::mmap(std::ptr::null_mut(), 0x1000, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0) as u64
+        libc::mmap(std::ptr::null_mut(), 0x400000, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0) as u64
     };
+    let pc = page + 0x200000;
     let mut buf = vec![0u8; 1 << 20];
     let bufp = buf.as_mut_ptr() as u64;
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
@@ -364,7 +370,7 @@ pub fn run_selftest(class: &str, count: usize) {
         for i in 0..32 {
             init.v[i] = [rng.val(), rng.val()];
         }
-        init.pc = page;
+        init.pc = pc;
         let mem0: Vec<u8> = buf.clone();
         let mut r = Cpu::new();
         *r = clone_cpu(&init);
@@ -379,10 +385,10 @@ pub fn run_selftest(class: &str, count: usize) {
         buf.copy_from_slice(&mem0);
         // JIT: single instruction followed by SVC (block terminator).
         unsafe {
-            *(page as *mut u32) = insn;
-            *((page + 4) as *mut u32) = 0xD400_1001; // svc #0x80
+            *(pc as *mut u32) = insn;
+            *((pc + 4) as *mut u32) = 0xD400_1001; // svc #0x80
         }
-        invalidate_range(page, 8);
+        invalidate_range(pc, 8);
         if std::env::var_os("SELFTEST_VERBOSE").is_some() {
             eprintln!("test {:08x} {}", insn, disasm(insn));
         }
@@ -390,7 +396,7 @@ pub fn run_selftest(class: &str, count: usize) {
         *j = clone_cpu(&init);
         setup_cpu(&mut j);
         let fb0 = STATS_FALLBACK.load(Ordering::Relaxed);
-        let host = lookup_or_translate(page);
+        let host = lookup_or_translate(pc);
         if STATS_FALLBACK.load(Ordering::Relaxed) == fb0 {
             native += 1;
         }

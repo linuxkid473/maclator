@@ -1,0 +1,905 @@
+--- a/crates/maclator/src/main.rs
++++ b/crates/maclator/src/main.rs
+@@ -13,6 +13,7 @@
+ mod loader;
+ mod macho;
+ mod paths;
++mod platform;
+ mod signals;
+ mod slices;
+ mod spawn;
+@@ -35,6 +36,7 @@
+     eprintln!("  --app-icon PATH  use an original icon resource for the running app");
+     eprintln!("  --trace         trace system calls");
+     eprintln!("  --gpu           route the guest's Metal API to the host GPU");
++    eprintln!("  --native-platform  experimental native memory library calls (default off)");
+     std::process::exit(2);
+ }
+ 
+@@ -71,6 +73,15 @@
+                 std::env::set_var("MACLATOR_GPU", "1");
+                 args.remove(0);
+             }
++            "--native-platform" => {
++                std::env::set_var("MACLATOR_NATIVE_PLATFORM", "1");
++                args.remove(0);
++            }
++            "--native-platform-shim" => {
++                args.remove(0);
++                if args.is_empty() { usage(); }
++                std::env::set_var("MACLATOR_PLATFORM_SHIM", args.remove(0));
++            }
+             "--gpu-only" => {
+                 // Only guest processes whose arguments contain SUBSTR get the GPU (e.g. --type=gpu-process);
+                 // others run untouched (saves the bridge start-up cost in every helper process).
+@@ -188,6 +199,13 @@
+         if std::env::var_os("MACLATOR_DUMP_ON_FAULT").is_some() {
+             fwd.push("--dump-on-fault".into());
+         }
++        if platform::enabled() {
++            fwd.push("--native-platform".into());
++            if let Some(shim) = platform::shim_path() {
++                fwd.push("--native-platform-shim".into());
++                fwd.push(shim);
++            }
++        }
+         spawn::configure(fwd);
+     }
+     if std::env::var_os("MACLATOR_TRACE").is_some() {
+@@ -203,6 +221,12 @@
+ 
+     if gpu_active && !gpu::inject(&mut envp) {
+         eprintln!("maclator: --gpu: libmclmetal.dylib not found (looked next to maclator, in ./gpu, ~/.maclator/gpu, $MACLATOR_GPU_DIR)");
++    }
++    if platform::enabled() {
++        if let Err(e) = platform::inject(&mut envp) {
++            eprintln!("maclator: native platform: {e}");
++            std::process::exit(1);
++        }
+     }
+     if let Some(icon) = app_icon_path {
+         if let Err(e) = app_icon::inject(&icon, &mut envp) {
+--- /dev/null
++++ b/crates/maclator/src/platform.rs
+@@ -0,0 +1,257 @@
++//! Opt-in native memory primitives, reached through an ARM interposing shim.
++//!
++//! This is a library-call bridge, not a BSD syscall: libc memory operations
++//! have no errno result. Preserve all guest state except the documented x0
++//! result and x17 completion status. Checked address arithmetic and commpage
++//! translation do not prove VM accessibility. Like the original C operation,
++//! callers must provide live readable/writable objects for the whole range.
++//! Synchronous host faults are not yet converted to recoverable guest faults.
++
++use maclator_core::{cpu::Cpu, mem};
++use std::path::PathBuf;
++use std::sync::{atomic::{AtomicU64, Ordering}, OnceLock};
++
++pub const SYS_MCL_MEMCALL: u64 = 0x4d4d;
++pub const OP_COPY: u64 = 1;
++pub const OP_FILL: u64 = 2;
++pub const OP_ZERO: u64 = 3;
++pub const MIN_SIZE: u64 = 4096;
++const SHIM_NAME: &str = "libmclplatform.dylib";
++const TBI_MASK: u64 = 0x00ff_ffff_ffff_ffff;
++// Darwin x86-64 user mappings occupy the positive canonical half.
++const HOST_END: u64 = 1 << 47;
++
++static COPY_CALLS: AtomicU64 = AtomicU64::new(0);
++static FILL_CALLS: AtomicU64 = AtomicU64::new(0);
++static BYTES: AtomicU64 = AtomicU64::new(0);
++static DECLINED: AtomicU64 = AtomicU64::new(0);
++
++pub fn enabled() -> bool {
++    static ENABLED: OnceLock<bool> = OnceLock::new();
++    *ENABLED.get_or_init(|| std::env::var("MACLATOR_NATIVE_PLATFORM").as_deref() == Ok("1"))
++}
++
++pub fn shim_path() -> Option<String> {
++    let path = if let Some(path) = std::env::var_os("MACLATOR_PLATFORM_SHIM") {
++        PathBuf::from(path)
++    } else {
++        std::env::current_exe().ok()?.parent()?.join(SHIM_NAME)
++    };
++    let path = std::fs::canonicalize(path).ok()?;
++    path.is_file().then(|| path.to_string_lossy().into_owned())
++}
++
++/// Return the injected path so the same opt-in and path can be forwarded to
++/// ARM children. Native children must have this ARM dylib scrubbed from envp.
++pub fn inject(envp: &mut Vec<String>) -> Result<String, String> {
++    let shim = shim_path().ok_or_else(|| format!("{SHIM_NAME} not found; set MACLATOR_PLATFORM_SHIM"))?;
++    let image = crate::macho::MachO::open_arm64(&shim, false)
++        .map_err(|e| format!("invalid ARM shim {shim}: {e}"))?;
++    if image.filetype != 6 { return Err(format!("platform shim is not MH_DYLIB: {shim}")); }
++    if let Some(entry) = envp.iter_mut().find(|e| e.starts_with("DYLD_INSERT_LIBRARIES=")) {
++        let value = entry.strip_prefix("DYLD_INSERT_LIBRARIES=").unwrap();
++        if !value.split(':').any(|path| path == shim) {
++            if !value.is_empty() { entry.push(':'); }
++            entry.push_str(&shim);
++        }
++    } else {
++        envp.push(format!("DYLD_INSERT_LIBRARIES={shim}"));
++    }
++    Ok(shim)
++}
++
++/// Map one entire nonempty interval, never only its first byte. Crossing a
++/// commpage boundary is declined because the range is not one linear mapping.
++/// All commpage destinations are declined, including in-place mappings.
++fn map_range(address: u64, length: u64, writing: bool, redirect: u64) -> Option<u64> {
++    if length == 0 || length > isize::MAX as u64 || usize::try_from(length).is_err() { return None; }
++    let start = address & TBI_MASK;
++    let end = start.checked_add(length)?;
++    if start == 0 || end > HOST_END { return None; }
++    let overlaps_commpage = start < mem::COMMPAGE_SPAN_END && end > mem::COMMPAGE_SPAN_START;
++    let mapped = if overlaps_commpage {
++        if writing || start < mem::COMMPAGE_SPAN_START || end > mem::COMMPAGE_SPAN_END { return None; }
++        if redirect == 0 { start }
++        else { redirect.checked_add(start - mem::COMMPAGE_SPAN_START)? }
++    } else { start };
++    if mapped == 0 || mapped.checked_add(length)? > HOST_END { return None; }
++    Some(mapped)
++}
++
++fn call(cpu: &mut Cpu, active: bool) -> bool {
++    let op = cpu.x[17];
++    if !active || !matches!(op, OP_COPY | OP_FILL | OP_ZERO) { return false; }
++    let destination = cpu.x[0];
++    let length = if op == OP_ZERO { cpu.x[1] } else { cpu.x[2] };
++    // Zero-sized calls must not examine or dereference either pointer. The
++    // original tagged destination is the result, even if it is null/invalid.
++    if length == 0 { return true; }
++    // A small copy with different TBI tags also needs normalized-pointer
++    // direction selection. Other small calls retain the original guest path.
++    if length < MIN_SIZE && !(op == OP_COPY && ((destination ^ cpu.x[1]) >> 56) != 0) {
++        return false;
++    }
++    let redirect = mem::COMMPAGE_REDIRECT.load(Ordering::Relaxed);
++    let Some(destination_host) = map_range(destination, length, true, redirect) else { return false };
++    let source_host = if op == OP_COPY {
++        let Some(source) = map_range(cpu.x[1], length, false, redirect) else { return false };
++        source
++    } else { 0 };
++    unsafe {
++        // The guest's __error/TSD storage is separate. Preserve host errno as
++        // well, so runtime machinery does not leak a host-library side effect.
++        let errno_pointer = libc::__error();
++        let saved_errno = *errno_pointer;
++        if op == OP_COPY {
++            // memcpy and memmove may resolve to one dyld address. One shared
++            // replacement uses memmove for both; this also handles TBI aliases.
++            libc::memmove(destination_host as *mut libc::c_void,
++                source_host as *const libc::c_void, length as usize);
++            COPY_CALLS.fetch_add(1, Ordering::Relaxed);
++        } else {
++            let value = if op == OP_ZERO { 0 } else { (cpu.x[1] & 255) as i32 };
++            libc::memset(destination_host as *mut libc::c_void, value, length as usize);
++            FILL_CALLS.fetch_add(1, Ordering::Relaxed);
++        }
++        *errno_pointer = saved_errno;
++    }
++    BYTES.fetch_add(length, Ordering::Relaxed);
++    // x0 stays the original guest spelling, including its top-byte tag. Do
++    // not set carry, clear flags, mutate x1/x2, or touch the guest TLS/errno.
++    cpu.x[0] = destination;
++    true
++}
++
++pub fn hostcall(cpu: &mut Cpu) {
++    let completed = call(cpu, enabled());
++    if !completed { DECLINED.fetch_add(1, Ordering::Relaxed); }
++    cpu.x[17] = if completed { 0 } else { 1 };
++}
++
++pub fn report() {
++    if enabled() && std::env::var_os("MACLATOR_STATS").is_some() {
++        eprintln!("[maclator] native platform: copy={} fill={} bytes={} declined={}",
++            COPY_CALLS.load(Ordering::Relaxed), FILL_CALLS.load(Ordering::Relaxed),
++            BYTES.load(Ordering::Relaxed), DECLINED.load(Ordering::Relaxed));
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn cpu(op: u64, dst: u64, second: u64, length: u64) -> Cpu {
++        let mut cpu = Cpu::default();
++        for i in 0..32 { cpu.x[i] = 0x1234_5678_0000_0000 + i as u64; cpu.v[i] = [i as u64, !i as u64]; }
++        cpu.x[0] = dst; cpu.x[1] = second; cpu.x[2] = length; cpu.x[17] = op;
++        cpu.pc = 0x1000; cpu.fpcr = 0x0300_0000; cpu.fpsr = 0x0800_009f;
++        cpu.tpidr_el0 = 0x1122; cpu.tpidrro_el0 = 0x3344; cpu.set_nzcv(0xf);
++        cpu
++    }
++
++    fn unchanged(before: &Cpu, after: &Cpu) {
++        assert_eq!(before.x, after.x); assert_eq!(before.v, after.v);
++        assert_eq!(before.pc, after.pc); assert_eq!(before.nzcv(), after.nzcv());
++        assert_eq!(before.fpcr, after.fpcr); assert_eq!(before.fpsr, after.fpsr);
++        assert_eq!(before.tpidr_el0, after.tpidr_el0); assert_eq!(before.tpidrro_el0, after.tpidrro_el0);
++    }
++
++    #[test]
++    fn complete_range_mapping_and_overflow() {
++        let r = 0x1000_0000;
++        let s = mem::COMMPAGE_SPAN_START;
++        let e = mem::COMMPAGE_SPAN_END;
++        assert_eq!(map_range(0xab00_0000_1234_0000, 4096, false, r), Some(0x1234_0000));
++        assert_eq!(map_range(s | 0xcd00_0000_0000_0000, e - s, false, r), Some(r));
++        assert_eq!(map_range(s + 8, e - s - 8, false, 0), Some(s + 8));
++        assert_eq!(map_range(s - 1, 2, false, r), None);
++        assert_eq!(map_range(e - 1, 2, false, r), None);
++        assert_eq!(map_range(s, 4096, true, r), None);
++        assert_eq!(map_range(s, 4096, true, 0), None);
++        assert_eq!(map_range(0, 1, false, 0), None);
++        assert_eq!(map_range(HOST_END - 1, 2, false, 0), None);
++        assert_eq!(map_range(0xffff_ffff_ffff_fff0, 4096, false, 0), None);
++        assert_eq!(map_range(1, u64::MAX, false, 0), None);
++        assert_eq!(map_range(s, 4096, false, u64::MAX - 100), None);
++    }
++
++    #[test]
++    fn zero_disabled_and_declined_calls_preserve_architecture() {
++        for op in [OP_COPY, OP_FILL, OP_ZERO] {
++            let mut value = cpu(op, u64::MAX, if op == OP_ZERO { 0 } else { u64::MAX }, 0);
++            let before = cpu(op, u64::MAX, if op == OP_ZERO { 0 } else { u64::MAX }, 0);
++            assert!(call(&mut value, true)); unchanged(&before, &value);
++            assert!(!call(&mut value, false)); unchanged(&before, &value);
++        }
++        for (dst, source, length) in [(0, 1, 4096), (1, 0, 4096),
++            (1, 2, u64::MAX), (mem::COMMPAGE_RO, 0x1000, 4096), (1, 2, 4095)] {
++            let mut value = cpu(OP_COPY, dst, source, length);
++            let before = cpu(OP_COPY, dst, source, length);
++            assert!(!call(&mut value, true)); unchanged(&before, &value);
++        }
++    }
++
++    #[test]
++    fn tagged_overlap_copy_fill_and_host_errno() {
++        let mut bytes = vec![0u8; 3 * MIN_SIZE as usize];
++        for (i, byte) in bytes.iter_mut().enumerate() { *byte = (i * 31) as u8; }
++        let initial = bytes.clone();
++        let base = bytes.as_mut_ptr() as u64;
++        let tag = 0xab00_0000_0000_0000;
++        let mut copied = cpu(OP_COPY, (base + 17) | tag, base | 0xcd00_0000_0000_0000, MIN_SIZE);
++        let before = cpu(OP_COPY, (base + 17) | tag, base | 0xcd00_0000_0000_0000, MIN_SIZE);
++        unsafe { *libc::__error() = 73; }
++        assert!(call(&mut copied, true)); unchanged(&before, &copied);
++        assert_eq!(unsafe { *libc::__error() }, 73);
++        assert_eq!(&bytes[17..17 + MIN_SIZE as usize], &initial[..MIN_SIZE as usize]);
++        assert_eq!(&bytes[..17], &initial[..17]);
++        let mut filled = cpu(OP_FILL, base | tag, 0xffff_ffff_ffff_ff39, MIN_SIZE);
++        assert!(call(&mut filled, true));
++        assert!(bytes[..MIN_SIZE as usize].iter().all(|&b| b == 0x39));
++        let mut zeroed = cpu(OP_ZERO, base | tag, MIN_SIZE, u64::MAX);
++        assert!(call(&mut zeroed, true));
++        assert!(bytes[..MIN_SIZE as usize].iter().all(|&b| b == 0));
++        assert_eq!(unsafe { *libc::__error() }, 73);
++    }
++
++    #[test]
++    fn small_mixed_tag_overlap_and_same_tag_decline() {
++        let capacity = 12288;
++        let mut bytes = vec![0u8; capacity];
++        let base = bytes.as_mut_ptr() as u64;
++        let dst_tag = 0xab00_0000_0000_0000;
++        let src_tag = 0xcd00_0000_0000_0000;
++        for length in [1usize, 7, 15, 16, 31, 64, 255, 4095] {
++            for delta in [-63isize, -1, 0, 1, 63] {
++                for (i, byte) in bytes.iter_mut().enumerate() { *byte = (i * 31 + 17) as u8; }
++                let mut expected = bytes.clone();
++                let from = 4096usize;
++                let to = (from as isize + delta) as usize;
++                expected.copy_within(from..from + length, to);
++                let mut value = cpu(OP_COPY, (base + to as u64) | dst_tag,
++                    (base + from as u64) | src_tag, length as u64);
++                let before = cpu(OP_COPY, value.x[0], value.x[1], length as u64);
++                unsafe { *libc::__error() = 73; }
++                assert!(call(&mut value, true)); unchanged(&before, &value);
++                assert_eq!(bytes, expected, "length={length} delta={delta}");
++                assert_eq!(unsafe { *libc::__error() }, 73);
++                value.x[1] = (base + from as u64) | dst_tag;
++                assert!(!call(&mut value, true));
++            }
++        }
++        for op in [OP_FILL, OP_ZERO] {
++            let mut value = cpu(op, base | dst_tag, if op == OP_ZERO { 4095 } else { 0xcd }, 4095);
++            assert!(!call(&mut value, true));
++        }
++        for (destination, source, length) in [
++            (0 | dst_tag, base | src_tag, 1),
++            (base | dst_tag, 0 | src_tag, 1),
++            (mem::COMMPAGE_SPAN_START | dst_tag, base | src_tag, 1),
++            (base | dst_tag, (mem::COMMPAGE_SPAN_END - 1) | src_tag, 2),
++        ] {
++            let mut value = cpu(OP_COPY, destination, source, length);
++            let before = cpu(OP_COPY, destination, source, length);
++            assert!(!call(&mut value, true)); unchanged(&before, &value);
++        }
++    }
++}
+--- a/crates/maclator/src/spawn.rs
++++ b/crates/maclator/src/spawn.rs
+@@ -42,11 +42,12 @@
+ }
+ 
+ /// Host processes (native children and the maclator re-launcher) must not inherit the arm64
+-/// GPU/icon shims in DYLD_INSERT_LIBRARIES; maclator injects its GPU shim itself.
++/// GPU/icon/platform shims in DYLD_INSERT_LIBRARIES; maclator reinjects ARM
++/// shims into translated children using forwarded options.
+ /// Returns the scrubbed environment (keep alive until the call), and points `args` at it.
+ fn scrub_shim(n: u64, args: &mut [u64; 8]) -> Option<(Vec<CString>, Vec<u64>)> {
+     let eidx = if n == SYS_EXECVE { 2 } else { 4 };
+-    let shims: Vec<String> = [crate::gpu::shim_path(), crate::app_icon::shim_path()]
++    let shims: Vec<String> = [crate::gpu::shim_path(), crate::app_icon::shim_path(), crate::platform::shim_path()]
+         .into_iter().flatten().collect();
+     let env = unsafe { read_argv(args[eidx]) };
+     if !env.iter().any(|e| e.starts_with("MACLATOR_APP_ICON=") ||
+--- a/crates/maclator/src/syscalls.rs
++++ b/crates/maclator/src/syscalls.rs
+@@ -72,6 +72,12 @@
+ /// Handle SVC. `cpu.pc` already points after the SVC.
+ pub fn handle_svc(cpu: &mut Cpu) {
+     let num = cpu.x[16] as u32 as i32;
++    // Private library calls preserve guest flags/errno and use x17 status.
++    // Keep them outside BSD success/error and SA_RESTART handling.
++    if num as u32 as u64 == crate::platform::SYS_MCL_MEMCALL {
++        crate::platform::hostcall(cpu);
++        return;
++    }
+     if num == PLATFORM_SYSCALL {
+         match cpu.x[3] {
+             2 => cpu.tpidrro_el0 = cpu.x[0],
+@@ -300,6 +306,7 @@
+             }
+         }
+         SYS_EXIT => {
++            crate::platform::report();
+             crate::engine::flush_profile();
+             let r = hostsys::unix(SYS_EXIT, &args);
+             set_res(cpu, r);
+@@ -419,6 +426,7 @@
+         },
+         SYS_EXECVE | SYS_POSIX_SPAWN => {
+             if n == SYS_EXECVE {
++                crate::platform::report();
+                 crate::engine::flush_profile();
+             }
+             let r = crate::spawn::exec_like(n, &args);
+--- /dev/null
++++ b/platform/README.md
+@@ -0,0 +1,85 @@
++This experimental bridge executes ordinary ARM libc memory-library calls with
++the host's native libc. It remains off unless `MACLATOR_NATIVE_PLATFORM=1` or
++`--native-platform` is supplied. It does not modify applications, system
++libraries, the benchmark, or the shared Maclator candidate.
++
++Build this independent runtime with Cargo, then run `bash platform/build.sh`.
++Set `MACLATOR_PLATFORM_SHIM` to the resulting absolute `libmclplatform.dylib`
++path, or place the dylib next to the experimental runtime. The ARM dylib has
++four `DYLD_INTERPOSE` entries for memcpy, memmove, memset and bzero. It has no
++constructors, Foundation/ObjC dependencies, allocation or TLS initialization.
++
++Calls shorter than 4096 bytes tail-call the original ARM library, except copy
++calls whose destination and source have different top-byte tags. Those small
++copies also use the host bridge so overlap direction uses normalized pointers.
++Larger calls use `svc #0x80`, x16=0x4d4d and x17=1/2/3 for copy/fill/zero. Arguments retain
++the original C ABI: copy/fill take x0/x1/x2; bzero takes x0/x1. Success sets
++x17=0 and leaves x0 as the original destination, including its tag. Declined
++calls set x17=1 and tail-call the original guest implementation. x30 and SP are
++never changed by the leaf shim. The host handler preserves NZCV, all remaining
++guest registers, FP state and TLS state; it saves/restores host errno. Guest
++errno is not translated or set. Actual writes to a buffer containing errno are
++ordinary requested memory writes, rather than an errno side effect.
++
++Both copy symbols use one shared replacement and native memmove. Dyld may
++resolve memcpy and memmove to the same implementation address, so separate
++interpose targets would be ambiguous. Memmove implements every valid memcpy
++call and also handles normalized tagged pointers that refer to overlapping
++memory. Memset truncates its integer argument to the low eight bits. Zero-size
++calls do not inspect either pointer. Calls exceeding the host object-size bound,
++arithmetic overflow, null nonempty ranges and noncanonical host addresses are
++declined before native access.
++
++The handler checks each entire normalized interval. Commpage sources can be
++translated only when fully contained in its linear span. Crossing either span
++boundary is declined. All destinations intersecting the commpage are declined,
++including in-place mappings, so the original guest access retains its existing
++protection/fault behavior. ARM child launches forward the explicit opt-in and
++shim path; native children have the ARM shim removed from their environment.
++Stats under `MACLATOR_STATS=1` distinguish completed copy/fill calls, bytes and
++declines. Interposing may be denied by dyld/AMFI and cannot cover compiler
++inlining or every private/directly-bound libc call; counters establish actual
++coverage instead of assuming it.
++
++Checked address arithmetic does **not** establish VM permissions. The prototype
++requires valid live C objects for the duration of native access, as the original
++library function does. It does not yet provide recoverable guest synchronous
++faults for bad pointers in a host libc call, and must not be advertised as
++synchronously fault-safe. It preserves existing host fault diagnostics. No
++allocation, Mach RPC or host framework call is used in the hot copy/fill path.
++
++The original guest libc path failed a positive overlapping copy with different
++top-byte tags in both disabled and initial enabled modes (length 15, offset +1).
++Its pointer-ordering behavior is an observed limitation of the existing guest
++path; without an ARM-hardware comparison this is not attributed to a translator
++bug. Keep the initial failure logs. The enabled prototype now routes all such
++nonzero differing-tag copies through checked normalized native memmove. The
++common native/off/on comparison uses matching tags for overlap, while an
++enabled-only real-symbol probe covers differing tags at 1..4095 boundary sizes
++and 4096, positive/negative overlaps and differently tagged identical addresses.
++Other small memory calls still use the original guest library.
++
++Run the Rust contract tests with `cargo test -p maclator platform::tests -j 1`
++using an independent target directory. Run the ARM/native end-to-end probe:
++
++```sh
++python3 tests/check_native_platform.py \
++  --runtime /absolute/path/to/experimental/maclator \
++  --sysroot /absolute/path/to/arm64/sysroot \
++  --output /absolute/path/to/probe-results
++```
++
++The same C source and real library calls run on native x86, translated ARM with
++the bridge disabled, and translated ARM with it enabled, including redirected
++commpage mode. Tests cover zero/boundary sizes, alignments, tagged return values,
++overlap in both directions, canaries, read-only sources, guard pages, guest errno,
++raw private-call ABI/flags/decline behavior, ARM child option forwarding and
++native child shim scrubbing. The runner verifies native byte checksums and
++requires enough completed library calls to distinguish real symbol interception
++from its few explicit ABI probes. Each process group has a bounded deadline.
++These are correctness/compatibility tests; report a separate alternating A/B of
++the unchanged workload before claiming any performance gain or 95% target.
++
++Primary dyld source for the interpose section and self-call exclusions:
++[Apple dyld-interposing.h](https://github.com/apple-oss-distributions/dyld/blob/main/include/mach-o/dyld-interposing.h)
++and [Apple DyldRuntimeState.cpp](https://github.com/apple-oss-distributions/dyld/blob/main/dyld/DyldRuntimeState.cpp).
+--- /dev/null
++++ b/platform/build.sh
+@@ -0,0 +1,9 @@
++#!/bin/bash
++set -euo pipefail
++cd "$(dirname "$0")"
++platform_out="${OUT:-out}"
++mkdir -p "$platform_out"
++clang -arch arm64 -dynamiclib -O2 -fno-builtin -fno-stack-protector \
++    -install_name @rpath/libmclplatform.dylib \
++    interpose.c mclplatform.S -o "$platform_out/libmclplatform.dylib"
++codesign -f -s - "$platform_out/libmclplatform.dylib"
+--- /dev/null
++++ b/platform/interpose.c
+@@ -0,0 +1,18 @@
++#include <stddef.h>
++#include <string.h>
++#include <strings.h>
++
++extern void *mcl_platform_copy(void *, const void *, size_t);
++extern void *mcl_platform_fill(void *, int, size_t);
++extern void mcl_platform_zero(void *, size_t);
++
++// The current Command Line Tools SDK omits the convenience header. Dyld's
++// documented interpose section consists of replacement/replacee pointer pairs.
++struct mcl_interpose_tuple { const void *replacement; const void *replacee; };
++__attribute__((used, section("__DATA,__interpose,interposing")))
++static const struct mcl_interpose_tuple memory_interposes[] = {
++    {(const void *)&mcl_platform_copy, (const void *)&memcpy},
++    {(const void *)&mcl_platform_copy, (const void *)&memmove},
++    {(const void *)&mcl_platform_fill, (const void *)&memset},
++    {(const void *)&mcl_platform_zero, (const void *)&bzero},
++};
+--- /dev/null
++++ b/platform/mclplatform.S
+@@ -0,0 +1,64 @@
++// ARM leaf entries. No constructors, allocation, TLS access or host frameworks.
++// x17=0 means complete; every other status tail-calls the original guest libc.
++// Both copy symbols share one replacement because dyld may resolve aliases to
++// the same implementation address. All valid memcpy calls also satisfy memmove.
++.text
++.p2align 2
++.globl _mcl_platform_copy
++_mcl_platform_copy:
++    cbz x2, Lcopy_done
++    cmp x2, #1, lsl #12
++    b.hs Lcopy_host
++    // Guest libc may choose copy direction before stripping TBI tags. Route
++    // only differing-tag small copies through the normalized native memmove.
++    eor x9, x0, x1
++    lsr x9, x9, #56
++    cbz x9, Lcopy_guest
++Lcopy_host:
++    mov x9, x0
++    mov w16, #0x4d4d
++    mov w17, #1
++    svc #0x80
++    cbnz x17, Lcopy_declined
++Lcopy_done:
++    ret
++Lcopy_declined:
++    mov x0, x9
++Lcopy_guest:
++    b _memmove
++
++.p2align 2
++.globl _mcl_platform_fill
++_mcl_platform_fill:
++    cbz x2, Lfill_done
++    cmp x2, #1, lsl #12
++    b.lo Lfill_guest
++    mov x9, x0
++    mov w16, #0x4d4d
++    mov w17, #2
++    svc #0x80
++    cbnz x17, Lfill_declined
++Lfill_done:
++    ret
++Lfill_declined:
++    mov x0, x9
++Lfill_guest:
++    b _memset
++
++.p2align 2
++.globl _mcl_platform_zero
++_mcl_platform_zero:
++    cbz x1, Lzero_done
++    cmp x1, #1, lsl #12
++    b.lo Lzero_guest
++    mov x9, x0
++    mov w16, #0x4d4d
++    mov w17, #3
++    svc #0x80
++    cbnz x17, Lzero_declined
++Lzero_done:
++    ret
++Lzero_declined:
++    mov x0, x9
++Lzero_guest:
++    b _bzero
+--- /dev/null
++++ b/tests/check_native_platform.py
+@@ -0,0 +1,102 @@
++#!/usr/bin/env python3
++"""Build and compare real libc memory calls with opt-in Maclator interception."""
++import argparse
++import hashlib
++import json
++import os
++from pathlib import Path
++import re
++import signal
++import subprocess
++import time
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--runtime", type=Path, required=True)
++    parser.add_argument("--sysroot", type=Path, required=True)
++    parser.add_argument("--output", type=Path, required=True)
++    parser.add_argument("--deadline", type=float, default=30)
++    args = parser.parse_args()
++    if not 0 < args.deadline <= 60:
++        parser.error("deadline must be between 0 and 60 seconds")
++    args.output = args.output.resolve()
++    args.output.mkdir(parents=True, exist_ok=True)
++    root = Path(__file__).resolve().parents[1]
++    source = root / "tests/native_platform/memory_primitives.c"
++    shim = args.output / "shim/libmclplatform.dylib"
++    records = []
++
++    def run(name, command, extra=None, check_probe=False, bridge=False):
++        env = dict(os.environ)
++        for key in list(env):
++            if key.startswith("MACLATOR_") or key.startswith("DYLD_") or key.startswith("MCL_"):
++                env.pop(key, None)
++        env.update(extra or {})
++        start = time.monotonic()
++        process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++                                   text=True, start_new_session=True)
++        timeout = False
++        try:
++            stdout, stderr = process.communicate(timeout=args.deadline)
++        except subprocess.TimeoutExpired:
++            timeout = True
++            os.killpg(process.pid, signal.SIGKILL)
++            stdout, stderr = process.communicate()
++        except BaseException:
++            os.killpg(process.pid, signal.SIGKILL)
++            process.communicate()
++            raise
++        (args.output / f"{name}.stdout.log").write_text(stdout)
++        (args.output / f"{name}.stderr.log").write_text(stderr)
++        passed = not timeout and process.returncode == 0
++        checksums = re.findall(r"^CHECKSUM=(\d+)$", stdout, re.M)
++        stats = [dict(zip(("copy", "fill", "bytes", "declined"), map(int, fields)))
++                 for fields in re.findall(r"native platform: copy=(\d+) fill=(\d+) bytes=(\d+) declined=(\d+)", stderr)]
++        if check_probe:
++            markers = ("PASS: copy/fill/zero sizes", "PASS: overlapping memmove",
++                       "PASS: read-only source", "PASS: native child scrub")
++            passed &= all(marker in stdout for marker in markers) and len(checksums) == 2 and len(set(checksums)) == 1
++            if name != "native-x86_64":
++                passed &= stdout.count("PASS: private ABI") == 2
++            if bridge:
++                # More than the direct SVC checks: prove actual library symbols
++                # were interposed in both the initial process and ARM child.
++                passed &= len(stats) == 2 and all(s["copy"] >= 30 and s["fill"] >= 40 for s in stats)
++                passed &= stdout.count("PASS: mixed-tag real memmove sizes") == 2
++        record = {"name": name, "command": command, "environment": extra or {},
++                  "returncode": process.returncode, "timeout": timeout, "passed": bool(passed),
++                  "elapsed_seconds": time.monotonic() - start, "checksums": checksums, "native_calls": stats}
++        records.append(record)
++        (args.output / "results.json").write_text(json.dumps(records, indent=2) + "\n")
++        print(f"{name}: {'PASS' if passed else 'FAIL'} ({record['elapsed_seconds']:.2f}s)", flush=True)
++        return record
++
++    if not run("build-shim", ["/bin/bash", str(root / "platform/build.sh")],
++               {"OUT": str(shim.parent)})["passed"]:
++        return 1
++    for arch in ("x86_64", "arm64"):
++        binary = args.output / f"memory-{arch}"
++        if not run(f"compile-{arch}", ["/usr/bin/clang", "-arch", arch, "-O2", "-fno-builtin",
++                   str(source), "-o", str(binary)])["passed"]:
++            return 1
++    native = run("native-x86_64", [str(args.output / "memory-x86_64")], check_probe=True)
++    command = [str(args.runtime.resolve()), "--no-aot", "--sysroot", str(args.sysroot.resolve()),
++               str(args.output / "memory-arm64")]
++    off = run("arm-disabled", [*command, "--expect-disabled"], check_probe=True)
++    env = {"MACLATOR_NATIVE_PLATFORM": "1", "MACLATOR_PLATFORM_SHIM": str(shim), "MACLATOR_STATS": "1"}
++    on = run("arm-native-platform", [*command, "--expect-bridge"], env, check_probe=True, bridge=True)
++    redirected = run("arm-redirected-commpage", [*command, "--expect-bridge"],
++                     {**env, "MACLATOR_NO_COMMPAGE": "1"}, check_probe=True, bridge=True)
++    equal = native["checksums"] and all(record["checksums"] == native["checksums"]
++                                       for record in (off, on, redirected))
++    paths = [source, args.runtime.resolve(), shim, args.output / "memory-x86_64", args.output / "memory-arm64"]
++    hashes = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in paths}
++    (args.output / "sha256.json").write_text(json.dumps(hashes, indent=2) + "\n")
++    (args.output / "summary.json").write_text(json.dumps({"matching_native_checksums": bool(equal),
++        "passed": bool(equal) and all(record["passed"] for record in records)}, indent=2) + "\n")
++    return 0 if equal and all(record["passed"] for record in records) else 1
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+--- /dev/null
++++ b/tests/native_platform/memory_primitives.c
+@@ -0,0 +1,240 @@
++// General memory-library contract probe. Compile unchanged for x86-64 and ARM.
++// Volatile function pointers plus -fno-builtin preserve real library calls.
++#include <errno.h>
++#include <spawn.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <strings.h>
++#include <sys/mman.h>
++#include <sys/wait.h>
++#include <unistd.h>
++
++extern char **environ;
++static void *(*volatile copy_call)(void *, const void *, size_t) = memcpy;
++static void *(*volatile move_call)(void *, const void *, size_t) = memmove;
++static void *(*volatile fill_call)(void *, int, size_t) = memset;
++static void (*volatile zero_call)(void *, size_t) = bzero;
++static uint64_t checksum = 0x137;
++
++static void require(int condition, const char *what) {
++    if (!condition) { fprintf(stderr, "FAIL: %s\n", what); exit(1); }
++}
++static void seed(unsigned char *p, size_t n) {
++    for (size_t i = 0; i < n; i++) p[i] = (unsigned char)(i * 31 + 17);
++}
++static void digest(const unsigned char *p, size_t n) {
++    for (size_t i = 0; i < n; i++) checksum = (checksum ^ p[i]) * 0x100000001b3ULL;
++}
++static void same(const unsigned char *a, const unsigned char *b, size_t n, const char *what) {
++    for (size_t i = 0; i < n; i++) require(a[i] == b[i], what);
++}
++static void *tag(void *pointer, unsigned top) {
++#if defined(__aarch64__)
++    return (void *)((uintptr_t)pointer | ((uintptr_t)top << 56));
++#else
++    (void)top;
++    return pointer;
++#endif
++}
++
++static void ordinary_contracts(void) {
++    const size_t capacity = 65536;
++    unsigned char *source = malloc(capacity), *destination = malloc(capacity);
++    require(source && destination, "allocation");
++    const size_t sizes[] = {0, 1, 7, 15, 16, 31, 64, 255, 4095, 4096, 4097, 8191, 16384};
++    const size_t offsets[] = {0, 1, 7, 15, 31, 63};
++    for (size_t s = 0; s < sizeof(sizes) / sizeof(*sizes); s++) {
++        size_t n = sizes[s];
++        for (size_t o = 0; o < sizeof(offsets) / sizeof(*offsets); o++) {
++            size_t offset = offsets[o];
++            seed(source, capacity); seed(destination, capacity);
++            void *d = tag(destination + offset, 0xab);
++            const void *p = tag(source + 127 - offset, 0xcd);
++            errno = EDOM;
++            require(copy_call(d, p, n) == d, "memcpy original tagged return");
++            require(errno == EDOM, "memcpy guest errno");
++            same(destination + offset, source + 127 - offset, n, "memcpy bytes");
++            require(destination[offset + n] == (unsigned char)((offset + n) * 31 + 17), "memcpy upper canary");
++            if (offset) require(destination[offset - 1] == (unsigned char)((offset - 1) * 31 + 17), "memcpy lower canary");
++            digest(destination, n + offset + 1);
++            errno = ERANGE;
++            require(fill_call(d, 0x139, n) == d, "memset original tagged return");
++            require(errno == ERANGE, "memset guest errno");
++            for (size_t i = 0; i < n; i++) require(destination[offset + i] == 0x39, "memset low byte");
++            digest(destination, n + offset + 1);
++            errno = E2BIG;
++            zero_call(d, n);
++            require(errno == E2BIG, "bzero guest errno");
++            for (size_t i = 0; i < n; i++) require(destination[offset + i] == 0, "bzero bytes");
++            digest(destination, n + offset + 1);
++        }
++    }
++    free(source); free(destination);
++    puts("PASS: copy/fill/zero sizes, alignments, tagged returns, canaries and errno");
++}
++
++static void overlap_contracts(void) {
++    const size_t capacity = 32768;
++    unsigned char *actual = malloc(capacity), *expected = malloc(capacity);
++    require(actual && expected, "overlap allocation");
++    const size_t sizes[] = {0, 15, 4095, 4096, 8192};
++    const int deltas[] = {-63, -1, 1, 63};
++    for (size_t s = 0; s < sizeof(sizes) / sizeof(*sizes); s++) {
++        for (size_t d = 0; d < sizeof(deltas) / sizeof(*deltas); d++) {
++            size_t n = sizes[s], from = 4096, to = (size_t)((int)from + deltas[d]);
++            seed(actual, capacity); seed(expected, capacity);
++            if (to < from) { for (size_t i = 0; i < n; i++) expected[to + i] = expected[from + i]; }
++            else { for (size_t i = n; i > 0; i--) expected[to + i - 1] = expected[from + i - 1]; }
++            void *destination = tag(actual + to, 0xab);
++            errno = EDOM;
++            // Preserve the common baseline comparison with matching tags.
++            // Different-tag overlap is an enabled-only compatibility probe.
++            require(move_call(destination, tag(actual + from, 0xab), n) == destination, "memmove tagged return");
++            require(errno == EDOM, "memmove guest errno");
++            for (size_t i = 0; i < capacity; i++) {
++                if (actual[i] != expected[i]) {
++                    fprintf(stderr, "overlap n=%zu delta=%d byte=%zu actual=%u expected=%u\n",
++                        n, deltas[d], i, actual[i], expected[i]);
++                    require(0, "overlapping memmove full buffer");
++                }
++            }
++            digest(actual, capacity);
++        }
++    }
++    free(actual); free(expected);
++    puts("PASS: overlapping memmove in both directions and TBI aliases");
++}
++
++static void guard_contracts(void) {
++    size_t page = (size_t)getpagesize();
++    unsigned char *s = mmap(NULL, 3 * page, PROT_NONE, MAP_ANON | MAP_PRIVATE, -1, 0);
++    unsigned char *d = mmap(NULL, 3 * page, PROT_NONE, MAP_ANON | MAP_PRIVATE, -1, 0);
++    require(s != MAP_FAILED && d != MAP_FAILED && page >= 4096, "guard allocation");
++    require(mprotect(s + page, page, PROT_READ | PROT_WRITE) == 0, "guard source writable");
++    require(mprotect(d + page, page, PROT_READ | PROT_WRITE) == 0, "guard destination writable");
++    seed(s + page, page);
++    require(mprotect(s + page, page, PROT_READ) == 0, "read-only source");
++    const size_t sizes[] = {1, 31, 4095, 4096};
++    for (size_t i = 0; i < sizeof(sizes) / sizeof(*sizes); i++) {
++        size_t n = sizes[i];
++        void *destination = d + 2 * page - n;
++        const void *source = s + 2 * page - n;
++        errno = ERANGE;
++        require(copy_call(destination, source, n) == destination, "guard copy return");
++        require(errno == ERANGE, "guard copy errno");
++        same(destination, source, n, "read-only source at unmapped guard boundary");
++        // Page sizes differ by architecture; hash a common end-relative pattern.
++        digest(destination, n);
++    }
++    require(munmap(s, 3 * page) == 0 && munmap(d, 3 * page) == 0, "guard unmap");
++    puts("PASS: read-only source and unmapped guard boundaries");
++}
++
++#if defined(__aarch64__)
++static uint64_t private_status(uint64_t operation, uintptr_t dst, uintptr_t second, uint64_t length) {
++    register uint64_t x0 __asm__("x0") = dst;
++    register uint64_t x1 __asm__("x1") = second;
++    register uint64_t x2 __asm__("x2") = length;
++    register uint64_t x16 __asm__("x16") = 0x4d4d;
++    register uint64_t x17 __asm__("x17") = operation;
++    uint64_t before, after;
++    __asm__ volatile("mrs %4,nzcv\n svc #0x80\n mrs %5,nzcv"
++        : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x17), "=&r"(before), "=&r"(after)
++        : "r"(x16) : "memory", "cc");
++    require(x0 == dst && x1 == second && x2 == length, "private ABI original arguments/result");
++    require(before == after, "private ABI NZCV");
++    return x17;
++}
++
++static void private_contracts(int expected_active) {
++    unsigned char *buffer = malloc(8192);
++    require(buffer != NULL, "private allocation");
++    const uintptr_t commpage = 0x0000000fffff4000ULL;
++    require(private_status(1, UINTPTR_MAX, UINTPTR_MAX, 0) == (expected_active ? 0 : 1), "zero size does not dereference");
++    require(private_status(1, (uintptr_t)buffer, 1, UINT64_MAX) == 1, "size overflow declines");
++    require(private_status(1, (uintptr_t)buffer, commpage - 8, 4096) == 1, "crossing commpage start declines");
++    require(private_status(1, (uintptr_t)buffer, 0x0000001000000000ULL - 8, 4096) == 1, "crossing commpage end declines");
++    require(private_status(1, commpage, (uintptr_t)buffer, 4096) == 1, "all commpage destinations decline");
++    require(private_status(2, commpage, 0, 4096) == 1, "commPage fill declines");
++    require(private_status(1, (uintptr_t)buffer, (uintptr_t)buffer, 4095) == 1, "small direct call declines");
++    require(private_status(2, (uintptr_t)tag(buffer, 0xab), 0xcd, 4095) == 1, "small fill declines");
++    require(private_status(3, (uintptr_t)tag(buffer, 0xab), 4095, 0) == 1, "small zero declines");
++    require(private_status(1, (uintptr_t)tag((void *)commpage, 0xab), (uintptr_t)tag(buffer, 0xcd), 1) == 1,
++        "small mixed-tag commpage destination declines");
++    require(private_status(1, (uintptr_t)tag(buffer, 0xab), (uintptr_t)tag((void *)(commpage - 1), 0xcd), 2) == 1,
++        "small mixed-tag crossing commpage start declines");
++    require(private_status(1, (uintptr_t)tag(buffer, 0xab), (uintptr_t)tag((void *)(0x0000001000000000ULL - 1), 0xcd), 2) == 1,
++        "small mixed-tag crossing commpage end declines");
++    require(private_status(999, (uintptr_t)buffer, (uintptr_t)buffer, 4096) == 1, "unknown operation declines");
++    require(private_status(1, (uintptr_t)buffer, (uintptr_t)buffer, 4096) == (expected_active ? 0 : 1), "active versus disabled dispatch");
++    if (expected_active) {
++        // Tests actual interposed memmove, not just the private SVC. The
++        // original guest libc's mixed-tag failure is preserved separately.
++        const size_t capacity = 12288;
++        unsigned char *actual = malloc(capacity), *expected = malloc(capacity);
++        require(actual && expected, "mixed-tag overlap allocation");
++        const size_t sizes[] = {1, 7, 15, 16, 31, 64, 255, 4095, 4096};
++        const int deltas[] = {-63, -1, 0, 1, 63};
++        for (size_t s = 0; s < sizeof(sizes) / sizeof(*sizes); s++) {
++            for (size_t d = 0; d < sizeof(deltas) / sizeof(*deltas); d++) {
++                size_t n = sizes[s], from = 4096, to = (size_t)((int)from + deltas[d]);
++                seed(actual, capacity); seed(expected, capacity);
++                if (to < from) { for (size_t i = 0; i < n; i++) expected[to + i] = expected[from + i]; }
++                else { for (size_t i = n; i > 0; i--) expected[to + i - 1] = expected[from + i - 1]; }
++                void *destination = tag(actual + to, 0xab);
++                errno = EDOM;
++                require(move_call(destination, tag(actual + from, 0xcd), n) == destination,
++                    "mixed-tag memmove original tagged return");
++                require(errno == EDOM, "mixed-tag memmove guest errno");
++                for (size_t i = 0; i < capacity; i++) {
++                    if (actual[i] != expected[i]) {
++                        fprintf(stderr, "mixed-tag overlap n=%zu delta=%d byte=%zu actual=%u expected=%u\n",
++                            n, deltas[d], i, actual[i], expected[i]);
++                        require(0, "mixed-tag memmove full buffer and canaries");
++                    }
++                }
++            }
++        }
++        free(actual); free(expected);
++        puts("PASS: mixed-tag real memmove sizes 1..4096, +/- overlap and normalized aliases");
++    }
++    errno = EDOM;
++    require(copy_call(buffer, tag((void *)(commpage + 0x100), 0xaa), 4096) == buffer, "contained commpage source return");
++    require(errno == EDOM, "commpage copy errno");
++    for (size_t i = 0; i < 4096; i++) {
++        require(buffer[i] == *(volatile unsigned char *)(commpage + 0x100 + i), "commpage source mapping");
++    }
++    free(buffer);
++    puts("PASS: private ABI, zero, overflow, disabled fallback and complete commpage mapping");
++}
++#endif
++
++static void spawn_contracts(const char *self, int expected_active) {
++    pid_t child;
++    char *native_args[] = {"/usr/bin/true", NULL};
++    require(posix_spawn(&child, native_args[0], NULL, NULL, native_args, environ) == 0, "native spawn");
++    int status;
++    require(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0, "native child shim scrub");
++    char *guest_args[] = {(char *)self, "--child", expected_active ? "--expect-bridge" : "--expect-disabled", NULL};
++    require(posix_spawn(&child, self, NULL, NULL, guest_args, environ) == 0, "same-architecture spawn");
++    require(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0, "translated child shim/options");
++    puts("PASS: native child scrub and translated child opt-in propagation");
++}
++
++int main(int argc, char **argv) {
++    int child = 0, expected_active = 0;
++    for (int i = 1; i < argc; i++) {
++        if (!strcmp(argv[i], "--child")) child = 1;
++        if (!strcmp(argv[i], "--expect-bridge")) expected_active = 1;
++    }
++    ordinary_contracts(); overlap_contracts(); guard_contracts();
++#if defined(__aarch64__)
++    private_contracts(expected_active);
++#endif
++    printf("CHECKSUM=%llu\n", (unsigned long long)checksum);
++    fflush(stdout);
++    if (!child) spawn_contracts(argv[0], expected_active);
++    return 0;
++}

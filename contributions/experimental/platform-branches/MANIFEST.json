@@ -1,0 +1,46 @@
+[
+  {
+    "path": "README.md",
+    "sha256": "d28521b1f0c9c68340ba4cf761a649eff5cd47c8546dfd252e6106146fc34741"
+  },
+  {
+    "path": "base-before-platform/crates/maclator/src/main.rs",
+    "sha256": "b8ac0fae3cf16bf592891f98aad07cf75b63741fd00cba95109160754b155bee"
+  },
+  {
+    "path": "base-before-platform/crates/maclator/src/spawn.rs",
+    "sha256": "925bab9efcf2299aa5a819c8577a829fb5ad45430c5b09666bcfd76e6de38739"
+  },
+  {
+    "path": "base-before-platform/crates/maclator/src/syscalls.rs",
+    "sha256": "4abe79435b110242ed9fb8724c77e70f3e9312f6c7a952fbdbe7a7212b577bc2"
+  },
+  {
+    "path": "base-platform/crates/maclator/src/aot.rs",
+    "sha256": "d6241b6f28853220d38d5e2605b3cd829c5219f227b2ab3c60ae2c83d9e66301"
+  },
+  {
+    "path": "base-platform/crates/maclator/src/jit/emit.rs",
+    "sha256": "03cf136a04632dd0b61a5b1ac682dc7de7dee9345ba3b14e237637de319a7818"
+  },
+  {
+    "path": "base-platform/crates/maclator/src/jit/loop_selftest.rs",
+    "sha256": "5be89fa33701abd2f4c4964033e6b4af989532f3a0e56197e23f265b4f86a8df"
+  },
+  {
+    "path": "base-platform/crates/maclator/src/jit/mod.rs",
+    "sha256": "2ee20897b116b56f0ff65347759cf7e3d683c9560e57cb9dd62ca2144677051b"
+  },
+  {
+    "path": "fixed-lhs.patch",
+    "sha256": "ab8ee71b35035cc06837069d74d1a6642009cfbdedcd7acf50acf777db64ae73"
+  },
+  {
+    "path": "fixed-pair.patch",
+    "sha256": "0a534ba95dc88f3daaabb4c75591119141a0d40a72fa474cb6691a038c74c104"
+  },
+  {
+    "path": "native-platform.patch",
+    "sha256": "c7bde0ad2e9b698db0d76d9d511515a9f19e20a8d33c80e6025fcac1f7e8a3a0"
+  }
+]

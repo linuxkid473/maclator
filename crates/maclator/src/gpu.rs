@@ -106,6 +106,7 @@ struct Shared {
     out_n: AtomicU64,
     bridge_parked: AtomicBool,
     caller_parked: AtomicBool,
+    requested_qos: AtomicU64,
 }
 
 /// Host frameworks (CoreFoundation, XPC, Metal) must never run on a guest thread: the kernel
@@ -120,6 +121,9 @@ struct BridgeThread {
 
 /// Spin budgets in microseconds, `MACLATOR_GPU_SPIN=caller,bridge` (default 20,20; 0,0 = always park).
 fn spin_budgets() -> (Duration, Duration) {
+    if let Some(budgets) = crate::macflow::spin_override() {
+        return budgets;
+    }
     static B: OnceLock<(Duration, Duration)> = OnceLock::new();
     *B.get_or_init(|| {
         let (c, b) = std::env::var("MACLATOR_GPU_SPIN")
@@ -142,7 +146,7 @@ fn wait_for(done: impl Fn() -> bool, flag: &AtomicBool, spin: Duration) {
             return;
         }
         n += 1;
-        if n & 63 != 0 || t0.elapsed() < spin {
+        if !spin.is_zero() && (n & 63 != 0 || t0.elapsed() < spin) {
             std::hint::spin_loop();
             continue;
         }
@@ -167,6 +171,7 @@ impl BridgeThread {
             out_n: AtomicU64::new(0),
             bridge_parked: AtomicBool::new(false),
             caller_parked: AtomicBool::new(false),
+            requested_qos: AtomicU64::new(crate::macflow::current_qos().packed()),
         });
         let caller = std::thread::current();
         let sh2 = sh.clone();
@@ -179,6 +184,9 @@ impl BridgeThread {
                     wait_for(|| matches!(sh2.state.load(Ordering::Acquire), 1 | 3), &sh2.bridge_parked, spin_budgets().1);
                     if sh2.state.load(Ordering::Acquire) == 3 {
                         return;
+                    }
+                    if let Some(qos) = crate::macflow::Qos::from_packed(sh2.requested_qos.load(Ordering::Relaxed)) {
+                        crate::macflow::set_self_qos(qos);
                     }
                     let mut outlen = 0u64;
                     let p = unsafe {
@@ -197,7 +205,9 @@ impl BridgeThread {
     }
 
     fn call(&self, op: u64, input: u64, len: u64) -> (u64, u64) {
+        let wait_started = Instant::now();
         let sh = &self.sh;
+        sh.requested_qos.store(crate::macflow::current_qos().packed(), Ordering::Relaxed);
         sh.op.store(op, Ordering::Relaxed);
         sh.input.store(input, Ordering::Relaxed);
         sh.len.store(len, Ordering::Relaxed);
@@ -208,6 +218,7 @@ impl BridgeThread {
         wait_for(|| sh.state.load(Ordering::Acquire) == 2, &sh.caller_parked, spin_budgets().0);
         let r = (sh.out_p.load(Ordering::Relaxed), sh.out_n.load(Ordering::Relaxed));
         sh.state.store(0, Ordering::Release);
+        crate::macflow::record_bridge_wait(wait_started.elapsed());
         r
     }
 }
@@ -257,5 +268,28 @@ pub fn hostcall(cpu: &mut Cpu) {
             cpu.x[0] = libc::EIO as u64;
             cpu.cf = 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    unsafe extern "C" fn qos_probe(_op: u64, _input: *const u8, _len: u64, outlen: *mut u64) -> *mut u8 {
+        *outlen = crate::macflow::current_qos().packed();
+        std::ptr::null_mut()
+    }
+
+    #[test]
+    fn dedicated_bridge_follows_caller_qos_on_every_reused_call() {
+        std::thread::spawn(|| {
+            let bridge = BridgeThread::spawn(qos_probe);
+            for class in [17, 25, 9, 33, 21] {
+                let qos = crate::macflow::Qos { class, relative: -3 };
+                crate::macflow::set_self_qos(qos);
+                let (_, packed) = bridge.call(0, 0, 0);
+                assert_eq!(crate::macflow::Qos::from_packed(packed), Some(qos));
+            }
+        }).join().unwrap();
     }
 }

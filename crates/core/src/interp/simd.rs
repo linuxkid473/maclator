@@ -478,13 +478,15 @@ fn fp_scalar(cpu: &mut Cpu, insn: u32) -> R {
                 0 => {
                     let a = f32::from_bits(cpu.vd(rn) as u32);
                     let b = f32::from_bits(cpu.vd(rm) as u32);
-                    let r = fp_2src(a, b, opcode).ok_or_else(|| unimpl(insn))?;
+                    let r = sf::binary_controlled(a, b, opcode, cpu.fpcr, &mut cpu.fpsr)
+                        .or_else(|| fp_2src(a, b, opcode)).ok_or_else(|| unimpl(insn))?;
                     cpu.set_vd(rd, r.to_bits() as u64);
                 }
                 1 => {
                     let a = f64::from_bits(cpu.vd(rn));
                     let b = f64::from_bits(cpu.vd(rm));
-                    let r = fp_2src(a, b, opcode).ok_or_else(|| unimpl(insn))?;
+                    let r = sf::binary_controlled(a, b, opcode, cpu.fpcr, &mut cpu.fpsr)
+                        .or_else(|| fp_2src(a, b, opcode)).ok_or_else(|| unimpl(insn))?;
                     cpu.set_vd(rd, r.to_bits());
                 }
                 3 => {
@@ -651,7 +653,8 @@ fn fp_3src(cpu: &mut Cpu, insn: u32) -> R {
                 _ => (-a, n),
             };
             // Negation is applied before NaN processing (flips NaN signs too).
-            $put(sf::fmla(a2, n2, m))
+            let result = sf::fmla_controlled(a2, n2, m, cpu.fpcr, &mut cpu.fpsr);
+            $put(result)
         }};
     }
     match ptype {
@@ -2412,6 +2415,32 @@ fn crypto_sha2(cpu: &mut Cpu, insn: u32) -> R {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn scalar_fma_fpcr_modes_preserve_aliases_and_clear_upper_lanes() {
+        for ptype in 0..2 {
+            for mode in 0..4 {
+                for (o1, o0, expected) in [(0, 0, 11.), (0, 1, -1.), (1, 0, -11.), (1, 1, 1.)] {
+                    for rd in [0u32, 1, 2, 3, 31] {
+                        let mut cpu = Cpu::new();
+                        cpu.fpcr = (1 << 25) | (mode << 22);
+                        cpu.fpsr = 1 << 27;
+                        for (reg, value) in [(1, 2f64), (2, 3.), (3, 5.)] {
+                            let bits = if ptype == 0 { (value as f32).to_bits() as u64 } else { value.to_bits() };
+                            cpu.v[reg] = [bits, u64::MAX];
+                        }
+                        let insn = 0x1f00_0000 | (ptype << 22) | (o1 << 21) | (2 << 16)
+                            | (o0 << 15) | (3 << 10) | (1 << 5) | rd;
+                        fp_3src(&mut cpu, insn).unwrap();
+                        let bits = if ptype == 0 { (expected as f32).to_bits() as u64 } else { (expected as f64).to_bits() };
+                        assert_eq!(cpu.v[rd as usize], [bits, 0], "ptype {ptype}, mode {mode}, o1 {o1}, o0 {o0}, rd {rd}");
+                        assert_eq!(cpu.fpsr, 1 << 27);
+                        assert_eq!(cpu.fpcr, (1 << 25) | (mode << 22));
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn aes_mixcolumns_vector() {
         let mut cpu = Cpu::new();

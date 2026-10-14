@@ -2,5 +2,12 @@
 /ref/tree_*.json
 /tests/guest/*
 !/tests/guest/*.c
+!/tests/guest/*.S
 gpu/out/
 .claude/
+/integration/build/
+/integration/runtime-target/
+/integration/__pycache__/
+/integration/macflow/target/
+/integration/macflow/dist/
+**/__pycache__/

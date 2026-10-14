@@ -1,0 +1,8 @@
+[package]
+name = "macflow-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[dependencies]
+macflow-protocol = { path = "../protocol" }
+

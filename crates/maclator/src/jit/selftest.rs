@@ -299,7 +299,223 @@ fn run_selftest_blocks(count: usize) {
     println!("jit selftest [blocks]: ok={ok} mismatch={bad} skipped={skipped} insns={insns} fallback_insns={fallbacks}");
 }
 
+/// CBZ/TBZ after a register write, including cached values, W/X width, all bit positions and ZR.
+/// Compare guest flags as well as the successor PC: testing a host flag must not alter ARM NZCV.
+fn run_selftest_branchcache(count: usize) {
+    let page = unsafe {
+        libc::mmap(std::ptr::null_mut(), 0x1000, libc::PROT_READ | libc::PROT_WRITE,
+                   libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0) as u64
+    };
+    let mut rng = Rng(0xcafe_1234_5678_beef);
+    let (mut ok, mut bad, mut native) = (0u64, 0u64, 0u64);
+    for it in 0..count {
+        let rt = rng.next() as u32 % 32;
+        let rm = rng.next() as u32 % 32;
+        let nz = (rng.next() as u32 & 1) << 24;
+        let cached = it % 2 == 0;
+        let setter = 0xAA00_03E0 | (rm << 16) | rt; // MOV Xrt, Xrm; rt=31 discards
+        let branch = if it % 4 < 2 {
+            let sf = (rng.next() as u32 & 1) << 31;
+            0x3400_0000 | sf | nz | (3 << 5) | rt // CBZ/CBNZ +12
+        } else {
+            let b = rng.next() as u32 % 64;
+            0x3600_0000 | ((b >> 5) << 31) | ((b & 31) << 19) | nz | (3 << 5) | rt
+        };
+        let mut init = Cpu::new();
+        for i in 0..32 { init.x[i] = rng.val(); }
+        init.set_nzcv((rng.next() % 16) as u32);
+        init.pc = page;
+        let mut r = clone_cpu(&init);
+        if cached { interp::exec(&mut r, setter).unwrap(); }
+        let branch_pc = page + if cached { 4 } else { 0 };
+        r.pc = branch_pc;
+        interp::exec(&mut r, branch).unwrap();
+        unsafe {
+            *(page as *mut u32) = if cached { setter } else { branch };
+            *((page + 4) as *mut u32) = if cached { branch } else { 0xD400_1001 };
+            *((page + 8) as *mut u32) = 0xD400_1001;
+            *((page + 12) as *mut u32) = 0xD400_1001;
+            *((page + 16) as *mut u32) = 0xD400_1001;
+        }
+        invalidate_range(page, 20);
+        let mut j = Cpu::new();
+        *j = clone_cpu(&init);
+        setup_cpu(&mut j);
+        let fb0 = STATS_FALLBACK.load(Ordering::Relaxed);
+        let host = lookup_or_translate(page);
+        if STATS_FALLBACK.load(Ordering::Relaxed) == fb0 { native += 1; }
+        unsafe { maclator_jit_enter(&mut *j, host) };
+        let pending = PENDING.with(|p| p.take());
+        if snapshot(&r) != snapshot(&j) || r.pc != j.pc || pending.is_some()
+            || j.exit_reason != EXIT_CONTINUE
+        {
+            bad += 1;
+            if bad <= 20 {
+                println!("MISMATCH branchcache #{it} cached={cached} {branch:08x} {} interp_pc={:#x} jit_pc={:#x}",
+                         disasm(branch), r.pc, j.pc);
+            }
+        } else { ok += 1; }
+    }
+    unsafe { libc::munmap(page as *mut libc::c_void, 0x1000); }
+    println!("jit selftest [branchcache]: ok={ok} mismatch={bad} native={native}");
+}
+
+/// Differential scalar FMA tests, including NaN priority, signed zero, aliases,
+/// upper-lane clearing and the guarded non-default-FPCR path. `native` is a
+/// feature switch, not a claim that every operand takes the hardware path.
+fn run_selftest_fma(count: usize) {
+    const EDGE64: [u64; 16] = [
+        0, 0x8000_0000_0000_0000, 1, 0x8000_0000_0000_0001,
+        0x0010_0000_0000_0000, 0x8010_0000_0000_0000,
+        0x3ff0_0000_0000_0000, 0xbff0_0000_0000_0000,
+        0x3ff0_0000_0000_0001, 0x7fef_ffff_ffff_ffff,
+        0x7ff0_0000_0000_0000, 0xfff0_0000_0000_0000,
+        0x7ff8_0000_0000_0123, 0xfff8_0000_0000_0456,
+        0x7ff0_0000_0000_0789, 0xfff0_0000_0000_0abc,
+    ];
+    const EDGE32: [u64; 16] = [
+        0, 0x8000_0000, 1, 0x8000_0001, 0x0080_0000, 0x8080_0000,
+        0x3f80_0000, 0xbf80_0000, 0x3f80_0001, 0x7f7f_ffff,
+        0x7f80_0000, 0xff80_0000, 0x7fc0_0123, 0xffc0_0456,
+        0x7f80_0789, 0xff80_0abc,
+    ];
+    let page = unsafe {
+        libc::mmap(std::ptr::null_mut(), 0x1000, libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0) as u64
+    };
+    assert_ne!(page, libc::MAP_FAILED as u64);
+    let mut rng = Rng(0xf00d_faa0_1234_5678u64);
+    let edges = EDGE64.len().pow(3) * 8;
+    let (mut ok, mut bad) = (0usize, 0usize);
+    for it in 0..edges + count {
+        let double = it % 8 >= 4;
+        let mode = it % 4;
+        let (rn, rm, ra, rd) = if it < edges {
+            (0u32, 1u32, 2u32, (it / 8 % 4) as u32)
+        } else {
+            (rng.next() as u32 % 32, rng.next() as u32 % 32,
+             rng.next() as u32 % 32, rng.next() as u32 % 32)
+        };
+        let insn = 0x1f00_0000 | ((double as u32) << 22) | (((mode / 2) as u32) << 21)
+            | (rm << 16) | (((mode % 2) as u32) << 15) | (ra << 10) | (rn << 5) | rd;
+        let mut init = Cpu::new();
+        for i in 0..32 {
+            init.x[i] = rng.next();
+            init.v[i] = [rng.next(), rng.next()];
+        }
+        if it < edges {
+            let e = if double { &EDGE64 } else { &EDGE32 };
+            let n = it / 8;
+            init.v[0][0] = e[n % 16];
+            init.v[1][0] = e[n / 16 % 16];
+            init.v[2][0] = e[n / 256 % 16];
+        }
+        init.pc = page;
+        init.set_nzcv(rng.next() as u32 & 15);
+        init.fpsr = rng.next() & 0xf800_009f;
+        if it >= edges && it % 3 == 0 {
+            init.fpcr = [1 << 22, 1 << 23, 1 << 24, 1 << 25][it % 4];
+        }
+        // Cached GPRs must survive both the fast and interpreter-FMA paths.
+        // The suffix consumes them, includes aliases and a W write over X bits.
+        let program = [0xaa0c_03e0, 0xaa0d_03e1, 0xaa0e_03e2, insn,
+            0x8b01_0003, 0x9b02_7c64, 0x6b00_0085];
+        let mut r = clone_cpu(&init);
+        for &word in &program { interp::exec(&mut r, word).expect("valid FMA/cache test"); }
+        unsafe {
+            for (i, &word) in program.iter().enumerate() { *((page as *mut u32).add(i)) = word; }
+            *((page as *mut u32).add(program.len())) = 0xd400_1001;
+        }
+        invalidate_range(page, (program.len() as u64 + 1) * 4);
+        let mut j = clone_cpu(&init);
+        setup_cpu(&mut j);
+        let host = lookup_or_translate(page);
+        unsafe { maclator_jit_enter(&mut j, host) };
+        let pending = PENDING.with(|p| p.take());
+        let mut a = snapshot(&r);
+        let mut b = snapshot(&j);
+        a.extend([r.fpcr, r.fpsr]);
+        b.extend([j.fpcr, j.fpsr]);
+        if a != b || j.exit_reason != EXIT_SVC || pending.is_some() {
+            bad += 1;
+            if bad <= 20 {
+                println!("MISMATCH FMA {insn:08x} {} fpcr={:#x}", disasm(insn), init.fpcr);
+                println!("    n={:x} m={:x} a={:x} ref={:x?} jit={:x?}",
+                    init.v[rn as usize][0], init.v[rm as usize][0], init.v[ra as usize][0],
+                    r.v[rd as usize], j.v[rd as usize]);
+            }
+        } else { ok += 1; }
+    }
+    unsafe { libc::munmap(page as *mut _, 0x1000); }
+    println!("jit selftest [fma]: ok={ok} mismatch={bad} edge_cases={edges} random={count} native_fma={}", emit::native_fma());
+    assert_eq!(bad, 0, "FMA differential mismatch");
+}
+
+/// Valid unshifted ALU blocks deliberately exceed the five-slot cache, then
+/// reuse/overwrite operands. Covers eviction, aliases, W upper bits and XZR.
+fn run_selftest_operandcache(count: usize) {
+    let page = unsafe { libc::mmap(std::ptr::null_mut(), 0x1000, libc::PROT_READ | libc::PROT_WRITE,
+        libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0) as u64 };
+    assert_ne!(page, libc::MAP_FAILED as u64);
+    let mut rng = Rng(0xdeaf_cafe_0987_6543);
+    let mut bad = 0;
+    for _ in 0..count {
+        let mut init = Cpu::new();
+        for i in 0..32 { init.x[i] = rng.val(); init.v[i] = [rng.next(), rng.next()]; }
+        init.set_nzcv(rng.next() as u32 & 15);
+        init.pc = page;
+        let mut program = Vec::new();
+        for rd in 0..8 { program.push(0xaa00_03e0 | ((8 + rng.next() as u32 % 24) << 16) | rd); }
+        for _ in 0..12 {
+            let sf = rng.next() as u32 % 2;
+            let mut reg = || if rng.next() % 8 == 0 { 31 } else { rng.next() as u32 % 8 };
+            let (rn, rm, rd, ra) = (reg(), reg(), reg(), reg());
+            let insn = match rng.next() % 3 {
+                0 => 0x0b00_0000 | ((rng.next() as u32 % 4) << 29), // ADD/SUB, flags optional
+                1 => 0x0a00_0000 | ((rng.next() as u32 % 4) << 29), // AND/ORR/EOR/ANDS
+                _ => 0x1b00_0000 | ((rng.next() as u32 % 2) << 15) | (ra << 10),
+            } | (sf << 31) | (rm << 16) | (rn << 5) | rd;
+            program.push(insn);
+        }
+        let mut reference = clone_cpu(&init);
+        for &insn in &program { interp::exec(&mut reference, insn).unwrap(); }
+        unsafe {
+            for (i, &word) in program.iter().enumerate() { *((page as *mut u32).add(i)) = word; }
+            *((page as *mut u32).add(program.len())) = 0xd400_1001;
+        }
+        invalidate_range(page, (program.len() as u64 + 1) * 4);
+        let mut j = clone_cpu(&init);
+        setup_cpu(&mut j);
+        let host = lookup_or_translate(page);
+        unsafe { maclator_jit_enter(&mut j, host) };
+        if snapshot(&reference) != snapshot(&j) || j.exit_reason != EXIT_SVC || PENDING.with(|p| p.take()).is_some() {
+            bad += 1;
+            if bad <= 10 { println!("MISMATCH operandcache {program:08x?}"); }
+        }
+    }
+    unsafe { libc::munmap(page as *mut _, 0x1000); }
+    println!("jit selftest [operandcache]: ok={} mismatch={bad} blocks={count} direct_operands={}", count - bad, emit::direct_operands());
+    assert_eq!(bad, 0, "cached operand differential mismatch");
+}
+
 pub fn run_selftest(class: &str, count: usize) {
+    if class == "gprwriteback" { return super::gpr_writeback_selftest::run(); }
+    if class == "scalarwriteback" { return super::loop_selftest::run_scalar_writeback(); }
+    if class == "effectiveaddress" { return super::effective_address_selftest::run(); }
+    if class == "cachedstore" { return super::cached_store_selftest::run(); }
+    if class == "budgetflags" { return super::budget_flags_selftest::run(); }
+    if class == "cselchain" { return super::csel_selftest::run(count); }
+    if class == "fp-modes" { return super::fp_mode_selftest::run(count); }
+    if class == "loopcache" { return super::loop_selftest::run(count); }
+    if class == "operandcache" {
+        return run_selftest_operandcache(count);
+    }
+    if class == "fma" {
+        return run_selftest_fma(count);
+    }
+    if class == "branchcache" {
+        return run_selftest_branchcache(count);
+    }
     if class == "fuse" {
         return run_selftest_fuse(count, false);
     }
@@ -337,6 +553,13 @@ pub fn run_selftest(class: &str, count: usize) {
         }
         if is_mem && (insn >> 5) & 31 == 31 {
             insn &= !(31 << 5);
+        }
+        // This randomized harness models data accesses inside buf, not a
+        // +/-1 MiB PC-relative literal pool. Reading arbitrary literal targets
+        // before code initialization could fault in the reference itself.
+        if is_mem && insn & 0x3B00_0000 == 0x1800_0000 {
+            skipped += 1;
+            continue;
         }
         // Reference first (it tells us whether the encoding is valid).
         let mut init = Cpu::new();
@@ -440,6 +663,7 @@ fn clone_cpu(c: &Cpu) -> Cpu {
     n.set_nzcv(c.nzcv());
     n.v = c.v;
     n.fpcr = c.fpcr;
+    n.fpsr = c.fpsr;
     n.tpidr_el0 = c.tpidr_el0;
     n.tpidrro_el0 = c.tpidrro_el0;
     n

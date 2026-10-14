@@ -1,0 +1,4 @@
+# 统一补丁的空白上下文行必须保留一个前导空格。
+*.patch -whitespace
+# 保留冻结配套工作区原有的文件末尾格式。
+integration/macflow/** whitespace=-blank-at-eof

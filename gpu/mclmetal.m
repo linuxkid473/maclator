@@ -190,7 +190,9 @@ static BOOL isNewFamily(const char *s) {
     if (gStats) legacy_note(sel);
     NSMethodSignature *sig = inv.methodSignature;
     NSMutableArray *args = [NSMutableArray array];
-    NSError **errOut = NULL;
+    // Reflection and error are separate out objects on pipeline-creation APIs.
+    // Keep one caller slot per argument instead of treating every ^@ as NSError **.
+    id **objectOut = calloc(sig.numberOfArguments, sizeof(id *));
     NSString *selName = @(sel_getName(sel));
     NSArray *parts = [selName componentsSeparatedByString:@":"];
     for (NSUInteger i = 2; i < sig.numberOfArguments; i++) {
@@ -212,8 +214,8 @@ static BOOL isNewFamily(const char *s) {
                 for (NSUInteger k = 0; k < count && ptr; k++) [ids addObject:encodeObject(((id *)ptr)[k])];
                 [args addObject:@{@"ids": ids}];
             } else {
-                errOut = (NSError **)ptr;
-                [args addObject:@{@"outerr": @YES}];
+                objectOut[i] = (id *)ptr;
+                [args addObject:ptr ? @{@"outobj": @YES} : NILV()];
             }
         } else if (strncmp(b, "^{__IOSurface", 13) == 0) {
             // IOSurfaceRef is a guest-side CF object; the host looks the surface up by its global id.
@@ -231,12 +233,16 @@ static BOOL isNewFamily(const char *s) {
     if (gTrace) fprintf(stderr, "[mclmetal] -> %s %s\n", [_chain[0] UTF8String], sel_getName(sel));
     NSDictionary *reply = mcl_rpc(@{@"c": @"msg", @"h": @(_h), @"sel": selName, @"args": args});
     if (reply[@"x"]) {
+        free(objectOut);
         [NSException raise:@"MCLRemoteException" format:@"%@", reply[@"x"]];
     }
-    if (errOut && reply[@"err"]) {
-        NSDictionary *e = reply[@"err"][@"e"];
-        *errOut = [NSError errorWithDomain:e[@"d"] code:[e[@"k"] integerValue] userInfo:@{NSLocalizedDescriptionKey: e[@"m"] ?: @""}];
+    for (NSUInteger i = 2; i < sig.numberOfArguments; i++) {
+        if (objectOut[i]) {
+            id v = reply[@"out"][[NSString stringWithFormat:@"%lu", (unsigned long)i]];
+            *objectOut[i] = decode(v ?: NILV(), NO);
+        }
     }
+    free(objectOut);
     const char *rt = skipQualifiers([sig methodReturnType]);
     if (rt[0] == 'v') return;
     id r = reply[@"r"];

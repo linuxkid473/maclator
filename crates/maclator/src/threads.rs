@@ -19,7 +19,7 @@ pub static LIVE_THREADS: AtomicUsize = AtomicUsize::new(1);
 
 const PTHREAD_START_CUSTOM: u64 = 0x0100_0000;
 const PTHREAD_START_TSD_BASE_SET: u64 = 0x1000_0000;
-const PTHREAD_START_SUSPENDED: u64 = 0x0200_0000;
+const PTHREAD_START_SUSPENDED: u64 = 0x2000_0000;
 
 // DISPATCHFUNC | FINEPRIO | BSDTHREADCTL | SETSELF | QOS_MAINTENANCE | QOS_DEFAULT | KEVENT.
 // Workloops are not offered: libdispatch then drives everything through the
@@ -78,16 +78,22 @@ unsafe impl Send for SendCpu {}
 /// Spawn a host thread running guest code from `cpu`.
 fn spawn_guest(mut cpu: Box<Cpu>, setup: impl FnOnce(&mut Cpu) + Send + 'static) {
     let sc = SendCpu(cpu_take(&mut cpu));
+    // XNU writes the new thread's Mach port to the guest TSD before
+    // bsdthread_create returns. The caller may inspect that slot immediately
+    // (or detach the thread), so do not expose a partially initialized pthread.
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
     LIVE_THREADS.fetch_add(1, Ordering::SeqCst);
     std::thread::Builder::new()
         .stack_size(8 << 20)
         .spawn(move || {
             let mut c = sc;
             setup(&mut c.0);
+            ready_tx.send(()).expect("guest thread creator disappeared");
             crate::engine::run_thread(&mut c.0);
             LIVE_THREADS.fetch_sub(1, Ordering::SeqCst);
         })
         .expect("failed to spawn host thread");
+    ready_rx.recv().expect("guest thread setup did not complete");
 }
 
 fn cpu_take(c: &mut Box<Cpu>) -> Box<Cpu> {
@@ -117,6 +123,7 @@ pub fn bsdthread_create(a: &[u64; 8]) -> Result<u64, u64> {
     cpu.x[5] = fl;
     cpu.x[31] = stack;
     spawn_guest(cpu, move |c| {
+        crate::macflow::set_guest_start_flags(flags);
         let port = unsafe { libc::mach_thread_self() } as u64;
         c.x[1] = port;
         if tsd_off != 0 && mts_off != 0 {

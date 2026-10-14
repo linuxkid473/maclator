@@ -67,3 +67,7 @@ their license headers intact. See [NOTICE](NOTICE). Maclator does not attempt to
 protection of, FairPlay/DRM-encrypted binaries.
 
 MIT licensed, see [LICENSE](LICENSE).
+
+## 中文贡献说明
+
+本分支整理了 ARM64 转译、Xcode 与应用兼容、原生应用入口和图标、Metal 桥、MacFlow，以及默认关闭的 CPU/GPU 研究原型。完整范围、构建方法、已验证用例和未完成事项见 [贡献总览](contributions/README.md) 与 [本次提交验证](contributions/提交验证.md)。独立实验和历史分支保留源码及明确基线，供维护者按模块审查和选择；95% 原生 x86 性能目标尚未达到。

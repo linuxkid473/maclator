@@ -1,0 +1,7 @@
+**/__pycache__/
+**/build/
+**/results-*/
+**/index-model-results.json
+**/tagged-memory-source.json
+**/tagged-memory-structures-source.json
+**/tagged-memory-structures-loop-source.json

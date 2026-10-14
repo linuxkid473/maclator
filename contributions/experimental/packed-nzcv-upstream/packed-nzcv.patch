@@ -1,0 +1,324 @@
+diff --git a/crates/maclator/src/aot.rs b/crates/maclator/src/aot.rs
+index fffb7cc..5296868 100644
+--- a/crates/maclator/src/aot.rs
++++ b/crates/maclator/src/aot.rs
+@@ -23,7 +23,7 @@ use std::sync::Mutex;
+ 
+ const MAGIC: &[u8; 8] = b"MCLAOT04";
+ /// Bump when the translator's output changes.
+-const TRANSLATOR_VERSION: u32 = 15;
++const TRANSLATOR_VERSION: u32 = 16;
+ 
+ #[derive(Clone)]
+ struct Image {
+@@ -73,7 +73,7 @@ fn fnv(parts: &[&[u8]]) -> String {
+ }
+ 
+ fn flags_word() -> u32 {
+-    crate::jit::commpage_checks() as u32
++    crate::jit::commpage_checks() as u32 | ((crate::jit::emit::packed_flags() as u32) << 1)
+ }
+ 
+ /// Register the main executable (mapped at a fixed address).
+diff --git a/crates/maclator/src/jit/emit.rs b/crates/maclator/src/jit/emit.rs
+index 5ef23e0..603cfe9 100644
+--- a/crates/maclator/src/jit/emit.rs
++++ b/crates/maclator/src/jit/emit.rs
+@@ -15,6 +15,22 @@ use maclator_core::cpu::off;
+ use maclator_core::interp::simd::vfp_expand_imm;
+ use std::collections::HashMap;
+ 
++// Two word stores must cover exactly the four normalized flag bytes.
++const _: () = {
++    assert!(off::ZF == off::NF + 1);
++    assert!(off::CF == off::NF + 2);
++    assert!(off::VF == off::NF + 3);
++    assert!(off::NF % 2 == 0 && off::CF % 2 == 0);
++};
++
++/// Pack NZ/CV into word stores without changing host flags. An explicit zero
++/// retains the byte-store implementation for comparison; include this choice
++/// in the AOT cache flags because it changes generated code.
++pub fn packed_flags() -> bool {
++    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ENABLED.get_or_init(|| std::env::var("MACLATOR_JIT_PACKED_FLAGS").as_deref() != Ok("0"))
++}
++
+ pub const HELPER_INTERP: usize = 0;
+ pub const HELPER_COMMPAGE: usize = 1;
+ 
+@@ -408,10 +424,22 @@ impl<'a> E<'a> {
+     }
+ 
+     /// Store NZCV from the x86 flags of a preceding add/sub/logic op.
++    /// Packed ADD/SUB clobber RCX/RDX; logic clobbers RDX. Callers have
++    /// consumed these scratch operands. RAX and cached results remain intact.
++    /// All SETcc/MOV instructions preserve flags for branch/select fusion.
+     fn flags_add(&mut self) {
+         if self.u.dead_flags {
+             return;
+         }
++        if packed_flags() {
++            a!(self, sets(dl));
++            a!(self, sete(dh));
++            a!(self, setb(cl));
++            a!(self, seto(ch));
++            a!(self, mov(word_ptr(r15 + off::NF), dx));
++            a!(self, mov(word_ptr(r15 + off::CF), cx));
++            return;
++        }
+         a!(self, sets(byte_ptr(r15 + off::NF)));
+         a!(self, sete(byte_ptr(r15 + off::ZF)));
+         a!(self, setb(byte_ptr(r15 + off::CF)));
+@@ -421,6 +449,15 @@ impl<'a> E<'a> {
+         if self.u.dead_flags {
+             return;
+         }
++        if packed_flags() {
++            a!(self, sets(dl));
++            a!(self, sete(dh));
++            a!(self, setae(cl));
++            a!(self, seto(ch));
++            a!(self, mov(word_ptr(r15 + off::NF), dx));
++            a!(self, mov(word_ptr(r15 + off::CF), cx));
++            return;
++        }
+         a!(self, sets(byte_ptr(r15 + off::NF)));
+         a!(self, sete(byte_ptr(r15 + off::ZF)));
+         a!(self, setae(byte_ptr(r15 + off::CF)));
+@@ -430,6 +467,13 @@ impl<'a> E<'a> {
+         if self.u.dead_flags {
+             return;
+         }
++        if packed_flags() {
++            a!(self, sets(dl));
++            a!(self, sete(dh));
++            a!(self, mov(word_ptr(r15 + off::NF), dx));
++            a!(self, mov(word_ptr(r15 + off::CF), 0u32));
++            return;
++        }
+         a!(self, sets(byte_ptr(r15 + off::NF)));
+         a!(self, sete(byte_ptr(r15 + off::ZF)));
+         a!(self, mov(byte_ptr(r15 + off::CF), 0));
+diff --git a/crates/maclator/src/jit/selftest.rs b/crates/maclator/src/jit/selftest.rs
+index 63fa655..d1e5cbb 100644
+--- a/crates/maclator/src/jit/selftest.rs
++++ b/crates/maclator/src/jit/selftest.rs
+@@ -37,6 +37,184 @@ fn snapshot(c: &Cpu) -> Vec<u64> {
+     v
+ }
+ 
++/// Deterministic flag-store coverage with arithmetic/condition oracles that do
++/// not use the interpreter. Every case must translate natively and pass.
++fn run_selftest_packedflags() {
++    fn arithmetic(a: u64, b: u64, width: u32, sub: bool, carry: bool) -> (u64, u32) {
++        let mask = if width == 64 { u64::MAX } else { u32::MAX as u64 };
++        let (a, b) = (a & mask, b & mask);
++        let sign = 1u64 << (width - 1);
++        let (result, c, v) = if sub {
++            let borrow = (!carry) as u128;
++            let result = a.wrapping_sub(b).wrapping_sub(borrow as u64) & mask;
++            (result, a as u128 >= b as u128 + borrow, ((a ^ b) & (a ^ result) & sign) != 0)
++        } else {
++            let sum = a as u128 + b as u128 + carry as u128;
++            let result = sum as u64 & mask;
++            (result, sum > mask as u128, (!(a ^ b) & (a ^ result) & sign) != 0)
++        };
++        let flags = (((result & sign != 0) as u32) << 3)
++            | (((result == 0) as u32) << 2) | ((c as u32) << 1) | v as u32;
++        (result, flags)
++    }
++    fn condition(flags: u32, cond: u32) -> bool {
++        let (n, z, c, v) = (flags & 8 != 0, flags & 4 != 0, flags & 2 != 0, flags & 1 != 0);
++        let yes = match cond >> 1 {
++            0 => z, 1 => c, 2 => n, 3 => v, 4 => c && !z,
++            5 => n == v, 6 => !z && n == v, _ => true,
++        };
++        if cond < 14 && cond & 1 != 0 { !yes } else { yes }
++    }
++    fn state(cpu: &Cpu) -> Vec<u64> {
++        let mut fields = snapshot(cpu);
++        fields.extend([cpu.pc, cpu.nf as u64, cpu.zf as u64, cpu.cf as u64, cpu.vf as u64,
++            cpu._pad0 as u64, cpu.fpcr, cpu.fpsr, cpu.tpidrro_el0,
++            cpu.excl_addr, cpu.excl_val, cpu.excl_val2, cpu.excl_size]);
++        fields
++    }
++    // Pin a few independently obvious arithmetic results before generating cases.
++    for width in [32, 64] {
++        let max = if width == 64 { u64::MAX } else { u32::MAX as u64 };
++        let sign = 1u64 << (width - 1);
++        assert_eq!(arithmetic(max, 1, width, false, false), (0, 6));
++        assert_eq!(arithmetic(sign - 1, 1, width, false, false), (sign, 9));
++        assert_eq!(arithmetic(0, 1, width, true, true), (max, 8));
++        assert_eq!(arithmetic(sign, 1, width, true, true), (sign - 1, 3));
++    }
++    assert!(std::env::var("MACLATOR_JIT_DISABLE").unwrap_or_default().is_empty(),
++        "packedflags requires normal native translation");
++    assert!(!verify_mode(), "packedflags controls its own execution boundaries");
++    let page = unsafe { libc::mmap(std::ptr::null_mut(), 4096, libc::PROT_READ | libc::PROT_WRITE,
++        libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0) };
++    assert_ne!(page, libc::MAP_FAILED);
++    let entry = page as u64;
++    let (mut cases, mut mismatches, mut native) = (0u64, 0u64, 0u64);
++    // consumer: 0=SVC, 1=B.cond, 2=CSEL, 3=ADC (reads the stored carry).
++    let mut check = |setter: u32, a: u64, b: u64, initial_flags: u32, result: Option<(u32, u64)>,
++                     flags: u32, width: u32, consumer: u32, cond: u32| {
++        let mut actual = Cpu::new();
++        for n in 0..32 {
++            actual.x[n] = 0x1234_5678_0000_0000 + n as u64;
++            actual.v[n] = [0xdead_beef_0000_0000 + n as u64, 0xcafe_babe_0000_0000 + n as u64];
++        }
++        actual.x[0] = a;
++        actual.x[1] = b;
++        actual.pc = entry;
++        actual.set_nzcv(initial_flags);
++        actual._pad0 = 0x1357_9bdf;
++        actual.fpsr = 0x0800_009f;
++        actual.tpidrro_el0 = 0x5555;
++        let mut expected = clone_cpu(&actual);
++        expected._pad0 = actual._pad0;
++        expected.fpsr = actual.fpsr;
++        if let Some((rd, value)) = result {
++            if rd != 31 { expected.x[rd as usize] = value; }
++        }
++        expected.set_nzcv(flags);
++        let sf = if width == 64 { 1u32 << 31 } else { 0 };
++        let mut words = [setter, 0xd400_1001, 0xd400_1001, 0xd400_1001];
++        let exit = if consumer == 1 {
++            words[1] = 0x5400_0000 | (2 << 5) | cond;
++            expected.pc = entry + if condition(flags, cond) { 12 } else { 8 };
++            EXIT_CONTINUE
++        } else {
++            expected.pc = entry + 8;
++            if consumer == 2 {
++                words[1] = sf | 0x1a80_0000 | (3 << 16) | (cond << 12) | (2 << 5) | 4;
++                let value = expected.x[if condition(flags, cond) { 2 } else { 3 }];
++                expected.x[4] = if width == 64 { value } else { value as u32 as u64 };
++                expected.pc += 4;
++            } else if consumer == 3 {
++                words[1] = sf | 0x1a00_0000 | (3 << 16) | (2 << 5) | 4;
++                expected.x[4] = arithmetic(expected.x[2], expected.x[3], width, false, flags & 2 != 0).0;
++                expected.pc += 4;
++            }
++            EXIT_SVC
++        };
++        unsafe { for (i, word) in words.iter().enumerate() { *((page as *mut u32).add(i)) = *word; } }
++        invalidate_range(entry, 16);
++        setup_cpu(&mut actual);
++        let fallback = STATS_FALLBACK.load(Ordering::Relaxed);
++        let host = lookup_or_translate(entry);
++        let is_native = STATS_FALLBACK.load(Ordering::Relaxed) == fallback;
++        native += is_native as u64;
++        unsafe { maclator_jit_enter(&mut *actual, host); }
++        let pending = PENDING.with(|p| p.take());
++        // A branch returns its patchable chaining slot, not a zero SVC payload.
++        let exit_data_ok = if exit == EXIT_SVC { actual.exit_data == 128 }
++            else { actual.exit_data % 8 == 0 && code_cache().contains(actual.exit_data) };
++        let pass = is_native && state(&actual) == state(&expected) && actual.exit_reason == exit
++            && exit_data_ok && pending.is_none();
++        cases += 1;
++        if !pass {
++            mismatches += 1;
++            if mismatches <= 20 {
++                println!("MISMATCH packedflags #{cases} setter={setter:08x} consumer={consumer} cond={cond} initial_nzcv={initial_flags:x} expected_nzcv={flags:x} actual_nzcv={:x} native={is_native} pc={:#x}/{:#x}",
++                    actual.nzcv(), expected.pc, actual.pc);
++            }
++        }
++    };
++    for width in [32, 64] {
++        let sf = if width == 64 { 1u32 << 31 } else { 0 };
++        let mask = if width == 64 { u64::MAX } else { u32::MAX as u64 };
++        let sign = 1u64 << (width - 1);
++        let edges = [(0, 0), (0, 1), (mask, 1), (mask, mask), (sign - 1, 1),
++            (sign, 1), (sign, mask), (1, mask), (sign, sign), (0, sign)];
++        for (a, b) in edges {
++            // High halves test zero-extension of W results and width-limited flags.
++            let (input_a, input_b) = if width == 32 { (a | 0xabcd_1234_0000_0000, b | 0x5678_9abc_0000_0000) } else { (a, b) };
++            for initial_flags in [0, 15] {
++                for (op, base) in [0x2b00_0000, 0x6b00_0000, 0x6a00_0000, 0x6a20_0000,
++                    0x3a00_0000, 0x7a00_0000, 0x3100_0400, 0x7100_0400,
++                    0x2b20_4400, 0x6b20_4400].iter().enumerate() {
++                    let rhs = match op { 6 | 7 => 1, 8 | 9 => (b as u32 as u64).wrapping_shl(1) & mask, _ => b };
++                    let (result, flags) = if op == 2 || op == 3 {
++                        let result = a & if op == 2 { b } else { !b & mask };
++                        (result, (((result & sign != 0) as u32) << 3) | (((result == 0) as u32) << 2))
++                    } else {
++                        arithmetic(a, rhs, width, matches!(op, 1 | 5 | 7 | 9),
++                            if op == 4 || op == 5 { initial_flags & 2 != 0 } else { matches!(op, 1 | 7 | 9) })
++                    };
++                    for rd in [0, 1, 2, 31] {
++                        let setter = sf | *base | if op == 6 || op == 7 { rd } else { (1 << 16) | rd };
++                        check(setter, input_a, input_b, initial_flags, Some((rd, result)), flags, width, 0, 0);
++                    }
++                    if op <= 2 {
++                        let setter = sf | *base | (1 << 16) | 2;
++                        for cond in 0..16 {
++                            for consumer in [1, 2] {
++                                check(setter, input_a, input_b, initial_flags, Some((2, result)), flags, width, consumer, cond);
++                            }
++                        }
++                        check(setter, input_a, input_b, initial_flags, Some((2, result)), flags, width, 3, 0);
++                    }
++                }
++            }
++        }
++        // CCMP/CCMN, register/immediate operands, true/false EQ and all 16 literal NZCV values.
++        for sub in [false, true] {
++            for immediate in [false, true] {
++                for initial_flags in [0, 4] {
++                    for literal in 0..16 {
++                        for (a, b) in [(0, 1), (mask, 1), (sign, sign - 1)] {
++                            let rhs = if immediate { 1 } else { b };
++                            let flags = if initial_flags & 4 != 0 {
++                                arithmetic(a, rhs, width, sub, sub).1
++                            } else { literal };
++                            let setter = sf | if sub { 0x7a40_0000 } else { 0x3a40_0000 }
++                                | (1 << 16) | ((immediate as u32) << 11) | literal;
++                            check(setter, a, b, initial_flags, None, flags, width, 0, 0);
++                        }
++                    }
++                }
++            }
++        }
++    }
++    unsafe { libc::munmap(page, 4096); }
++    println!("jit selftest [packedflags]: cases={cases} mismatch={mismatches} native={native} packed={}", emit::packed_flags());
++    assert_eq!(mismatches, 0, "packed flag-store regression");
++}
++
+ /// Pairs of (flag-setting instruction, flag consumer) to exercise compare-and-branch / select fusion.
+ fn run_selftest_fuse(count: usize, deep: bool) {
+     // (mask, value) of the flag-setting encodings: add/sub imm, shifted reg, extended reg (all with S),
+@@ -300,6 +478,9 @@ fn run_selftest_blocks(count: usize) {
+ }
+ 
+ pub fn run_selftest(class: &str, count: usize) {
++    if class == "packedflags" {
++        return run_selftest_packedflags();
++    }
+     if class == "fuse" {
+         return run_selftest_fuse(count, false);
+     }
+diff --git a/docs/DEBUGGING.md b/docs/DEBUGGING.md
+index aa9fe02..91dfe44 100644
+--- a/docs/DEBUGGING.md
++++ b/docs/DEBUGGING.md
+@@ -17,11 +17,18 @@ file + `clang -c` + `objdump -d --x86-asm-syntax=intel`). `ipsw dyld a2s/disass`
+ shared-cache addresses to symbols (unslid vaddr = `0x180000000 + (pc - 0x600000000)`).
+ `sample <pid> 8 -file f` for host-side profiles.
+ 
++NZCV 标志默认通过两次 16 位写入保存。设置 `MACLATOR_JIT_PACKED_FLAGS=0`
++可使用原来的四次字节写入进行对照。两种模式都保留四个归一化的标志字节，
++并保留分支/条件选择融合使用的宿主标志。该选项参与 AOT 缓存标识，
++不兼容模式的缓存会被拒绝，不会直接复用。
++
+ **Differential JIT self-test** (the important safety net):
+ ```bash
+ MACLATOR_SELFTEST_MEM=1 MACLATOR_SELFTEST_SIMDMEM=1 \
+   maclator --selftest-jit MASK:VALUE 8000      # hex mask/value of the encoding class
+ # also classes: dpimm dpreg ldst branch
++maclator --selftest-jit packedflags       # 确定性检查 NZCV、运算结果和融合；出现不一致时失败退出
++MACLATOR_JIT_PACKED_FLAGS=0 maclator --selftest-jit packedflags
+ maclator --selftest-jit fuse   200000   # (flag setter, b.cond | csel) pairs: compare+branch/select fusion
+ maclator --selftest-jit fuse2  200000   # [setter, b.cond, A, B, svc] with A/B overwriting all flags, run to the svc:
+                                         #   exercises dead-flag-store elimination (prints dead_flag_skips)

@@ -1,0 +1,241 @@
+--- a/crates/maclator/src/jit/emit.rs
++++ b/crates/maclator/src/jit/emit.rs
+@@ -125,6 +125,13 @@
+     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+     *ENABLED.get_or_init(|| std::env::var("MACLATOR_JIT_LOOP_CACHE").as_deref() != Ok("0"))
+ }
++/// Operate directly on an existing fixed loop-cache destination when it is
++/// also the left operand. Every result is still written through before the
++/// next guest instruction; dynamic cache mappings keep the ordinary path.
++pub fn fixed_lhs() -> bool {
++    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ENABLED.get_or_init(|| std::env::var("MACLATOR_JIT_FIXED_LHS").as_deref() == Ok("1"))
++}
+ /// Adjacent GPR pairs can transfer directly between a vector and the
+ /// authoritative Cpu slots. Cached destinations use PEXTRQ, requiring SSE4.1.
+ /// Opt in for experimentation: the whole-workload benchmark found a recursive
+@@ -136,6 +143,7 @@
+         && std::is_x86_feature_detected!("sse4.1"))
+ }
+ pub static LOOP_CACHE_BLOCKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++pub static FIXED_LHS_OPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+ pub static VECTOR_LOOP_CACHE_BLOCKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+ pub static DEAD_FLAG_SKIPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+ const LOOKAHEAD: usize = 10;
+@@ -490,6 +498,21 @@
+         self.ld(rcx, n, false, sf);
+         rcx
+     }
++    fn fixed_lhs(&mut self, rd: u32, rn: u32) -> Option<R64> {
++        if !self.u.rc_fixed || !fixed_lhs() || rd == 31 || rd != rn { return None; }
++        let slot = self.rc_find(rn)?;
++        self.u.gpr_uses[rn as usize] += 1;
++        self.rc_touch(slot);
++        FIXED_LHS_OPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        Some(CREGS[slot])
++    }
++    fn st_fixed_lhs(&mut self, n: u32, r: R64) {
++        debug_assert!(self.u.rc_fixed);
++        debug_assert!(self.rc_find(n).map_or(false, |s| CREGS[s] == r));
++        a!(self, mov(qword_ptr(r15 + xoff(n)), r));
++        self.u.gpr_uses[n as usize] += 1;
++        if let Some(slot) = self.rc_find(n) { self.rc_touch(slot); }
++    }
+     /// Store `r` to Xn (31 = discard, unless `sp`).
+     fn stx(&mut self, n: u32, r: R64, use_sp: bool) {
+         if n == 31 && !use_sp {
+@@ -1112,18 +1135,21 @@
+                 if bit(insn, 22) != 0 {
+                     imm <<= 12;
+                 }
+-                self.ld(rax, rn, true, sf);
++                let fixed = self.fixed_lhs(rd, rn);
++                let lhs = fixed.unwrap_or(rax);
++                if fixed.is_none() { self.ld(rax, rn, true, sf); }
+                 if sf {
+-                    if op == 0 { a!(self, add(rax, imm as i32)) } else { a!(self, sub(rax, imm as i32)) }
++                    if op == 0 { a!(self, add(lhs, imm as i32)) } else { a!(self, sub(lhs, imm as i32)) }
+                 } else if op == 0 {
+-                    a!(self, add(eax, imm as i32))
++                    a!(self, add(r32_of(lhs), imm as i32))
+                 } else {
+-                    a!(self, sub(eax, imm as i32))
++                    a!(self, sub(r32_of(lhs), imm as i32))
+                 }
+                 if s {
+                     if op == 0 { self.flags_add(); self.u.fuse = Some(FuseKind::Add) } else { self.flags_sub(); self.u.fuse = Some(FuseKind::Sub) }
+                 }
+-                self.stx(rd, rax, !s);
++                if fixed.is_some() { self.st_fixed_lhs(rd, lhs); }
++                else { self.stx(rd, rax, !s); }
+                 true
+             }
+             0b100 => {
+@@ -1402,6 +1428,27 @@
+                 self.stx(rd, rax, false);
+                 return true;
+             }
++            if amt == 0 && !nflag {
++                if let Some(lhs) = self.fixed_lhs(rd, rn) {
++                    let rhs = self.rhs(rm, sf);
++                    if sf {
++                        match opc {
++                            0 | 3 => a!(self, and(lhs, rhs)),
++                            1 => a!(self, or(lhs, rhs)),
++                            _ => a!(self, xor(lhs, rhs)),
++                        }
++                    } else {
++                        match opc {
++                            0 | 3 => a!(self, and(r32_of(lhs), r32_of(rhs))),
++                            1 => a!(self, or(r32_of(lhs), r32_of(rhs))),
++                            _ => a!(self, xor(r32_of(lhs), r32_of(rhs))),
++                        }
++                    }
++                    if opc == 3 { self.flags_logic(); self.u.fuse = Some(FuseKind::Logic); }
++                    self.st_fixed_lhs(rd, lhs);
++                    return true;
++                }
++            }
+             let rhs = if amt == 0 && !nflag {
+                 self.ld(rax, rn, false, sf);
+                 self.rhs(rm, sf)
+@@ -1443,6 +1490,14 @@
+             let amt = bits(insn, 15, 10);
+             if ty == 3 || (!sf && amt >= 32) {
+                 return false;
++            }
++            if amt == 0 {
++                if let Some(lhs) = self.fixed_lhs(rd, rn) {
++                    let rhs = self.rhs(rm, sf);
++                    self.addsub_regs(op, sf, s, lhs, rhs);
++                    self.st_fixed_lhs(rd, lhs);
++                    return true;
++                }
+             }
+             let rhs = if amt == 0 {
+                 self.ld(rax, rn, false, sf);
+@@ -1656,12 +1711,15 @@
+         self.addsub_rhs(op, sf, s, rcx);
+     }
+     fn addsub_rhs(&mut self, op: u32, sf: bool, s: bool, rhs: R64) {
++        self.addsub_regs(op, sf, s, rax, rhs);
++    }
++    fn addsub_regs(&mut self, op: u32, sf: bool, s: bool, lhs: R64, rhs: R64) {
+         if sf {
+-            if op == 0 { a!(self, add(rax, rhs)) } else { a!(self, sub(rax, rhs)) }
++            if op == 0 { a!(self, add(lhs, rhs)) } else { a!(self, sub(lhs, rhs)) }
+         } else if op == 0 {
+-            a!(self, add(eax, r32_of(rhs)))
++            a!(self, add(r32_of(lhs), r32_of(rhs)))
+         } else {
+-            a!(self, sub(eax, r32_of(rhs)))
++            a!(self, sub(r32_of(lhs), r32_of(rhs)))
+         }
+         if s {
+             if op == 0 { self.flags_add(); self.u.fuse = Some(FuseKind::Add) } else { self.flags_sub(); self.u.fuse = Some(FuseKind::Sub) }
+--- a/crates/maclator/src/jit/mod.rs
++++ b/crates/maclator/src/jit/mod.rs
+@@ -474,6 +474,8 @@
+         eprintln!("[maclator] loop cache: {} blocks ({} with vector registers)",
+             emit::LOOP_CACHE_BLOCKS.load(Ordering::Relaxed),
+             emit::VECTOR_LOOP_CACHE_BLOCKS.load(Ordering::Relaxed));
++        eprintln!("[maclator] fixed lhs: {} emitted operations",
++            emit::FIXED_LHS_OPS.load(Ordering::Relaxed));
+     }
+ }
+ 
+--- a/crates/maclator/src/jit/loop_selftest.rs
++++ b/crates/maclator/src/jit/loop_selftest.rs
+@@ -228,6 +228,7 @@
+     let before_loops = emit::LOOP_CACHE_BLOCKS.load(Ordering::Relaxed);
+     let before_vectors = emit::VECTOR_LOOP_CACHE_BLOCKS.load(Ordering::Relaxed);
+     let before_calls = COMMPAGE_CALLS.load(Ordering::Relaxed);
++    let before_lhs = emit::FIXED_LHS_OPS.load(Ordering::Relaxed);
+     let (pair_cases, pair_yields) = run_pair_fixtures(code);
+     ok += pair_cases;
+     yields += pair_yields;
+@@ -297,13 +298,42 @@
+                 0x9100_0000 | ((bytes as u32) << 10) | (24 << 5) | 24,
+                 0x9100_0000 | ((bytes as u32) << 10) | (25 << 5) | 25, 0xd100_0694];
+         } else {
+-            let wide = it % 2 == 0;
++            let wide = if it >= 736 { ((it - 737) / 2) % 2 == 0 } else { it % 2 == 0 };
+             let sf = if wide { 1 << 31 } else { 0 };
+             let imm = rng.next() as u32 & 0xffff;
+             program = vec![0x5280_0005 | sf | (imm << 5),
+                 0x0b01_0000 | sf, 0x4b02_0021 | sf, 0x4a00_0042 | sf,
+                 0x1b01_0803 | sf, 0x6b05_007f | sf, 0x1a81_c004 | sf,
+                 0x1100_0c84 | sf, 0xd100_0694];
++            if it >= 736 {
++                // Fixed destination/source aliases, same-register and XZR
++                // RHS, 32-bit zero extension, all add/sub and logic flags.
++                // Immediate edge cases include zero and the LSL #12 form.
++                let shape = (it - 737) / 2;
++                let variant = (shape / 2) % 16;
++                let rhs = [0u32, 1, 31][(shape / 32) % 3];
++                let operation = match variant {
++                    0..=7 => {
++                        let op = (variant / 4) as u32;
++                        let flags = (variant % 4 / 2) as u32;
++                        let value = if variant % 2 == 0 { 0 } else { 4095 };
++                        let shift = ((shape / 96) % 2) as u32;
++                        0x1100_0000 | sf | (op << 30) | (flags << 29)
++                            | (shift << 22) | (value << 10)
++                    }
++                    8..=11 => {
++                        let op = ((variant - 8) / 2) as u32;
++                        let flags = ((variant - 8) % 2) as u32;
++                        0x0b00_0000 | sf | (op << 30) | (flags << 29) | (rhs << 16)
++                    }
++                    _ => 0x0a00_0000 | sf | (((variant - 12) as u32) << 29) | (rhs << 16),
++                };
++                let condition = ((shape / 192) % 16) as u32;
++                program = vec![operation,
++                    0x1a80_0002 | sf | (1 << 16) | (condition << 12),
++                    0x1a80_0003 | sf | (2 << 5) | ((condition ^ 1) << 12),
++                    0xd100_0694];
++            }
+         }
+         program.push(cbnz_back(program.len()));
+         let loop_len = program.len();
+@@ -364,7 +394,11 @@
+     let loop_blocks = emit::LOOP_CACHE_BLOCKS.load(Ordering::Relaxed) - before_loops;
+     let vector_blocks = emit::VECTOR_LOOP_CACHE_BLOCKS.load(Ordering::Relaxed) - before_vectors;
+     let helper_calls = COMMPAGE_CALLS.load(Ordering::Relaxed) - before_calls;
+-    println!("jit selftest [loopcache]: ok={ok} mismatch={bad} yields={yields} cached={loop_blocks} vector_cached={vector_blocks} clobbering_helper_calls={helper_calls}");
++    let lhs_ops = emit::FIXED_LHS_OPS.load(Ordering::Relaxed) - before_lhs;
++    println!("jit selftest [loopcache]: ok={ok} mismatch={bad} yields={yields} cached={loop_blocks} vector_cached={vector_blocks} clobbering_helper_calls={helper_calls} fixed_lhs_ops={lhs_ops}");
++    if emit::fixed_lhs() && emit::loop_cache() {
++        assert!(lhs_ops != 0, "fixed lhs optimization was not emitted");
++    }
+     assert!(helper_calls != 0, "synthetic commpage helper was not exercised");
+     assert_eq!(bad, 0, "whole-loop differential mismatch");
+ }
+--- a/crates/maclator/src/aot.rs
++++ b/crates/maclator/src/aot.rs
+@@ -23,7 +23,7 @@
+ 
+ const MAGIC: &[u8; 8] = b"MCLAOT04";
+ /// Bump when the translator's output changes.
+-const TRANSLATOR_VERSION: u32 = 20;
++const TRANSLATOR_VERSION: u32 = 21;
+ 
+ #[derive(Clone)]
+ struct Image {
+@@ -81,6 +81,7 @@
+         | ((maclator_core::mem::native_pair_atomic() as u32) << 4)
+         | ((crate::jit::emit::register_budget() as u32) << 5)
+         | ((crate::jit::emit::pair_fast() as u32) << 6)
++        | ((crate::jit::emit::fixed_lhs() as u32) << 10)
+         | ((crate::jit::emit::cold_budget() as u32) << 7)
+         | ((crate::jit::emit::csel_chain() as u32) << 8)
+ }
+@@ -588,6 +589,8 @@
+         assert_eq!(cache_layout(&different_features, expected_len), None);
+         different_features[12..16].copy_from_slice(&(flags_word() ^ 16).to_le_bytes());
+         assert_eq!(cache_layout(&different_features, expected_len), None);
++        different_features[12..16].copy_from_slice(&(flags_word() ^ (1 << 10)).to_le_bytes());
++        assert_eq!(cache_layout(&different_features, expected_len), None);
+     }
+ 
+     #[test]

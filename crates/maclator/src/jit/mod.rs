@@ -3,6 +3,14 @@
 
 pub mod emit;
 pub mod selftest;
+pub mod fp_mode_selftest;
+pub mod loop_selftest;
+pub mod gpr_writeback_selftest;
+pub mod budget_flags_selftest;
+pub mod effective_address_selftest;
+pub mod cached_store_selftest;
+pub mod csel_selftest;
+pub(crate) mod diagnostic;
 
 use emit::{StubKind, Unit, EXIT_CONTINUE, EXIT_PENDING, EXIT_SVC, HELPER_COMMPAGE, HELPER_INTERP};
 use iced_x86::BlockEncoderOptions;
@@ -37,10 +45,25 @@ pub const IBTC_SIZE: usize = 32768;
 const CODE_CACHE_SIZE: u64 = 4 << 30;
 
 std::arch::global_asm!(
-    ".globl _maclator_jit_enter",
-    ".globl _maclator_jit_exit",
+    ".globl _maclator_jit_enter_register",
+    ".globl _maclator_jit_enter_memory",
+    ".globl _maclator_jit_exit_register",
+    ".globl _maclator_jit_exit_memory",
     ".p2align 4",
-    "_maclator_jit_enter:",
+    "_maclator_jit_enter_register:",
+    "push rbp",
+    "mov rbp, rsp",
+    "push rbx",
+    "push r12",
+    "push r13",
+    "push r14",
+    "push r15",
+    "sub rsp, 8",
+    "mov r15, rdi",
+    "mov r14, [r15 + {budget}]",
+    "jmp rsi",
+    ".p2align 4",
+    "_maclator_jit_enter_memory:",
     "push rbp",
     "mov rbp, rsp",
     "push rbx",
@@ -52,7 +75,9 @@ std::arch::global_asm!(
     "mov r15, rdi",
     "jmp rsi",
     ".p2align 4",
-    "_maclator_jit_exit:",
+    "_maclator_jit_exit_register:",
+    "mov [r15 + {budget}], r14",
+    "_maclator_jit_exit_memory:",
     "add rsp, 8",
     "pop r15",
     "pop r14",
@@ -61,11 +86,23 @@ std::arch::global_asm!(
     "pop rbx",
     "pop rbp",
     "ret",
+    budget = const maclator_core::cpu::off::BUDGET,
 );
 
 extern "C" {
-    fn maclator_jit_enter(cpu: *mut Cpu, code: u64);
-    fn maclator_jit_exit();
+    fn maclator_jit_enter_register(cpu: *mut Cpu, code: u64);
+    fn maclator_jit_enter_memory(cpu: *mut Cpu, code: u64);
+    fn maclator_jit_exit_register();
+    fn maclator_jit_exit_memory();
+}
+
+#[inline(always)]
+unsafe fn maclator_jit_enter(cpu: *mut Cpu, code: u64) {
+    if emit::register_budget() {
+        maclator_jit_enter_register(cpu, code);
+    } else {
+        maclator_jit_enter_memory(cpu, code);
+    }
 }
 
 pub struct CodeCache {
@@ -165,6 +202,17 @@ pub fn lookup(pc: u64) -> Option<u64> {
 pub fn register_block(pc: u64, host: u64) {
     let mut g = BLOCKS.write().unwrap();
     g.get_or_insert_with(FastMap::default).entry(pc).or_insert(host);
+}
+
+/// Register a complete AOT image without taking the global write lock for
+/// every block. Keep any live JIT translation that was already published.
+pub fn register_blocks(blocks: impl ExactSizeIterator<Item = (u64, u64)>) {
+    let mut g = BLOCKS.write().unwrap();
+    let map = g.get_or_insert_with(FastMap::default);
+    map.reserve(blocks.len());
+    for (pc, host) in blocks {
+        map.entry(pc).or_insert(host);
+    }
 }
 
 // ---------------- helpers called from generated code ----------------
@@ -315,6 +363,8 @@ fn translate_inner(pc: u64) -> u64 {
     drop(ix_guard);
     let mut g = BLOCKS.write().unwrap();
     g.get_or_insert_with(FastMap::default).insert(pc, at);
+    drop(g);
+    diagnostic::export_unit(&u, &res, pc, at);
     at
 }
 
@@ -428,13 +478,21 @@ pub fn flush_profile() {
             STATS_JIT_ENTRIES.load(Ordering::Relaxed),
             STATS_INTERP_BLOCKS.load(Ordering::Relaxed),
         );
+        eprintln!("[maclator] loop cache: {} blocks ({} with vector registers)",
+            emit::LOOP_CACHE_BLOCKS.load(Ordering::Relaxed),
+            emit::VECTOR_LOOP_CACHE_BLOCKS.load(Ordering::Relaxed));
     }
 }
 
 // ---------------- dispatcher ----------------
 
 fn setup_cpu(cpu: &mut Cpu) {
-    cpu.jit_exit = maclator_jit_exit as usize as u64;
+    cpu.budget = JIT_BUDGET;
+    cpu.jit_exit = if emit::register_budget() {
+        maclator_jit_exit_register as *const () as usize as u64
+    } else {
+        maclator_jit_exit_memory as *const () as usize as u64
+    };
     cpu.helpers[HELPER_INTERP] = helper_interp as usize as u64;
     cpu.helpers[HELPER_COMMPAGE] = helper_commpage as usize as u64;
     IBTC.with(|t| {
@@ -445,6 +503,10 @@ fn setup_cpu(cpu: &mut Cpu) {
         cpu.ibtc = t.as_mut().unwrap().as_mut_ptr() as u64;
     });
 }
+
+/// A long chained loop must return regularly to deliver signals and observe
+/// cache invalidation. This is a guest instruction limit, not a timer.
+const JIT_BUDGET: u64 = 65_536;
 
 fn ibtc_insert(pc: u64, host: u64) {
     IBTC.with(|t| {
@@ -513,6 +575,7 @@ fn verify_block(cpu: &mut Cpu, host: u64) {
     for (a, old, n) in log.iter().rev() {
         unsafe { std::ptr::copy_nonoverlapping(old.as_ptr(), mem::host(*a), *n) };
     }
+    cpu.budget = JIT_BUDGET;
     unsafe { maclator_jit_enter(cpu, host) };
     // Blocks with atomics race with other threads between the two runs.
     let racy = executed.iter().any(|&(_, i)| {
@@ -588,6 +651,9 @@ pub fn run(cpu: &mut Cpu) {
     setup_cpu(cpu);
     let (mut last_pc, mut repeats) = (u64::MAX, 0u64);
     loop {
+        if let Err(code) = crate::signals::poll(cpu) {
+            unsafe { libc::_exit(code); }
+        }
         if cpu.pc == last_pc {
             repeats += 1;
             if repeats == 20000 && std::env::var_os("MACLATOR_SPIN_DEBUG").is_some() {
@@ -636,6 +702,7 @@ pub fn run(cpu: &mut Cpu) {
             }
         };
         STATS_JIT_ENTRIES.fetch_add(1, Ordering::Relaxed);
+        cpu.budget = JIT_BUDGET;
         if verify_mode() {
             verify_block(cpu, host);
         } else {

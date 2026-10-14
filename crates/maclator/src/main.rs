@@ -1,6 +1,7 @@
 //! Maclator: run arm64 macOS programs on x86-64 Macs.
 
 mod aot;
+mod app_icon;
 mod cache;
 mod commpage;
 mod engine;
@@ -11,8 +12,10 @@ mod iokit;
 mod jit;
 mod loader;
 mod macho;
+mod macflow;
 mod paths;
 mod signals;
+mod slices;
 mod spawn;
 mod symbols;
 mod syscalls;
@@ -29,6 +32,8 @@ fn usage() -> ! {
     eprintln!("  --no-aot        JIT only: don't load or build AOT translations");
     eprintln!("  --dyld PATH     arm64 dyld to use (default /usr/lib/dyld)");
     eprintln!("  --sysroot DIR   directory with the arm64 dyld shared cache files");
+    eprintln!("  --overlay-root DIR  local Xcode component payloads (experimental)");
+    eprintln!("  --app-icon PATH  use an original icon resource for the running app");
     eprintln!("  --trace         trace system calls");
     eprintln!("  --gpu           route the guest's Metal API to the host GPU");
     std::process::exit(2);
@@ -37,6 +42,8 @@ fn usage() -> ! {
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let mut dyld = std::env::var("MACLATOR_DYLD").unwrap_or_else(|_| "/usr/lib/dyld".to_string());
+    let mut no_aot = false;
+    let mut app_icon_path = None;
     while let Some(a) = args.first().cloned() {
         match a.as_str() {
             "--trace-file" => {
@@ -81,6 +88,7 @@ fn main() {
             }
             "--no-aot" => {
                 aot::set_enabled(false);
+                no_aot = true;
                 args.remove(0);
             }
             "--sysroot" => {
@@ -89,6 +97,23 @@ fn main() {
                     usage();
                 }
                 paths::set_cache_dir(&args.remove(0));
+            }
+            "--overlay-root" => {
+                args.remove(0);
+                if args.is_empty() {
+                    usage();
+                }
+                if let Err(e) = paths::set_overlay_root(&args.remove(0)) {
+                    eprintln!("maclator: overlay: {e}");
+                    std::process::exit(1);
+                }
+            }
+            "--app-icon" => {
+                args.remove(0);
+                if args.is_empty() {
+                    usage();
+                }
+                app_icon_path = Some(args.remove(0));
             }
             "--aot" => {
                 args.remove(0);
@@ -118,6 +143,14 @@ fn main() {
                 let n = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(20000);
                 aot::set_enabled(false);
                 jit::selftest::run_selftest(&class, n);
+                let packed = jit::emit::packed_flags_counts();
+                println!("{{\"probe\":\"packed-flags-emission\",\"enabled\":{},\"add\":{},\"sub\":{},\"logic\":{}}}",
+                    jit::emit::packed_flags(), packed[0], packed[1], packed[2]);
+                let ea = jit::emit::effective_address_counts();
+                println!("{{\"probe\":\"effective-address-emission\",\"enabled\":{},\"cached_base\":{},\"memory_base\":{}}}",
+                    jit::emit::effective_address(), ea[0], ea[1]);
+                println!("{{\"probe\":\"cached-store-emission\",\"enabled\":{},\"slot_size_counts\":{:?}}}",
+                    jit::emit::cached_store(), jit::emit::cached_store_counts());
                 std::process::exit(0);
             }
             "-h" | "--help" => usage(),
@@ -139,8 +172,15 @@ fn main() {
             fwd.push("--sysroot".into());
             fwd.push(d);
         }
+        if let Some(root) = paths::overlay_root() {
+            fwd.push("--overlay-root".into());
+            fwd.push(root.to_string_lossy().into_owned());
+        }
         if !jit::JIT_ENABLED.load(Ordering::Relaxed) {
             fwd.push("--interp".into());
+        }
+        if no_aot {
+            fwd.push("--no-aot".into());
         }
         if std::env::var_os("MACLATOR_GPU").is_some() {
             fwd.push("--gpu".into());
@@ -163,6 +203,7 @@ fn main() {
         syscalls::TRACE.store(true, Ordering::Relaxed);
     }
     let exe = resolve_path(&args[0]);
+    macflow::start(&exe);
     let gpu_active = std::env::var_os("MACLATOR_GPU").is_some()
         && std::env::var("MACLATOR_GPU_ONLY").map(|o| args.iter().skip(1).any(|a| a.contains(&o))).unwrap_or(true);
     let mut envp: Vec<String> = std::env::vars()
@@ -172,6 +213,12 @@ fn main() {
 
     if gpu_active && !gpu::inject(&mut envp) {
         eprintln!("maclator: --gpu: libmclmetal.dylib not found (looked next to maclator, in ./gpu, ~/.maclator/gpu, $MACLATOR_GPU_DIR)");
+    }
+    if let Some(icon) = app_icon_path {
+        if let Err(e) = app_icon::inject(&icon, &mut envp) {
+            eprintln!("maclator: app icon: {e}");
+            std::process::exit(1);
+        }
     }
     if std::env::var_os("MACLATOR_TRACE_FILE").is_some() {
         unsafe {
@@ -224,6 +271,9 @@ fn main() {
 }
 
 fn resolve_path(p: &str) -> String {
+    if let Some(physical) = paths::redirect(p) {
+        return physical;
+    }
     if p.contains('/') {
         return std::fs::canonicalize(p).map(|x| x.to_string_lossy().into_owned()).unwrap_or_else(|_| p.to_string());
     }

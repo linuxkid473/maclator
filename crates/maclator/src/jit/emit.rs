@@ -1,19 +1,30 @@
 //! AArch64 -> x86-64 block translator.
 //!
 //! Conventions for generated code:
-//!  * `r15` holds `&mut Cpu`; guest registers live in the Cpu struct.
+//!  * `r15` holds `&mut Cpu`; NZCV always writes through. Opt-in preflighted
+//!    self-loops can keep fixed GPR or scalar SIMD state until exit/helper spill.
+//!    Experimental GPR writeback diagnostics explicitly allow delayed X0..28.
 //!  * `rsp` is 16-byte aligned, so helpers can be `call`ed directly.
 //!  * Generated code never embeds absolute host addresses: helpers and the
 //!    exit trampoline are reached through `[r15 + off]`. Code is therefore
 //!    position independent, which lets the AOT cache store it on disk.
 //!  * Instructions the translator does not handle natively are executed by
 //!    calling the reference interpreter (`HELPER_INTERP`) for that single
-//!    instruction; all guest state is in memory, so this is always safe.
+//!    instruction; all guest state is materialized before the helper is called.
 
 use iced_x86::code_asm::*;
 use maclator_core::cpu::off;
 use maclator_core::interp::simd::vfp_expand_imm;
 use std::collections::HashMap;
+
+// Packed stores must preserve the existing four normalized flag bytes and
+// must never write the adjacent padding or PC. Cpu is pinned and mapped.
+const _: () = {
+    assert!(off::ZF == off::NF + 1);
+    assert!(off::CF == off::NF + 2);
+    assert!(off::VF == off::NF + 3);
+    assert!(off::NF % 2 == 0 && off::CF % 2 == 0);
+};
 
 pub const HELPER_INTERP: usize = 0;
 pub const HELPER_COMMPAGE: usize = 1;
@@ -58,6 +69,8 @@ pub struct Unit {
     /// Emit commpage redirection checks on memory accesses.
     pub commpage_checks: bool,
     pub exit_label: CodeLabel,
+    /// Budget-exhaustion tails kept after the translated blocks.
+    budget_exits: Vec<(CodeLabel, u64, [u8; NCREGS], [u8; 8])>,
     /// Stubs emitted by `finish` (slot init needs their continuation labels).
     pub finished_stubs: Vec<Stub>,
     pub insns_translated: u64,
@@ -66,10 +79,9 @@ pub struct Unit {
     /// touches them); consumed by the very next instruction of the block to branch/select on the
     /// x86 flags directly instead of re-deriving the condition from the stored NZCV bytes.
     pub fuse: Option<FuseKind>,
-    /// Write-through cache of guest general registers in callee-saved x86 registers that the JIT
-    /// never uses otherwise (see `CREGS`). Memory stays authoritative, so faults, signals and
-    /// helper calls always see current values; the cache only saves reloads. Compile-time state,
-    /// reset at every block start.
+    /// Guest GPR cache in callee-saved x86 registers (see CREGS). Normally
+    /// write-through; only the explicit fixed integer selfloop experiment may
+    /// delay mapped X0..28 until materialization. Reset at every block start.
     pub rc: RegCache,
     /// Set once an instruction has created an internal label (conditional code follows): cached
     /// state may then be used but not extended, or paths could disagree about what is cached.
@@ -80,10 +92,168 @@ pub struct Unit {
     /// The flag-setting instruction being translated feeds a fused branch/select and its NZCV bytes
     /// are dead afterwards: skip the four flag stores.
     pub dead_flags: bool,
+    /// Fixed GPR mappings for a self-loop. External entry loads them once;
+    /// only this block's own backedge skips loads. Mapped GPRs normally write
+    /// through; gpr_writeback is the restricted integer-only exception.
+    pub rc_fixed: bool,
+    pub vc: [u8; 8],
+    /// Opt-in scalar-only self-loop writeback. GPR/NZCV remain write-through;
+    /// all exits and helper calls spill this block's fixed vector mapping.
+    pub scalar_writeback: bool,
+    /// Default-OFF, strictly integer ALU/direct-selfloop GPR writeback.
+    pub gpr_writeback: bool,
+    /// Compile-time PC attribution, never dynamic execution counts.
+    pub(super) diagnostic_gpr_plans: Vec<(u64, [u8; NCREGS], bool, &'static str, &'static str)>,
+    pub(super) diagnostic_gpr_store_sites: Vec<u64>,
+    pub loop_body: Option<(u64, CodeLabel)>,
+    pub allow_loop_cache: bool,
+    /// Actual guest register accesses emitted by the preflight translator.
+    /// Operand encodings may contain immediates or XZR; count the real uses.
+    pub gpr_uses: [u32; 32],
+    /// Optional compile-time attribution only; never emits guest/host code.
+    pub(super) diagnostic_guests: Option<Vec<super::diagnostic::GuestAssemblyRange>>,
+    pub(super) diagnostic_rets: Vec<super::diagnostic::RetAssemblyRange>,
+    pub(super) diagnostic_body_end: Option<usize>,
+    pub(super) diagnostic_exit_end: Option<usize>,
 }
 
-pub const NCREGS: usize = 5;
+// r14 holds the chained execution budget; helpers preserve it under SysV.
+pub const NCREGS: usize = 4;
+pub fn register_budget() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("MACLATOR_JIT_REGISTER_BUDGET").as_deref() != Ok("0"))
+}
+/// Keep budget-exhaustion exits outside the common block-entry path.
+pub fn cold_budget() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("MACLATOR_JIT_BUDGET_COLD").as_deref() != Ok("0"))
+}
+/// FMA needs both the instruction and OS support for saving AVX state. Include
+/// this code-generation choice in the AOT cache flags, and allow an A/B opt-out.
+pub fn native_fma() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("MACLATOR_JIT_FMA").as_deref() != Ok("0")
+        && std::is_x86_feature_detected!("avx") && std::is_x86_feature_detected!("fma"))
+}
+pub fn direct_operands() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("MACLATOR_JIT_OPERANDS").as_deref() != Ok("0"))
+}
+/// Consecutive native conditional selects preserve the producer's host flags.
+/// Keep this code-generation choice in AOT flags and allow same-binary A/B.
+pub fn csel_chain() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("MACLATOR_JIT_CSEL_CHAIN").as_deref() != Ok("0"))
+}
+/// Full NZCV write-through in two word stores. SETcc/MOV preserve live
+/// branch flags; architectural state remains current at budget suspension.
+/// Set MACLATOR_JIT_PACKED_FLAGS=0 to compare the byte-store implementation.
+pub fn packed_flags() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("MACLATOR_JIT_PACKED_FLAGS").as_deref() != Ok("0"))
+}
+/// Form a 64-bit LSL register-offset address directly from an existing fixed
+/// loop-cache index. This only removes scratch moves/shift instructions;
+/// access() still applies TBI/commpage handling and performs the same memory
+/// operation. Opt in until whole-workload A/B and application regressions pass.
+pub fn effective_address() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("MACLATOR_JIT_EFFECTIVE_ADDRESS").as_deref() == Ok("1"))
+}
+/// Ordinary GPR stores can read an existing fixed cache slot directly. This
+/// does not change Cpu write-through or the number/width of guest accesses.
+/// Atomic, release, RCpc and pair stores retain their existing access path.
+pub fn cached_store() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("MACLATOR_JIT_CACHED_STORE").as_deref() == Ok("1"))
+}
+/// Shorten the data dependency for ARM top-byte-ignore normalization.
+/// RCX is scratch across commpage_fix; both variants clobber host flags.
+/// Opt in only on BMI2 hosts, and include the effective choice in AOT flags.
+pub fn tbi_bmi2() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("MACLATOR_JIT_TBI_BMI2").as_deref() == Ok("1")
+        && std::is_x86_feature_detected!("bmi2"))
+}
+/// Accept the load bit in existing non-writeback LD1/LD4 structure paths.
+/// Keep the old decoder selectable until SIMD state regressions pass.
+pub fn structure_loads() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("MACLATOR_JIT_STRUCTURE_LOADS").as_deref() == Ok("1")
+        && std::is_x86_feature_detected!("ssse3"))
+}
+/// Use a shorter RET-only IBTC address dependency chain. Both forms select
+/// the same per-thread entry for every 64-bit target and keep the full tag
+/// comparison. RDX is scratch at this terminator; Cpu/cache/budget are unchanged.
+/// Opt in pending same-binary regression and throughput measurements.
+pub fn ret_index() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("MACLATOR_JIT_RET_INDEX").as_deref() == Ok("1"))
+}
+pub fn loop_cache() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("MACLATOR_JIT_LOOP_CACHE").as_deref() != Ok("0"))
+}
+/// Only scalar SIMD slots in a preflighted native direct self-loop may be
+/// authoritative in XMM8..15. Current immediate diagnostics read only
+/// GPR/PC/NZCV/TPIDRRO; guest signal frames observe Cpu after an exit spill.
+/// This is not a protocol for future asynchronous vector-state observers.
+pub fn scalar_writeback() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("MACLATOR_JIT_SCALAR_WRITEBACK").as_deref() == Ok("1"))
+}
+/// Only mapped X0..28 in an audited integer direct selfloop may be delayed.
+/// X29/X30/SP and NZCV stay write-through. Async guest frames are materialized
+/// at dispatcher exits. Host debug/fatal dumps explicitly permit older mapped
+/// GPR values; this is not a synchronous guest-fault resume protocol.
+pub fn gpr_writeback() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("MACLATOR_JIT_GPR_WRITEBACK").as_deref() == Ok("1"))
+}
+pub static GPR_WRITEBACK_BLOCKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static GPR_WRITEBACK_SKIPPED_STORES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SCALAR_WRITEBACK_BLOCKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SCALAR_WRITEBACK_SKIPPED_STORES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Adjacent GPR pairs can transfer directly between a vector and the
+/// authoritative Cpu slots. Cached destinations use PEXTRQ, requiring SSE4.1.
+/// Opt in for experimentation: the whole-workload benchmark found a recursive
+/// call regression with vector transfers through Cpu slots. Keep this choice
+/// in the AOT flags and allow same-binary A/B.
+pub fn pair_fast() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("MACLATOR_JIT_PAIR_FAST").as_deref() == Ok("1")
+        && std::is_x86_feature_detected!("sse4.1"))
+}
+pub static LOOP_CACHE_BLOCKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static VECTOR_LOOP_CACHE_BLOCKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static DEAD_FLAG_SKIPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static DEAD_FLAG_CANDIDATES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Code-emission counts, including preflight/assembler retries. These are not
+/// dynamic execution counts or unique guest blocks.
+pub static EFFECTIVE_ADDRESS_CACHED_BASE_EMISSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static EFFECTIVE_ADDRESS_MEMORY_BASE_EMISSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub fn effective_address_counts() -> [u64; 2] {
+    use std::sync::atomic::Ordering::Relaxed;
+    [EFFECTIVE_ADDRESS_CACHED_BASE_EMISSIONS.load(Relaxed),
+     EFFECTIVE_ADDRESS_MEMORY_BASE_EMISSIONS.load(Relaxed)]
+}
+/// Emission counts by fixed cache slot then log2 access size. May include
+/// assembler retries; never interpret these as dynamic guest store counts.
+pub static CACHED_STORE_EMISSIONS: [std::sync::atomic::AtomicU64; 16] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 16];
+pub fn cached_store_counts() -> [u64; 16] {
+    std::array::from_fn(|i| CACHED_STORE_EMISSIONS[i].load(std::sync::atomic::Ordering::Relaxed))
+}
+pub static PACKED_FLAG_ADD_EMISSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PACKED_FLAG_SUB_EMISSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PACKED_FLAG_LOGIC_EMISSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Code-generation counts, including loop-plan preflight; not dynamic
+/// execution counts. Differential tests also check the final emitted code.
+pub fn packed_flags_counts() -> [u64; 3] {
+    use std::sync::atomic::Ordering::Relaxed;
+    [PACKED_FLAG_ADD_EMISSIONS.load(Relaxed), PACKED_FLAG_SUB_EMISSIONS.load(Relaxed),
+        PACKED_FLAG_LOGIC_EMISSIONS.load(Relaxed)]
+}
 const LOOKAHEAD: usize = 10;
 
 #[derive(Clone, Copy, Default)]
@@ -146,6 +316,7 @@ impl Unit {
             first_slot: None,
             commpage_checks,
             exit_label,
+            budget_exits: Vec::new(),
             finished_stubs: Vec::new(),
             insns_translated: 0,
             insns_fallback: 0,
@@ -154,14 +325,45 @@ impl Unit {
             rc_frozen: false,
             look: Vec::new(),
             dead_flags: false,
+            rc_fixed: false,
+            vc: [0xff; 8],
+            scalar_writeback: false,
+            gpr_writeback: false,
+            diagnostic_gpr_plans: Vec::new(),
+            diagnostic_gpr_store_sites: Vec::new(),
+            loop_body: None,
+            allow_loop_cache: true,
+            gpr_uses: [0; 32],
+            diagnostic_guests: if stub_kind == StubKind::Patchable && super::diagnostic::enabled() {
+                Some(Vec::new())
+            } else { None },
+            diagnostic_rets: Vec::new(),
+            diagnostic_body_end: None,
+            diagnostic_exit_end: None,
         }
     }
 
     /// Emit the shared "jump to dispatcher" tail. Call once after all blocks.
     pub fn finish(&mut self) {
+        if self.diagnostic_guests.is_some() {
+            self.diagnostic_body_end = Some(self.a.instructions().len());
+        }
         let a = &mut self.a;
         a.set_label(&mut self.exit_label).unwrap();
         a.jmp(qword_ptr(r15 + off::JIT_EXIT)).unwrap();
+        if self.diagnostic_guests.is_some() {
+            self.diagnostic_exit_end = Some(self.a.instructions().len());
+        }
+        let budget_exits = std::mem::take(&mut self.budget_exits);
+        for (mut label, pc, regs, vectors) in budget_exits {
+            self.a.set_label(&mut label).unwrap();
+            // An AOT unit may have many loops with different mappings. Never
+            // use the last block's Unit.vc for a previous block's cold exit.
+            spill_gprs(&mut self.a, regs);
+            spill_vectors(&mut self.a, vectors);
+            let mut e = E { u: self, pc, fuse_in: None };
+            e.st_pc_and_exit_clean(pc);
+        }
         let stubs = std::mem::take(&mut self.stubs);
         for mut s in stubs.into_iter() {
             let a = &mut self.a;
@@ -210,6 +412,11 @@ fn r32_of(r: R64) -> R32 {
         x if x == r9 => r9d,
         x if x == r10 => r10d,
         x if x == r11 => r11d,
+        x if x == rbx => ebx,
+        x if x == rbp => ebp,
+        x if x == r12 => r12d,
+        x if x == r13 => r13d,
+        x if x == r14 => r14d,
         _ => panic!("no 32-bit alias"),
     }
 }
@@ -225,6 +432,10 @@ fn r8_of(r: R64) -> AsmRegister8 {
         x if x == r9 => r9b,
         x if x == r10 => r10b,
         x if x == r11 => r11b,
+        x if x == rbx => bl,
+        x if x == rbp => bpl,
+        x if x == r12 => r12b,
+        x if x == r13 => r13b,
         _ => panic!("no 8-bit alias"),
     }
 }
@@ -240,6 +451,10 @@ fn r16_of(r: R64) -> AsmRegister16 {
         x if x == r9 => r9w,
         x if x == r10 => r10w,
         x if x == r11 => r11w,
+        x if x == rbx => bx,
+        x if x == rbp => bp,
+        x if x == r12 => r12w,
+        x if x == r13 => r13w,
         _ => panic!("no 16-bit alias"),
     }
 }
@@ -271,8 +486,30 @@ struct E<'a> {
 }
 
 /// Callee-saved x86 registers the JIT keeps guest registers in (see `RegCache`).
-const CREGS: [R64; NCREGS] = [rbx, rbp, r12, r13, r14];
-const CREGS32: [R32; NCREGS] = [ebx, ebp, r12d, r13d, r14d];
+const CREGS: [R64; NCREGS] = [rbx, rbp, r12, r13];
+const CREGS32: [R32; NCREGS] = [ebx, ebp, r12d, r13d];
+const VCREGS: [AsmRegisterXmm; 8] = [xmm8, xmm9, xmm10, xmm11, xmm12, xmm13, xmm14, xmm15];
+
+/// Spill a specific block's full fixed vector map. No dynamic dirty bitmap is
+/// required: even unwritten slots were loaded from Cpu on the public entry.
+/// MOVDQU does not destroy the host flags consumed by a fused successor.
+/// Full fixed-map spill, including unchanged entry-loaded slots. MOV keeps
+/// live host flags and scratch results intact. Capture this map per source
+/// block; Unit.rc may belong to another block when cold tails are emitted.
+fn spill_gprs(a: &mut CodeAssembler, regs: [u8; NCREGS]) {
+    for (slot, reg) in regs.into_iter().enumerate() {
+        if reg != 0xff {
+            debug_assert!(reg < 29);
+            a.mov(qword_ptr(r15 + xoff(reg as u32)), CREGS[slot]).unwrap();
+        }
+    }
+}
+
+fn spill_vectors(a: &mut CodeAssembler, vectors: [u8; 8]) {
+    for (slot, reg) in vectors.into_iter().enumerate() {
+        if reg != 0xff { a.movdqu(xmmword_ptr(r15 + voff(reg as u32)), VCREGS[slot]).unwrap(); }
+    }
+}
 
 macro_rules! a {
     ($e:expr, $m:ident ( $($arg:expr),* )) => { $e.u.a.$m($($arg),*).unwrap() };
@@ -286,7 +523,8 @@ impl<'a> E<'a> {
         self.u.rc.tick += 1;
         self.u.rc.stamp[s] = self.u.rc.tick;
     }
-    /// Slot for guest register `n` (least recently used one is evicted; memory is up to date).
+    /// Dynamic write-through slot only: eviction sees authoritative memory.
+    /// Fixed mappings never call this allocator.
     fn rc_alloc(&mut self, n: u32) -> usize {
         let rc = &self.u.rc;
         let s = (0..NCREGS).find(|&i| rc.reg[i] == 0xff).unwrap_or_else(|| (0..NCREGS).min_by_key(|&i| rc.stamp[i]).unwrap());
@@ -300,7 +538,47 @@ impl<'a> E<'a> {
         }
     }
     fn rc_clear(&mut self) {
+        if self.u.rc_fixed {
+            // Helpers may change guest registers, but the fixed mapping must
+            // remain identical on every path through the loop.
+            for s in 0..NCREGS {
+                let n = self.u.rc.reg[s];
+                if n != 0xff { a!(self, mov(CREGS[s], qword_ptr(r15 + xoff(n as u32)))); }
+            }
+            return;
+        }
         self.u.rc = RegCache::new();
+    }
+    fn vc_find(&self, n: u32) -> Option<AsmRegisterXmm> {
+        self.u.vc.iter().position(|&r| r as u32 == n).map(|s| VCREGS[s])
+    }
+    fn vc_reload(&mut self) {
+        // Writeback loops spill before calling any helper; other loops remain
+        // write-through. Helpers can clobber caller-saved XMM registers.
+        for s in 0..8 {
+            let n = self.u.vc[s];
+            if n != 0xff { a!(self, movdqu(VCREGS[s], xmmword_ptr(r15 + voff(n as u32)))); }
+        }
+    }
+    fn vc_spill(&mut self) {
+        if self.u.scalar_writeback { spill_vectors(&mut self.u.a, self.u.vc); }
+    }
+    fn rc_spill(&mut self) {
+        if self.u.gpr_writeback { spill_gprs(&mut self.u.a, self.u.rc.reg); }
+    }
+    fn state_spill(&mut self) {
+        self.rc_spill();
+        self.vc_spill();
+    }
+    fn skipped_gpr_store(&mut self) {
+        GPR_WRITEBACK_SKIPPED_STORES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.u.diagnostic_guests.is_some() { self.u.diagnostic_gpr_store_sites.push(self.pc); }
+    }
+    fn scalar_src(&mut self, n: u32, scratch: AsmRegisterXmm, double: bool) -> AsmRegisterXmm {
+        if let Some(r) = self.vc_find(n) { return r; }
+        if double { a!(self, movq(scratch, qword_ptr(r15 + voff(n)))) }
+        else { a!(self, movd(scratch, dword_ptr(r15 + voff(n)))) }
+        scratch
     }
     /// Does a later instruction of this block name guest register `n` in any register field?
     /// (Heuristic: false positives only cost performance.)
@@ -312,17 +590,18 @@ impl<'a> E<'a> {
         self.u.rc_frozen = true;
         self.u.a.create_label()
     }
-    /// Guest register `n` was just written from `r` (already stored to memory).
+    /// Guest register `n` was written from `r`; fixed writeback may delay its Cpu store.
     fn rc_wrote(&mut self, n: u32, r: R64) {
+        self.u.gpr_uses[n as usize] += 1;
         let soon = self.used_soon(n);
         if let Some(s) = self.rc_find(n) {
-            if self.u.rc_frozen || !soon {
+            if !self.u.rc_fixed && (self.u.rc_frozen || !soon) {
                 self.u.rc.reg[s] = 0xff;
             } else {
                 a!(self, mov(CREGS[s], r));
                 self.rc_touch(s);
             }
-        } else if !self.u.rc_frozen && soon {
+        } else if !self.u.rc_fixed && !self.u.rc_frozen && soon {
             let s = self.rc_alloc(n);
             a!(self, mov(CREGS[s], r));
         }
@@ -338,10 +617,11 @@ impl<'a> E<'a> {
     }
     /// Load Xn without touching the x86 flags (n = 31 must be SP).
     fn ldx_nf(&mut self, r: R64, n: u32) {
+        self.u.gpr_uses[n as usize] += 1;
         if let Some(s) = self.rc_find(n) {
             self.rc_touch(s);
             a!(self, mov(r, CREGS[s]));
-        } else if !self.u.rc_frozen && self.used_soon(n) {
+        } else if !self.u.rc_fixed && !self.u.rc_frozen && self.used_soon(n) {
             let s = self.rc_alloc(n);
             a!(self, mov(CREGS[s], qword_ptr(r15 + xoff(n))));
             a!(self, mov(r, CREGS[s]));
@@ -358,10 +638,11 @@ impl<'a> E<'a> {
         }
     }
     fn ldw_nf(&mut self, r: R64, n: u32) {
+        self.u.gpr_uses[n as usize] += 1;
         if let Some(s) = self.rc_find(n) {
             self.rc_touch(s);
             a!(self, mov(r32_of(r), CREGS32[s]));
-        } else if !self.u.rc_frozen && self.used_soon(n) {
+        } else if !self.u.rc_fixed && !self.u.rc_frozen && self.used_soon(n) {
             let s = self.rc_alloc(n);
             a!(self, mov(CREGS[s], qword_ptr(r15 + xoff(n))));
             a!(self, mov(r32_of(r), CREGS32[s]));
@@ -376,12 +657,55 @@ impl<'a> E<'a> {
             self.ldw(r, n, use_sp)
         }
     }
+    /// Read a non-destructive RHS directly from the cache. Call only after
+    /// loading the writable LHS: that load may allocate and evict an old slot.
+    fn rhs(&mut self, n: u32, sf: bool) -> R64 {
+        if n != 31 && direct_operands() {
+            if let Some(s) = self.rc_find(n) {
+                self.u.gpr_uses[n as usize] += 1;
+                self.rc_touch(s);
+                return CREGS[s];
+            }
+        }
+        self.ld(rcx, n, false, sf);
+        rcx
+    }
+    /// Existing fixed mappings cannot be evicted by a base load. The index
+    /// is read without modifying its cache register, including rn == rm.
+    /// The caller admits only option 3 (LSL X-register), shifts 0..=3, and
+    /// a non-XZR index; UXTW/SXTW/SXTX and scale 16 retain the reference path.
+    fn fixed_effective_address(&mut self, rn: u32, rm: u32, shift: u32) -> bool {
+        if !effective_address() || !self.u.rc_fixed || rm == 31 || shift > 3 {
+            return false;
+        }
+        let Some(index_slot) = self.rc_find(rm) else { return false; };
+        self.u.gpr_uses[rm as usize] += 1;
+        self.rc_touch(index_slot);
+        let index = CREGS[index_slot];
+        let base = if let Some(base_slot) = self.rc_find(rn) {
+            self.u.gpr_uses[rn as usize] += 1;
+            self.rc_touch(base_slot);
+            EFFECTIVE_ADDRESS_CACHED_BASE_EMISSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            CREGS[base_slot]
+        } else {
+            self.ldx(rax, rn, true);
+            EFFECTIVE_ADDRESS_MEMORY_BASE_EMISSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            rax
+        };
+        a!(self, lea(rax, qword_ptr(base + index * (1i32 << shift))));
+        true
+    }
     /// Store `r` to Xn (31 = discard, unless `sp`).
     fn stx(&mut self, n: u32, r: R64, use_sp: bool) {
         if n == 31 && !use_sp {
             return;
         }
-        a!(self, mov(qword_ptr(r15 + xoff(n)), r));
+        if self.u.gpr_writeback && self.rc_find(n).is_some() {
+            debug_assert!(n < 29 && self.u.rc_fixed);
+            self.skipped_gpr_store();
+        } else {
+            a!(self, mov(qword_ptr(r15 + xoff(n)), r));
+        }
         self.rc_wrote(n, r);
     }
     fn mov_imm(&mut self, r: R64, v: u64) {
@@ -397,7 +721,17 @@ impl<'a> E<'a> {
         if n == 31 {
             return;
         }
-        self.rc_inval(n);
+        self.u.gpr_uses[n as usize] += 1;
+        if self.u.rc_fixed {
+            if let Some(s) = self.rc_find(n) {
+                a!(self, mov(CREGS[s], v));
+                if self.u.gpr_writeback {
+                    debug_assert!(n < 29);
+                    self.skipped_gpr_store();
+                    return;
+                }
+            }
+        } else { self.rc_inval(n); }
         if v as i64 >= i32::MIN as i64 && v as i64 <= i32::MAX as i64 {
             a!(self, mov(qword_ptr(r15 + xoff(n)), v as i64 as i32));
         } else {
@@ -408,8 +742,21 @@ impl<'a> E<'a> {
     }
 
     /// Store NZCV from the x86 flags of a preceding add/sub/logic op.
+    /// With packed_flags(), ADD/SUB clobber RCX/RDX and logic clobbers RDX.
+    /// Callers must have finished using these scratch operands; RAX and
+    /// fixed CREG results stay intact. All SETcc/MOV preserve host flags.
     fn flags_add(&mut self) {
         if self.u.dead_flags {
+            return;
+        }
+        if packed_flags() {
+            a!(self, sets(dl));
+            a!(self, sete(dh));
+            a!(self, setb(cl));
+            a!(self, seto(ch));
+            a!(self, mov(word_ptr(r15 + off::NF), dx));
+            a!(self, mov(word_ptr(r15 + off::CF), cx));
+            PACKED_FLAG_ADD_EMISSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return;
         }
         a!(self, sets(byte_ptr(r15 + off::NF)));
@@ -421,6 +768,16 @@ impl<'a> E<'a> {
         if self.u.dead_flags {
             return;
         }
+        if packed_flags() {
+            a!(self, sets(dl));
+            a!(self, sete(dh));
+            a!(self, setae(cl));
+            a!(self, seto(ch));
+            a!(self, mov(word_ptr(r15 + off::NF), dx));
+            a!(self, mov(word_ptr(r15 + off::CF), cx));
+            PACKED_FLAG_SUB_EMISSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
         a!(self, sets(byte_ptr(r15 + off::NF)));
         a!(self, sete(byte_ptr(r15 + off::ZF)));
         a!(self, setae(byte_ptr(r15 + off::CF)));
@@ -428,6 +785,14 @@ impl<'a> E<'a> {
     }
     fn flags_logic(&mut self) {
         if self.u.dead_flags {
+            return;
+        }
+        if packed_flags() {
+            a!(self, sets(dl));
+            a!(self, sete(dh));
+            a!(self, mov(word_ptr(r15 + off::NF), dx));
+            a!(self, mov(word_ptr(r15 + off::CF), 0u32));
+            PACKED_FLAG_LOGIC_EMISSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return;
         }
         a!(self, sets(byte_ptr(r15 + off::NF)));
@@ -490,6 +855,26 @@ impl<'a> E<'a> {
         }
     }
 
+    /// AL = 0/1 from live host flags; SETcc does not change those flags.
+    fn setcc_to_al(&mut self, cc: Cc) {
+        match cc {
+            Cc::E => a!(self, sete(al)),
+            Cc::Ne => a!(self, setne(al)),
+            Cc::B => a!(self, setb(al)),
+            Cc::Ae => a!(self, setae(al)),
+            Cc::S => a!(self, sets(al)),
+            Cc::Ns => a!(self, setns(al)),
+            Cc::O => a!(self, seto(al)),
+            Cc::No => a!(self, setno(al)),
+            Cc::A => a!(self, seta(al)),
+            Cc::Be => a!(self, setbe(al)),
+            Cc::L => a!(self, setl(al)),
+            Cc::Ge => a!(self, setge(al)),
+            Cc::G => a!(self, setg(al)),
+            Cc::Le => a!(self, setle(al)),
+        }
+    }
+
     /// Evaluate condition `cond` into `al` (0/1).
     fn cond_to_al(&mut self, cond: u32) {
         let base = cond >> 1;
@@ -524,11 +909,13 @@ impl<'a> E<'a> {
     /// Call the interpreter for one instruction; exit if it reports anything.
     fn fallback(&mut self, insn: u32) {
         self.u.insns_fallback += 1;
+        self.state_spill();
         a!(self, mov(rdi, r15));
         a!(self, mov(esi, insn));
         self.mov_imm(rdx, self.pc);
         a!(self, call(qword_ptr(r15 + off::helper(HELPER_INTERP))));
         self.rc_clear();   // the interpreter may have written any guest register
+        self.vc_reload();
         a!(self, test(eax, eax));
         let exit = self.u.exit_label;
         a!(self, jnz(exit));
@@ -547,11 +934,16 @@ impl<'a> E<'a> {
     /// Jump to a direct successor: inside the unit, or through a stub.
     fn goto(&mut self, target: u64) {
         if !self.u.no_internal_jumps {
+            if let Some((pc, body)) = self.u.loop_body {
+                if target == pc { a!(self, jmp(body)); return; }
+            }
             if let Some(l) = self.u.labels.get(&target).copied() {
+                self.state_spill();
                 a!(self, jmp(l));
                 return;
             }
         }
+        self.state_spill();
         let cont = self.u.a.create_label();
         let slot = self.u.a.create_label();
         if self.u.stub_kind == StubKind::Patchable {
@@ -566,8 +958,13 @@ impl<'a> E<'a> {
     /// Guest effective address in rax; applies commpage redirection if needed.
     fn commpage_fix(&mut self) {
         // arm64 top-byte-ignore: drop bits 63:56 (flags are dead across memory accesses).
-        a!(self, shl(rax, 8));
-        a!(self, shr(rax, 8));
+        if tbi_bmi2() {
+            a!(self, mov(ecx, 56));
+            a!(self, bzhi(rax, rax, rcx));
+        } else {
+            a!(self, shl(rax, 8));
+            a!(self, shr(rax, 8));
+        }
         if !self.u.commpage_checks {
             return;
         }
@@ -578,8 +975,13 @@ impl<'a> E<'a> {
         a!(self, jne(skip));
         a!(self, push(r8));
         a!(self, push(r9));
+        // Only the uncommon commpage/helper arm needs a spill. Ordinary
+        // faulting loads/stores preserve the existing GPR-only fault dump.
+        self.state_spill();
         a!(self, mov(rdi, rax));
         a!(self, call(qword_ptr(r15 + off::helper(HELPER_COMMPAGE))));
+        if self.u.gpr_writeback { self.rc_clear(); }
+        self.vc_reload();
         a!(self, pop(r9));
         a!(self, pop(r8));
         self.u.a.set_label(&mut skip).unwrap();
@@ -697,12 +1099,131 @@ pub fn is_terminator(insn: u32) -> bool {
         || (insn & 0xFFF8_F0E0 == 0xD508_7020)   // IC IVAU (runtime must see it)
 }
 
+fn block_words(u: &Unit, pc: u64, read: &dyn Fn(u64) -> Option<u32>) -> Vec<u32> {
+    let mut words = Vec::new();
+    for i in 0..MAX_BLOCK_INSNS {
+        let cur = pc + i as u64 * 4;
+        if i != 0 && u.labels.contains_key(&cur) { break; }
+        let Some(w) = read(cur) else { break };
+        words.push(w);
+        if is_terminator(w) { break; }
+    }
+    words
+}
+
+fn direct_target(pc: u64, w: u32) -> Option<u64> {
+    if w & 0xfc00_0000 == 0x1400_0000 {
+        Some(pc.wrapping_add((sext((w & 0x03ff_ffff) as u64, 26) << 2) as u64))
+    } else if w & 0xff00_0000 == 0x5400_0000 || w & 0x7e00_0000 == 0x3400_0000 {
+        Some(pc.wrapping_add((sext(((w >> 5) & 0x7ffff) as u64, 19) << 2) as u64))
+    } else if w & 0x7e00_0000 == 0x3600_0000 {
+        Some(pc.wrapping_add((sext(((w >> 5) & 0x3fff) as u64, 14) << 2) as u64))
+    } else { None }
+}
+
+/// Small first-stage GPR allowlist. Reserved widths/shifts and decodings
+/// still have to pass the native preflight. No memory/vector/FP/system/hints,
+/// indirect branches, calls, atomics, exclusives or helper paths are admitted.
+/// Last instruction is B (not BL), B.cond (not BC.cond), CBZ/CBNZ or TBZ/TBNZ.
+pub fn gpr_writeback_eligibility(words: &[u32]) -> Result<(), &'static str> {
+    let Some((&last, body)) = words.split_last() else { return Err("empty_block"); };
+    if !(last & 0xfc00_0000 == 0x1400_0000
+        || last & 0xff00_0010 == 0x5400_0000
+        || last & 0x7e00_0000 == 0x3400_0000
+        || last & 0x7e00_0000 == 0x3600_0000) { return Err("non_direct_branch"); }
+    if body.is_empty() { return Err("empty_loop_body"); }
+    for &w in body {
+        let alu = w & 0x1f80_0000 == 0x1100_0000 // ADD/SUB immediate
+            || w & 0x1f80_0000 == 0x1280_0000  // MOVN/MOVZ/MOVK
+            || w & 0x1f00_0000 == 0x0a00_0000  // logical shifted register
+            || w & 0x1f20_0000 == 0x0b00_0000  // ADD/SUB shifted register
+            || w & 0x7fe0_0000 == 0x1b00_0000; // MADD/MSUB, not long/high multiply
+        if !alu { return Err("outside_integer_alu_allowlist"); }
+    }
+    Ok(())
+}
+
+/// Plan only an entire direct self-loop with native instructions (apart from
+/// scalar FP mode/NaN guards). Never carry a mapping across another entry.
+fn loop_plan(u: &Unit, pc: u64, words: &[u32], read: &dyn Fn(u64) -> Option<u32>)
+    -> Option<([u8; NCREGS], [u8; 8], bool)>
+{
+    if !u.allow_loop_cache || !loop_cache() || u.no_internal_jumps || words.len() < 2 { return None; }
+    let last_pc = pc + (words.len() as u64 - 1) * 4;
+    if direct_target(last_pc, *words.last()?) != Some(pc) { return None; }
+    let mut probe = Unit::new(StubKind::Plain, u.commpage_checks);
+    probe.allow_loop_cache = false;
+    let l = probe.a.create_label();
+    probe.labels.insert(pc, l);
+    emit_block(&mut probe, pc, read);
+    let guards = words.iter().filter(|&&w| {
+        (w & 0xff00_0000 == 0x1f00_0000 && bits(w,23,22) <= 1 && native_fma())
+            || (w & 0xff20_0c00 == 0x1e20_0800 && bits(w,23,22) <= 1
+                && matches!(bits(w,15,12), 0 | 2 | 3))
+    }).count() as u64;
+    if probe.insns_fallback != guards { return None; }
+
+    let g = probe.gpr_uses;
+    let mut v = [0u32; 32];
+    let mut vectors_ok = true;
+    for &w in words {
+        let (rd, rn, rm, ra) = (bits(w,4,0), bits(w,9,5), bits(w,20,16), bits(w,14,10));
+        match bits(w,28,25) {
+            4 | 6 | 12 | 14 => {
+                let is_vec = bit(w,26) != 0;
+                if is_vec {
+                    let ordinary = w & 0x3b00_0000 == 0x3900_0000
+                        || w & 0x3b20_0000 == 0x3800_0000
+                        || w & 0x3b20_0c00 == 0x3820_0800;
+                    let scalar = ordinary && bits(w,31,30) >= 2 && bits(w,23,22) <= 1;
+                    let literal = w & 0x3b00_0000 == 0x1800_0000 && bits(w,31,30) <= 1;
+                    if scalar || literal { v[rd as usize] += 1; } else { vectors_ok = false; }
+                }
+            }
+            7 | 15 => {
+                if w & 0xff00_0000 == 0x1f00_0000 && bits(w,23,22) <= 1 && native_fma() {
+                    for n in [rd,rn,rm,ra] { v[n as usize] += 1; }
+                } else { vectors_ok = false; }
+            }
+            _ => {}
+        }
+    }
+    fn top<const N: usize>(counts: &[u32; 32]) -> [u8; N] {
+        let mut order: Vec<usize> = (0..32).filter(|&i| counts[i] != 0).collect();
+        order.sort_by_key(|&i| (std::cmp::Reverse(counts[i]), i));
+        let mut result = [0xff; N];
+        for (slot, reg) in result.iter_mut().zip(order) { *slot = reg as u8; }
+        result
+    }
+    let mut regs = top(&g);
+    let mut writeback = false;
+    if gpr_writeback() && probe.insns_fallback == 0 && gpr_writeback_eligibility(words).is_ok() {
+        let mut restricted = g;
+        restricted[29..].fill(0);
+        let candidate = top(&restricted);
+        // Count destination writes, not just frequently read operands. Every
+        // allowed body instruction has a GPR destination in bits 4:0.
+        if words[..words.len() - 1].iter().any(|w| candidate.contains(&((w & 31) as u8))) {
+            regs = candidate;
+            writeback = true;
+        }
+    }
+    Some((regs, if vectors_ok { top(&v) } else { [0xff; 8] }, writeback))
+}
+
 /// Translate one basic block starting at `pc` into `u`. The caller must have
 /// created and registered the label for `pc` if it wants intra-unit jumps.
 /// Returns the guest address just past the block.
 pub fn emit_block(u: &mut Unit, pc: u64, read: &dyn Fn(u64) -> Option<u32>) -> u64 {
+    let words = block_words(u, pc, read);
+    let plan = loop_plan(u, pc, &words, read);
     u.fuse = None;
     u.rc = RegCache::new();
+    u.rc_fixed = false;
+    u.vc = [0xff; 8];
+    u.scalar_writeback = false;
+    u.gpr_writeback = false;
+    u.loop_body = None;
     u.rc_frozen = false;
     u.look.clear();
     {
@@ -720,6 +1241,60 @@ pub fn emit_block(u: &mut Unit, pc: u64, read: &dyn Fn(u64) -> Option<u32>) -> u
     u.a.set_label(&mut label).unwrap();
     // set_label updates the label; keep the updated value for label_ip().
     u.labels.insert(pc, label);
+    if let Some((regs, vectors, writeback)) = plan {
+        u.rc.reg = regs;
+        u.rc_fixed = true;
+        u.gpr_writeback = writeback;
+        u.vc = vectors;
+        u.scalar_writeback = scalar_writeback() && vectors != [0xff; 8];
+        for s in 0..NCREGS {
+            if regs[s] != 0xff { u.a.mov(CREGS[s], qword_ptr(r15 + xoff(regs[s] as u32))).unwrap(); }
+        }
+        for s in 0..8 {
+            if vectors[s] != 0xff { u.a.movdqu(VCREGS[s], xmmword_ptr(r15 + voff(vectors[s] as u32))).unwrap(); }
+        }
+        let mut body = u.a.create_label();
+        u.a.set_label(&mut body).unwrap();
+        u.loop_body = Some((pc, body));
+        LOOP_CACHE_BLOCKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if vectors != [0xff; 8] { VECTOR_LOOP_CACHE_BLOCKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+        if u.scalar_writeback { SCALAR_WRITEBACK_BLOCKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+        if u.gpr_writeback { GPR_WRITEBACK_BLOCKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+    }
+    if u.diagnostic_guests.is_some() {
+        let last_pc = pc + words.len().saturating_sub(1) as u64 * 4;
+        let reason = if !gpr_writeback() { "feature_disabled" }
+            else if words.last().and_then(|&w| direct_target(last_pc, w)) != Some(pc) { "not_entire_direct_selfloop" }
+            else if let Err(reason) = gpr_writeback_eligibility(&words) { reason }
+            else if !u.rc_fixed { "native_preflight_or_loop_cache_rejected" }
+            else if !u.gpr_writeback { "no_mapped_destination_write" }
+            else { "accepted_integer_selfloop" };
+        let classes = gpr_writeback_eligibility(&words).err().unwrap_or("integer_alu_and_direct_branch");
+        u.diagnostic_gpr_plans.push((pc, u.rc.reg, u.gpr_writeback, reason, classes));
+    }
+    // Bound chained execution, including backedges that stay in this unit.
+    // NZCV stays write-through. Every writeback loop spills its own fixed
+    // GPR/vector maps on exhaustion; resume at the public entry PC.
+    if register_budget() {
+        u.a.sub(r14, words.len().max(1) as i32).unwrap();
+    } else {
+        u.a.sub(qword_ptr(r15 + off::BUDGET), words.len().max(1) as i32).unwrap();
+    }
+    if cold_budget() {
+        let cold = u.a.create_label();
+        u.a.jb(cold).unwrap();
+        u.budget_exits.push((cold, pc,
+            if u.gpr_writeback { u.rc.reg } else { [0xff; NCREGS] },
+            if u.scalar_writeback { u.vc } else { [0xff; 8] }));
+    } else {
+        let mut ready = u.a.create_label();
+        u.a.jae(ready).unwrap();
+        {
+            let mut e = E { u, pc, fuse_in: None };
+            e.st_pc_and_exit(pc);
+        }
+        u.a.set_label(&mut ready).unwrap();
+    }
     let mut cur = pc;
     let mut count = 0;
     loop {
@@ -741,16 +1316,19 @@ pub fn emit_block(u: &mut Unit, pc: u64, read: &dyn Fn(u64) -> Option<u32>) -> u
                     && count + 1 < MAX_BLOCK_INSNS
                     && disabled_classes() & 32 == 0
                 {
-                    // cmp/adds/ands feeding B.cond: the flags are dead if both successors overwrite them
+                    // A block-entry budget exit exposes NZCV to the dispatcher
+                    // and signal frames before a successor overwrites it. Keep
+                    // the current flags in Cpu memory even for this candidate;
+                    // the branch itself can still consume live host flags.
                     let target = (cur + 4).wrapping_add((sext(((nx >> 5) & 0x7ffff) as u64, 19) << 2) as u64);
                     if flags_dead_at(target, read) && flags_dead_at(cur + 8, read) {
-                        u.dead_flags = true;
-                        DEAD_FLAG_SKIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        DEAD_FLAG_CANDIDATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
             }
         }
         let mut e = E { u, pc: cur, fuse_in };
+        let diagnostic_start = e.u.diagnostic_guests.as_ref().map(|_| e.u.a.instructions().len());
         let term = is_terminator(insn);
         e.u.insns_translated += 1;
         let translated = e.translate(insn);
@@ -761,6 +1339,12 @@ pub fn emit_block(u: &mut Unit, pc: u64, read: &dyn Fn(u64) -> Option<u32>) -> u
             } else {
                 e.fallback(insn);
             }
+        }
+        if let Some(start) = diagnostic_start {
+            let end = e.u.a.instructions().len();
+            e.u.diagnostic_guests.as_mut().unwrap().push(super::diagnostic::GuestAssemblyRange {
+                pc: cur, word: insn, asm_start: start, asm_end: end, native: translated,
+            });
         }
         cur += 4;
         count += 1;
@@ -793,6 +1377,11 @@ pub fn emit_block(u: &mut Unit, pc: u64, read: &dyn Fn(u64) -> Option<u32>) -> u
 
 impl<'a> E<'a> {
     fn st_pc_and_exit(&mut self, pc: u64) {
+        self.state_spill();
+        self.st_pc_and_exit_clean(pc);
+    }
+    /// Caller already materialized the precise source block's GPR/vector maps.
+    fn st_pc_and_exit_clean(&mut self, pc: u64) {
         self.mov_imm(rax, pc);
         a!(self, mov(qword_ptr(r15 + off::PC), rax));
         a!(self, mov(qword_ptr(r15 + off::EXIT_REASON), EXIT_CONTINUE as i32));
@@ -1142,23 +1731,30 @@ impl<'a> E<'a> {
                 self.stx(rd, rax, false);
                 return true;
             }
-            self.ld(rcx, rm, false, sf);
-            self.shift(rcx, ty, amt, sf);
-            if nflag {
-                if sf { a!(self, not(rcx)) } else { a!(self, not(ecx)) }
-            }
-            self.ld(rax, rn, false, sf);
+            let rhs = if amt == 0 && !nflag {
+                self.ld(rax, rn, false, sf);
+                self.rhs(rm, sf)
+            } else {
+                self.ld(rcx, rm, false, sf);
+                self.shift(rcx, ty, amt, sf);
+                if nflag {
+                    if sf { a!(self, not(rcx)) } else { a!(self, not(ecx)) }
+                }
+                self.ld(rax, rn, false, sf);
+                rcx
+            };
             if sf {
                 match opc {
-                    0 | 3 => a!(self, and(rax, rcx)),
-                    1 => a!(self, or(rax, rcx)),
-                    _ => a!(self, xor(rax, rcx)),
+                    0 | 3 => a!(self, and(rax, rhs)),
+                    1 => a!(self, or(rax, rhs)),
+                    _ => a!(self, xor(rax, rhs)),
                 }
             } else {
+                let rhs = r32_of(rhs);
                 match opc {
-                    0 | 3 => a!(self, and(eax, ecx)),
-                    1 => a!(self, or(eax, ecx)),
-                    _ => a!(self, xor(eax, ecx)),
+                    0 | 3 => a!(self, and(eax, rhs)),
+                    1 => a!(self, or(eax, rhs)),
+                    _ => a!(self, xor(eax, rhs)),
                 }
             }
             if opc == 3 {
@@ -1177,10 +1773,16 @@ impl<'a> E<'a> {
             if ty == 3 || (!sf && amt >= 32) {
                 return false;
             }
-            self.ld(rcx, rm, false, sf);
-            self.shift(rcx, ty, amt, sf);
-            self.ld(rax, rn, false, sf);
-            self.addsub(op, sf, s);
+            let rhs = if amt == 0 {
+                self.ld(rax, rn, false, sf);
+                self.rhs(rm, sf)
+            } else {
+                self.ld(rcx, rm, false, sf);
+                self.shift(rcx, ty, amt, sf);
+                self.ld(rax, rn, false, sf);
+                rcx
+            };
+            self.addsub_rhs(op, sf, s, rhs);
             self.stx(rd, rax, false);
             return true;
         }
@@ -1266,18 +1868,28 @@ impl<'a> E<'a> {
             if let Some(k) = self.fuse_in {
                 if let Some(cc_false) = x86_cc(k, cond ^ 1) {
                     // Select on the live x86 flags: nothing below may modify them (no xor/inc/neg).
-                    self.ld_nf(rcx, rn, sf);
-                    self.ld_nf(rdx, rm, sf);
-                    match (op, o2) {
-                        (0, 0) => {}
-                        (0, _) => if sf { a!(self, lea(rdx, qword_ptr(rdx + 1))) } else { a!(self, lea(edx, dword_ptr(rdx + 1))) },
-                        (_, 0) => if sf { a!(self, not(rdx)) } else { a!(self, not(edx)) },
-                        _ => {
-                            if sf { a!(self, not(rdx)); a!(self, lea(rdx, qword_ptr(rdx + 1))) } else { a!(self, not(edx)); a!(self, lea(edx, dword_ptr(rdx + 1))) }
+                    if csel_chain() && op == 0 && o2 == 1 && rn == 31 && rm == 31 {
+                        // CSET alias: 0 when cond holds, 1 otherwise. Do not use
+                        // XOR to clear the register: the next select may reuse flags.
+                        self.setcc_to_al(cc_false);
+                        a!(self, movzx(ecx, al));
+                    } else {
+                        self.ld_nf(rcx, rn, sf);
+                        self.ld_nf(rdx, rm, sf);
+                        match (op, o2) {
+                            (0, 0) => {}
+                            (0, _) => if sf { a!(self, lea(rdx, qword_ptr(rdx + 1))) } else { a!(self, lea(edx, dword_ptr(rdx + 1))) },
+                            (_, 0) => if sf { a!(self, not(rdx)) } else { a!(self, not(edx)) },
+                            _ => {
+                                if sf { a!(self, not(rdx)); a!(self, lea(rdx, qword_ptr(rdx + 1))) } else { a!(self, not(edx)); a!(self, lea(edx, dword_ptr(rdx + 1))) }
+                            }
                         }
+                        self.cmov(cc_false, rcx, rdx, sf);
                     }
-                    self.cmov(cc_false, rcx, rdx, sf);
                     self.stx(rd, rcx, false);
+                    // Loads, NOT, LEA, CMOV/SETcc, MOVZX and cache write-through
+                    // preserve flags. Only this confirmed native path can extend fusion.
+                    if csel_chain() { self.u.fuse = Some(k); }
                     return true;
                 }
             }
@@ -1312,16 +1924,18 @@ impl<'a> E<'a> {
             match (op31, o0) {
                 (0, _) => {
                     self.ld(rax, rn, false, sf);
-                    self.ld(rcx, rm, false, sf);
-                    if sf { a!(self, imul_2(rax, rcx)) } else { a!(self, imul_2(eax, ecx)) }
+                    let rhs = self.rhs(rm, sf);
+                    if sf { a!(self, imul_2(rax, rhs)) } else { a!(self, imul_2(eax, r32_of(rhs))) }
                     if ra != 31 {
-                        self.ld(rcx, ra, false, sf);
                         if o0 == 0 {
-                            if sf { a!(self, add(rax, rcx)) } else { a!(self, add(eax, ecx)) }
+                            let addend = self.rhs(ra, sf);
+                            if sf { a!(self, add(rax, addend)) } else { a!(self, add(eax, r32_of(addend))) }
                         } else if sf {
+                            self.ld(rcx, ra, false, sf);
                             a!(self, sub(rcx, rax));
                             a!(self, mov(rax, rcx));
                         } else {
+                            self.ld(rcx, ra, false, sf);
                             a!(self, sub(ecx, eax));
                             a!(self, mov(eax, ecx));
                         }
@@ -1368,12 +1982,15 @@ impl<'a> E<'a> {
 
     /// rax = rax op rcx with optional flags.
     fn addsub(&mut self, op: u32, sf: bool, s: bool) {
+        self.addsub_rhs(op, sf, s, rcx);
+    }
+    fn addsub_rhs(&mut self, op: u32, sf: bool, s: bool, rhs: R64) {
         if sf {
-            if op == 0 { a!(self, add(rax, rcx)) } else { a!(self, sub(rax, rcx)) }
+            if op == 0 { a!(self, add(rax, rhs)) } else { a!(self, sub(rax, rhs)) }
         } else if op == 0 {
-            a!(self, add(eax, ecx))
+            a!(self, add(eax, r32_of(rhs)))
         } else {
-            a!(self, sub(eax, ecx))
+            a!(self, sub(eax, r32_of(rhs)))
         }
         if s {
             if op == 0 { self.flags_add(); self.u.fuse = Some(FuseKind::Add) } else { self.flags_sub(); self.u.fuse = Some(FuseKind::Sub) }
@@ -1603,14 +2220,20 @@ impl<'a> E<'a> {
             let rt = bits(insn, 4, 0);
             let nz = bit(insn, 24) != 0;
             if rt == 31 {
-                a!(self, xor(eax, eax));
+                self.goto(if nz { next } else { target });
+                return true;
+            } else if let Some(s) = self.rc_find(rt) {
+                if sf {
+                    a!(self, test(CREGS[s], CREGS[s]));
+                } else {
+                    a!(self, test(CREGS32[s], CREGS32[s]));
+                }
             } else if sf {
                 a!(self, cmp(qword_ptr(r15 + xoff(rt)), 0));
             } else {
                 a!(self, cmp(dword_ptr(r15 + xoff(rt)), 0));
             }
-            if nz { a!(self, setne(al)) } else { a!(self, sete(al)) }
-            self.cond_branch(target, next);
+            self.cond_branch_cc(if nz { Cc::E } else { Cc::Ne }, target, next);
             return true;
         }
         if insn & 0x7E00_0000 == 0x3600_0000 {
@@ -1618,10 +2241,13 @@ impl<'a> E<'a> {
             let target = pc.wrapping_add((sext(bits(insn, 18, 5) as u64, 14) << 2) as u64);
             let rt = bits(insn, 4, 0);
             let nz = bit(insn, 24) != 0;
+            if rt == 31 {
+                self.goto(if nz { next } else { target });
+                return true;
+            }
             self.ldx(rax, rt, false);
             a!(self, bt(rax, b));
-            if nz { a!(self, setc(al)) } else { a!(self, setnc(al)) }
-            self.cond_branch(target, next);
+            self.cond_branch_cc(if nz { Cc::Ae } else { Cc::B }, target, next);
             return true;
         }
         if insn & 0xFE00_0000 == 0xD600_0000 {
@@ -1647,6 +2273,7 @@ impl<'a> E<'a> {
         }
         if insn & 0xFFE0_001F == 0xD400_0001 {
             // SVC
+            self.state_spill();
             let imm = bits(insn, 20, 5);
             self.mov_imm(rax, next);
             a!(self, mov(qword_ptr(r15 + off::PC), rax));
@@ -1707,9 +2334,15 @@ impl<'a> E<'a> {
 
     /// al holds the condition; emit taken/not-taken successors.
     fn cond_branch(&mut self, taken: u64, not_taken: u64) {
-        let mut l_nt = self.new_label();
         a!(self, test(al, al));
-        a!(self, jz(l_nt));
+        self.cond_branch_cc(Cc::E, taken, not_taken);
+    }
+
+    /// Branch directly on the existing host flags. Avoid materialising a condition in AL and
+    /// testing it again for CBZ/TBZ, and keep the guest NZCV state unchanged.
+    fn cond_branch_cc(&mut self, cc_not_taken: Cc, taken: u64, not_taken: u64) {
+        let mut l_nt = self.new_label();
+        self.jcc(cc_not_taken, l_nt);
         self.goto(taken);
         self.u.a.set_label(&mut l_nt).unwrap();
         self.goto(not_taken);
@@ -1717,22 +2350,47 @@ impl<'a> E<'a> {
 
     /// Indirect branch to the guest address in rax via the per-thread
     /// indirect-branch table; misses go to the dispatcher.
-    fn indirect(&mut self, _is_ret: bool) {
+    fn indirect(&mut self, is_ret: bool) {
+        // Current eligibility excludes indirect terminators, but preserve the
+        // full boundary if this emitter is ever used with a fixed mapping.
+        self.state_spill();
+        let diagnostic_start = if is_ret && self.u.diagnostic_guests.is_some() {
+            Some(self.u.a.instructions().len())
+        } else { None };
         let mut l_miss = self.new_label();
-        a!(self, mov(rcx, rax));
-        a!(self, shr(ecx, 2));
-        a!(self, and(ecx, (crate::jit::IBTC_SIZE - 1) as i32));
-        a!(self, shl(ecx, 4));
-        a!(self, add(rcx, qword_ptr(r15 + off::IBTC)));
+        if is_ret && ret_index() {
+            // ((target >> 2) & (N - 1)) * 16 ==
+            // (u32(target) & ((N - 1) << 2)) * 4 for N == 32768.
+            // Load the independent base first so it can overlap the mask.
+            a!(self, mov(rdx, qword_ptr(r15 + off::IBTC)));
+            a!(self, mov(ecx, eax));
+            a!(self, and(ecx, ((crate::jit::IBTC_SIZE - 1) << 2) as i32));
+            a!(self, lea(rcx, qword_ptr(rdx + rcx * 4)));
+        } else {
+            a!(self, mov(rcx, rax));
+            a!(self, shr(ecx, 2));
+            a!(self, and(ecx, (crate::jit::IBTC_SIZE - 1) as i32));
+            a!(self, shl(ecx, 4));
+            a!(self, add(rcx, qword_ptr(r15 + off::IBTC)));
+        }
         a!(self, cmp(rax, qword_ptr(rcx)));
         a!(self, jne(l_miss));
+        let diagnostic_hit_start = self.u.a.instructions().len();
         a!(self, jmp(qword_ptr(rcx + 8)));
+        let diagnostic_hit_end = self.u.a.instructions().len();
         self.u.a.set_label(&mut l_miss).unwrap();
         a!(self, mov(qword_ptr(r15 + off::PC), rax));
         a!(self, mov(qword_ptr(r15 + off::EXIT_REASON), EXIT_CONTINUE as i32));
         a!(self, mov(qword_ptr(r15 + off::EXIT_DATA), 0));
         let exit = self.u.exit_label;
         a!(self, jmp(exit));
+        if let Some(start) = diagnostic_start {
+            self.u.diagnostic_rets.push(super::diagnostic::RetAssemblyRange {
+                pc: self.pc, asm_start: start, asm_hit_start: diagnostic_hit_start,
+                asm_hit_end: diagnostic_hit_end,
+                asm_end: self.u.a.instructions().len(),
+            });
+        }
     }
 
     // ---------------- loads and stores ----------------
@@ -1903,7 +2561,7 @@ impl<'a> E<'a> {
             if imm != 0 {
                 a!(self, add(rax, imm as i32));
             }
-            return self.access_sized(rt, v, size, opc);
+            return self.access_sized_ordinary(rt, v, size, opc);
         }
         if insn & 0x3B20_0000 == 0x3800_0000 {
             let size = bits(insn, 31, 30);
@@ -1916,12 +2574,12 @@ impl<'a> E<'a> {
                     if imm != 0 {
                         a!(self, add(rax, imm as i32));
                     }
-                    self.access_sized(rt, v, size, opc)
+                    self.access_sized_ordinary(rt, v, size, opc)
                 }
                 1 => {
                     // post-index: access at base, then base += imm
                     a!(self, mov(r8, rax));
-                    if !self.access_sized(rt, v, size, opc) {
+                    if !self.access_sized_ordinary(rt, v, size, opc) {
                         return false;
                     }
                     a!(self, add(r8, imm as i32));
@@ -1932,7 +2590,7 @@ impl<'a> E<'a> {
                 _ => {
                     a!(self, add(rax, imm as i32));
                     a!(self, mov(r8, rax));
-                    if !self.access_sized(rt, v, size, opc) {
+                    if !self.access_sized_ordinary(rt, v, size, opc) {
                         return false;
                     }
                     a!(self, mov(qword_ptr(r15 + xoff(rn)), r8));
@@ -1951,11 +2609,15 @@ impl<'a> E<'a> {
                 return false;
             }
             let scale = if v && opc & 2 != 0 { 4 } else { size };
+            let shift = if s != 0 { scale } else { 0 };
+            if option == 3 && self.fixed_effective_address(rn, rm, shift) {
+                return self.access_sized_ordinary(rt, v, size, opc);
+            }
             self.ldx(rcx, rm, false);
-            self.extend(rcx, option, if s != 0 { scale } else { 0 });
+            self.extend(rcx, option, shift);
             self.ldx(rax, rn, true);
             a!(self, add(rax, rcx));
-            self.access_sized(rt, v, size, opc)
+            self.access_sized_ordinary(rt, v, size, opc)
         } else {
             false
         }
@@ -1964,29 +2626,37 @@ impl<'a> E<'a> {
     /// Access with LDR/STR (size, opc) semantics at address rax.
     /// Preserves r8 (used for writeback).
     fn access_sized(&mut self, rt: u32, v: bool, size: u32, opc: u32) -> bool {
+        self.access_sized_mode(rt, v, size, opc, false)
+    }
+    /// Only the ordinary LDR/STR decoder calls this entry. try_atomics and
+    /// RCpc/release decoders keep using access_sized/access with false.
+    fn access_sized_ordinary(&mut self, rt: u32, v: bool, size: u32, opc: u32) -> bool {
+        self.access_sized_mode(rt, v, size, opc, true)
+    }
+    fn access_sized_mode(&mut self, rt: u32, v: bool, size: u32, opc: u32, ordinary: bool) -> bool {
         if v {
             let q = opc & 2 != 0;
             if q && size != 0 {
                 return false;
             }
             let kind = if q { 4 } else { size };
-            return self.access(rt, true, kind, opc & 1, false);
+            return self.access_mode(rt, true, kind, opc & 1, false, ordinary);
         }
         // kind: 0..3 = zero-extend size, 5..6 = sign-extend to 64 (b,h), 7 = sign-extend w, 8.. = sign-extend to 32
         match opc {
-            0 => self.access(rt, false, size, 0, false),
-            1 => self.access(rt, false, size, 1, false),
+            0 => self.access_mode(rt, false, size, 0, false, ordinary),
+            1 => self.access_mode(rt, false, size, 1, false, ordinary),
             2 => {
                 if size == 3 {
                     return true; // PRFM
                 }
-                self.access(rt, false, 16 + size, 1, false)
+                self.access_mode(rt, false, 16 + size, 1, false, ordinary)
             }
             _ => {
                 if size >= 2 {
                     return false;
                 }
-                self.access(rt, false, 32 + size, 1, false)
+                self.access_mode(rt, false, 32 + size, 1, false, ordinary)
             }
         }
     }
@@ -1995,18 +2665,54 @@ impl<'a> E<'a> {
     /// kind: 0-3 = 1/2/4/8 bytes; 4 = 16 bytes (SIMD only); 16+s = sign-extend
     /// to 64; 32+s = sign-extend to 32. `load`: 1 = load, 0 = store.
     fn access(&mut self, rt: u32, v: bool, kind: u32, load: u32, literal: bool) -> bool {
+        self.access_mode(rt, v, kind, load, literal, false)
+    }
+    fn access_mode(&mut self, rt: u32, v: bool, kind: u32, load: u32, literal: bool, ordinary: bool) -> bool {
         let _ = literal;
         self.commpage_fix();
         let load = load != 0;
         if v {
+            if matches!(kind, 2 | 3) {
+                if let Some(r) = self.vc_find(rt) {
+                    if load {
+                        if kind == 3 { a!(self, movq(r, qword_ptr(rax))) }
+                        else { a!(self, movd(r, dword_ptr(rax))) }
+                        if self.u.scalar_writeback {
+                            SCALAR_WRITEBACK_SKIPPED_STORES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        } else { a!(self, movdqu(xmmword_ptr(r15 + voff(rt)), r)); }
+                    } else if kind == 3 { a!(self, movq(qword_ptr(rax), r)) }
+                    else { a!(self, movd(dword_ptr(rax), r)) }
+                    return true;
+                }
+            }
             match (kind, load) {
                 (4, true) => {
-                    a!(self, movdqu(xmm0, xmmword_ptr(rax)));
+                    if maclator_core::mem::native_pair_atomic() {
+                        let mut unaligned = self.new_label();
+                        let mut loaded = self.new_label();
+                        a!(self, test(al, 15));
+                        a!(self, jnz(unaligned));
+                        a!(self, vmovdqa(xmm0, xmmword_ptr(rax)));
+                        a!(self, jmp(loaded));
+                        self.u.a.set_label(&mut unaligned).unwrap();
+                        a!(self, movdqu(xmm0, xmmword_ptr(rax)));
+                        self.u.a.set_label(&mut loaded).unwrap();
+                    } else { a!(self, movdqu(xmm0, xmmword_ptr(rax))); }
                     a!(self, movdqu(xmmword_ptr(r15 + voff(rt)), xmm0));
                 }
                 (4, false) => {
                     a!(self, movdqu(xmm0, xmmword_ptr(r15 + voff(rt))));
-                    a!(self, movdqu(xmmword_ptr(rax), xmm0));
+                    if maclator_core::mem::native_pair_atomic() {
+                        let mut unaligned = self.new_label();
+                        let mut stored = self.new_label();
+                        a!(self, test(al, 15));
+                        a!(self, jnz(unaligned));
+                        a!(self, vmovdqa(xmmword_ptr(rax), xmm0));
+                        a!(self, jmp(stored));
+                        self.u.a.set_label(&mut unaligned).unwrap();
+                        a!(self, movdqu(xmmword_ptr(rax), xmm0));
+                        self.u.a.set_label(&mut stored).unwrap();
+                    } else { a!(self, movdqu(xmmword_ptr(rax), xmm0)); }
                 }
                 (k, true) if k < 4 => {
                     match k {
@@ -2055,6 +2761,25 @@ impl<'a> E<'a> {
             }
             self.stx(rt, rcx, false);
         } else {
+            // Source is selected after commpage_fix has returned. A fixed
+            // mapping cannot be evicted and the SysV helper preserves CREGS;
+            // helper_interp refreshes fixed mappings before returning here.
+            // rt==31 must still use XZR, even if SP occupies a cache slot.
+            if ordinary && cached_store() && self.u.rc_fixed && rt != 31 && kind < 4 {
+                if let Some(slot) = self.rc_find(rt) {
+                    self.u.gpr_uses[rt as usize] += 1;
+                    self.rc_touch(slot);
+                    let source = CREGS[slot];
+                    match kind {
+                        0 => a!(self, mov(byte_ptr(rax), r8_of(source))),
+                        1 => a!(self, mov(word_ptr(rax), r16_of(source))),
+                        2 => a!(self, mov(dword_ptr(rax), r32_of(source))),
+                        _ => a!(self, mov(qword_ptr(rax), source)),
+                    }
+                    CACHED_STORE_EMISSIONS[slot * 4 + kind as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return true;
+                }
+            }
             self.ldx(rcx, rt, false);
             match kind {
                 0 => a!(self, mov(byte_ptr(rax), cl)),
@@ -2067,7 +2792,48 @@ impl<'a> E<'a> {
         true
     }
 
+    /// Commit the single aligned guest read in xmm0 to adjacent Cpu GPR slots.
+    /// Keep xmm0 in guest operand order for updating any fixed cache entries.
+    fn pair_gpr_load_slots(&mut self, rt: u32, rt2: u32) {
+        debug_assert!(rt < 31 && rt2 < 31 && rt.abs_diff(rt2) == 1);
+        debug_assert!(self.u.rc_frozen);
+        if rt2 == rt + 1 {
+            a!(self, movdqu(xmmword_ptr(r15 + xoff(rt)), xmm0));
+        } else {
+            a!(self, pshufd(xmm1, xmm0, 0x4e));
+            a!(self, movdqu(xmmword_ptr(r15 + xoff(rt2)), xmm1));
+        }
+        for (n, high) in [(rt, false), (rt2, true)] {
+            self.u.gpr_uses[n as usize] += 1;
+            if let Some(s) = self.rc_find(n) {
+                if self.u.rc_fixed {
+                    if high { a!(self, pextrq(CREGS[s], xmm0, 1)); }
+                    else { a!(self, movq(CREGS[s], xmm0)); }
+                    self.rc_touch(s);
+                } else {
+                    // This instruction has an aligned/ordinary join. Match
+                    // stx's frozen-cache invalidation on both generated paths.
+                    self.u.rc.reg[s] = 0xff;
+                }
+            }
+        }
+    }
+
+    /// Prepare an adjacent GPR store pair in xmm0. Guest writes are always
+    /// write-through, so Cpu slots also contain the current cached sources.
+    fn pair_gpr_store_slots(&mut self, rt: u32, rt2: u32) {
+        debug_assert!(rt < 31 && rt2 < 31 && rt.abs_diff(rt2) == 1);
+        let first = rt.min(rt2);
+        a!(self, movdqu(xmm0, xmmword_ptr(r15 + xoff(first))));
+        if rt2 < rt { a!(self, pshufd(xmm0, xmm0, 0x4e)); }
+        for n in [rt, rt2] {
+            self.u.gpr_uses[n as usize] += 1;
+            if let Some(s) = self.rc_find(n) { self.rc_touch(s); }
+        }
+    }
+
     fn pair(&mut self, insn: u32) -> bool {
+        debug_assert!(!self.u.gpr_writeback, "pair emitters require Cpu GPR write-through");
         let opc = bits(insn, 31, 30);
         let v = bit(insn, 26) != 0;
         let idx = bits(insn, 24, 23);
@@ -2106,6 +2872,53 @@ impl<'a> E<'a> {
         if l && !v && rt == rt2 {
             return false;
         }
+        let atomic_pair = kind == 3 && maclator_core::mem::native_pair_atomic();
+        let fast_gpr_pair = !v && rt < 31 && rt2 < 31 && rt.abs_diff(rt2) == 1 && pair_fast();
+        let mut ordinary = self.u.a.create_label();
+        let mut accessed = self.u.a.create_label();
+        if atomic_pair {
+            self.u.rc_frozen = true;
+            self.commpage_fix();
+            a!(self, test(al, 15));
+            a!(self, jnz(ordinary));
+            if l {
+                // One aligned read preserves ARM LSE2 single-copy atomicity,
+                // including when the guest mapping is read-only.
+                a!(self, vmovdqa(xmm0, xmmword_ptr(rax)));
+                if fast_gpr_pair {
+                    self.pair_gpr_load_slots(rt, rt2);
+                } else {
+                    if v {
+                        a!(self, movq(xmm1, xmm0));
+                        a!(self, movdqu(xmmword_ptr(r15 + voff(rt)), xmm1));
+                    } else {
+                        a!(self, movq(rcx, xmm0));
+                        self.stx(rt, rcx, false);
+                    }
+                    a!(self, psrldq(xmm0, 8));
+                    if v { a!(self, movdqu(xmmword_ptr(r15 + voff(rt2)), xmm0)); }
+                    else { a!(self, movq(rcx, xmm0)); self.stx(rt2, rcx, false); }
+                }
+            } else {
+                if fast_gpr_pair {
+                    self.pair_gpr_store_slots(rt, rt2);
+                } else {
+                    if v {
+                        a!(self, movq(xmm0, qword_ptr(r15 + voff(rt))));
+                        a!(self, movq(xmm1, qword_ptr(r15 + voff(rt2))));
+                    } else {
+                        self.ldx(rcx, rt, false);
+                        a!(self, movq(xmm0, rcx));
+                        self.ldx(rcx, rt2, false);
+                        a!(self, movq(xmm1, rcx));
+                    }
+                    a!(self, punpcklqdq(xmm0, xmm1));
+                }
+                a!(self, vmovdqa(xmmword_ptr(rax), xmm0));
+            }
+            a!(self, jmp(accessed));
+            self.u.a.set_label(&mut ordinary).unwrap();
+        }
         if !self.access(rt, v, kind, l as u32, false) {
             return false;
         }
@@ -2113,6 +2926,7 @@ impl<'a> E<'a> {
         if !self.access(rt2, v, kind, l as u32, false) {
             return false;
         }
+        if atomic_pair { self.u.a.set_label(&mut accessed).unwrap(); }
         if idx == 1 || idx == 3 {
             a!(self, mov(qword_ptr(r15 + xoff(rn)), r8));
             self.rc_wrote(rn, r8);
@@ -2584,7 +3398,8 @@ impl<'a> E<'a> {
         }
 
         // ---- LD1 / ST1 (multiple structures, 1-4 registers, optional post-index) ----
-        if insn & 0xBFFF_0000 == 0x0C00_0000 || insn & 0xBFA0_0000 == 0x0C80_0000 {
+        let multiple_mask = if structure_loads() { 0xBFBF_0000 } else { 0xBFFF_0000 };
+        if insn & multiple_mask == 0x0C00_0000 || insn & 0xBFA0_0000 == 0x0C80_0000 {
             let post = bit(insn, 23) != 0;
             let load = bit(insn, 22) != 0;
             let nregs = match bits(insn, 15, 12) {
@@ -2634,6 +3449,89 @@ impl<'a> E<'a> {
 
         // ---- scalar floating point ----
         let ftype = bits(insn, 23, 22);
+        // FMADD/FMSUB/FNMADD/FNMSUB. A hardware result can only differ from
+        // the reference's NaN selection when it is NaN itself. Check the result
+        // before any guest write; all NaNs and non-default FP modes go through
+        // the reference. Finite results retain hardware single rounding.
+        if insn & 0xFF00_0000 == 0x1F00_0000 && ftype <= 1 && native_fma() {
+            let saved_rc = self.u.rc;
+            let saved_frozen = self.u.rc_frozen;
+            let double = ftype == 1;
+            let ra = bits(insn, 14, 10);
+            let mode = (bit(insn, 21), bit(insn, 15));
+            let mut slow = self.new_label();
+            let mut done = self.new_label();
+            a!(self, cmp(qword_ptr(r15 + off::FPCR as i32), 0));
+            a!(self, jne(slow));
+            let n = self.scalar_src(rn, xmm0, double);
+            let m = self.scalar_src(rm, xmm1, double);
+            let addend = self.scalar_src(ra, xmm2, double);
+            // A loop accumulator can stay in its XMM register. NaN guards
+            // still run before the authoritative guest memory is changed.
+            // Writeback cannot overwrite the prior accumulator before the NaN
+            // guard: a helper must receive the latest *original* guest inputs.
+            // Compute in scratch and publish to the fixed map only after the
+            // guard and scalar high-lane clearing have both succeeded.
+            let accumulator = if rd == ra && !self.u.scalar_writeback { self.vc_find(rd) } else { None };
+            let result = accumulator.unwrap_or(xmm0);
+            if accumulator.is_some() {
+                if double {
+                    match mode {
+                        (0, 0) => a!(self, vfmadd231sd(result, n, m)),
+                        (0, _) => a!(self, vfnmadd231sd(result, n, m)),
+                        (_, 0) => a!(self, vfnmsub231sd(result, n, m)),
+                        _ => a!(self, vfmsub231sd(result, n, m)),
+                    }
+                } else {
+                    match mode {
+                        (0, 0) => a!(self, vfmadd231ss(result, n, m)),
+                        (0, _) => a!(self, vfnmadd231ss(result, n, m)),
+                        (_, 0) => a!(self, vfnmsub231ss(result, n, m)),
+                        _ => a!(self, vfmsub231ss(result, n, m)),
+                    }
+                }
+            } else if double {
+                if n != xmm0 { a!(self, movaps(xmm0, n)); }
+                match mode {
+                    (0, 0) => a!(self, vfmadd213sd(xmm0, m, addend)),
+                    (0, _) => a!(self, vfnmadd213sd(xmm0, m, addend)),
+                    (_, 0) => a!(self, vfnmsub213sd(xmm0, m, addend)),
+                    _ => a!(self, vfmsub213sd(xmm0, m, addend)),
+                }
+            } else {
+                if n != xmm0 { a!(self, movaps(xmm0, n)); }
+                match mode {
+                    (0, 0) => a!(self, vfmadd213ss(xmm0, m, addend)),
+                    (0, _) => a!(self, vfnmadd213ss(xmm0, m, addend)),
+                    (_, 0) => a!(self, vfnmsub213ss(xmm0, m, addend)),
+                    _ => a!(self, vfmsub213ss(xmm0, m, addend)),
+                }
+            }
+            a!(self, vzeroupper());
+            if double { a!(self, ucomisd(result, result)) } else { a!(self, ucomiss(result, result)) }
+            a!(self, jp(slow));
+            // ARM scalar writes clear all higher lanes. The AVX scalar FMA
+            // preserves source high lanes, so clear them explicitly.
+            if double { a!(self, movq(result, result)) }
+            else { a!(self, movd(eax, result)); a!(self, movd(result, eax)); }
+            if let Some(dst) = self.vc_find(rd) {
+                if dst != result { a!(self, movaps(dst, result)); }
+            }
+            if self.u.scalar_writeback && self.vc_find(rd).is_some() {
+                SCALAR_WRITEBACK_SKIPPED_STORES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else { a!(self, movdqu(xmmword_ptr(r15 + voff(rd)), result)); }
+            a!(self, jmp(done));
+            self.u.a.set_label(&mut slow).unwrap();
+            self.fallback(insn);
+            self.u.a.set_label(&mut done).unwrap();
+            a!(self, nop());
+            // Both paths only change vector state; helper_interp is a normal
+            // ABI call and preserves the callee-saved cache registers. The
+            // local branch therefore does not invalidate/freeze GPR caching.
+            self.u.rc = saved_rc;
+            self.u.rc_frozen = saved_frozen;
+            return true;
+        }
         // FMOV to/from general registers
         if insn & 0x7F3E_FC00 == 0x1E26_0000 {
             let sf = bit(insn, 31) != 0;
@@ -2695,6 +3593,14 @@ impl<'a> E<'a> {
             if opcode > 3 {
                 return false;
             }
+            let saved_rc = self.u.rc;
+            let saved_frozen = self.u.rc_frozen;
+            let mut slow = self.new_label();
+            let mut done = self.new_label();
+            if opcode != 1 {
+                a!(self, cmp(qword_ptr(r15 + off::FPCR as i32), 0));
+                a!(self, jne(slow));
+            }
             let double = ftype == 1;
             if double {
                 a!(self, movsd_2(xmm0, qword_ptr(r15 + voff(rn))));
@@ -2715,6 +3621,15 @@ impl<'a> E<'a> {
             }
             self.fix_default_nan(double);
             a!(self, movdqu(xmmword_ptr(r15 + voff(rd)), xmm0));
+            if opcode != 1 {
+                a!(self, jmp(done));
+                self.u.a.set_label(&mut slow).unwrap();
+                self.fallback(insn);
+                self.u.a.set_label(&mut done).unwrap();
+                a!(self, nop());
+            }
+            self.u.rc = saved_rc;
+            self.u.rc_frozen = saved_frozen;
             return true;
         }
         // FSQRT
@@ -3661,7 +4576,8 @@ impl<'a> E<'a> {
         }
 
         // ---- LD4 / ST4 (multiple structures), 128-bit, b/h/s elements ----
-        if !q && (insn & 0xBFFF_F000 == 0x0C00_0000 || insn & 0xBFA0_F000 == 0x0C80_0000) {
+        let structure_mask = if structure_loads() { 0xBFBF_F000 } else { 0xBFFF_F000 };
+        if !q && (insn & structure_mask == 0x0C00_0000 || insn & 0xBFA0_F000 == 0x0C80_0000) {
             let post = bit(insn, 23) != 0;
             let load = bit(insn, 22) != 0;
             if !post && bits(insn, 20, 16) != 0 {
@@ -3748,7 +4664,7 @@ impl<'a> E<'a> {
             }
             return true;
         }
-        if q && (insn & 0xBFFF_F000 == 0x0C00_0000 || insn & 0xBFA0_F000 == 0x0C80_0000) {
+        if q && (insn & structure_mask == 0x0C00_0000 || insn & 0xBFA0_F000 == 0x0C80_0000) {
             let post = bit(insn, 23) != 0;
             let load = bit(insn, 22) != 0;
             if !post && bits(insn, 20, 16) != 0 {

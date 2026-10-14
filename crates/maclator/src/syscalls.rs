@@ -86,6 +86,7 @@ pub fn handle_svc(cpu: &mut Cpu) {
     }
     let mut n = num as u64;
     let mut args = [cpu.x[0], cpu.x[1], cpu.x[2], cpu.x[3], cpu.x[4], cpu.x[5], cpu.x[6], cpu.x[7]];
+    let original_args = args;
     if n == SYS_SYSCALL {
         n = args[0];
         args = [args[1], args[2], args[3], args[4], args[5], args[6], args[7], 0];
@@ -98,10 +99,17 @@ pub fn handle_svc(cpu: &mut Cpu) {
     if trace {
         eprintln!("[sys]   -> {}{:#x}", if cpu.cf != 0 { "ERR " } else { "" }, cpu.x[0]);
     }
+    // Host callbacks never run ARM code, and must interrupt host waits so we
+    // can deliver at a guest boundary. For SA_RESTART, save a context that
+    // retries this SVC after the guest signal trampoline has returned.
+    if cpu.cf != 0 && cpu.x[0] == libc::EINTR as u64 && crate::signals::should_restart(n) {
+        cpu.x[..8].copy_from_slice(&original_args);
+        cpu.pc = cpu.pc.wrapping_sub(4);
+    }
 }
 
-/// Guest paths of open fds under the redirected cache prefixes ("/", "/System", ...),
-/// so `openat(dirfd, "rel")` walks (as dyld does) can be resolved to a full guest path.
+/// Guest paths of open fds, so relative *at lookups can resolve both the dyld
+/// cache and optional Xcode component overlay without changing the host files.
 static FD_VPATHS: std::sync::Mutex<Option<std::collections::HashMap<i32, String>>> = std::sync::Mutex::new(None);
 
 fn vpath_join(base: &str, rel: &str) -> String {
@@ -112,12 +120,90 @@ fn vpath_join(base: &str, rel: &str) -> String {
     }
 }
 
+fn fd_guest_path(fd: i32) -> Option<String> {
+    if let Some(path) = FD_VPATHS.lock().unwrap().as_ref().and_then(|m| m.get(&fd).cloned()) {
+        return Some(path);
+    }
+    // A descriptor may have been inherited from a native parent. Recover its
+    // guest spelling from the host path rather than requiring a prior open.
+    if crate::paths::overlay_root().is_some() {
+        let mut path = [0u8; 1024];
+        if unsafe { libc::fcntl(fd, libc::F_GETPATH, path.as_mut_ptr()) } == 0 {
+            let end = path.iter().position(|&c| c == 0)?;
+            let host = std::str::from_utf8(&path[..end]).ok()?;
+            return crate::paths::guest_path(host).or_else(|| Some(host.to_string()));
+        }
+    }
+    None
+}
+
+fn rewrite_fd_path(cpu: &mut Cpu, args: &[u64; 8]) {
+    let mut path = [0u8; 1024];
+    if !crate::guestmem::read(args[2], &mut path) {
+        return;
+    }
+    let Some(end) = path.iter().position(|&c| c == 0) else { return };
+    let Ok(host) = std::str::from_utf8(&path[..end]) else { return };
+    let Some(guest) = crate::paths::guest_path(host) else { return };
+    let Ok(guest) = std::ffi::CString::new(guest) else { return };
+    if !crate::guestmem::write(args[2], guest.as_bytes_with_nul()) {
+        set_err(cpu, libc::EFAULT as u64);
+    }
+}
+
+fn rewrite_fullpath_attribute(cpu: &mut Cpu, n: u64, args: &[u64; 8]) {
+    // The general attribute buffer contains variable layouts. Handle only the
+    // exact FULLPATH-only request whose ABI is a length and one attrreference;
+    // never reinterpret a mixed attribute list using this small layout.
+    let (attrs, out, capacity) = if n == 476 { (args[2], args[3], args[4]) } else { (args[1], args[2], args[3]) };
+    let mut requested = [0u8; 24];
+    if !crate::guestmem::read(attrs, &mut requested) ||
+        u16::from_le_bytes(requested[0..2].try_into().unwrap()) != 5 ||
+        u32::from_le_bytes(requested[4..8].try_into().unwrap()) != 0x0800_0000 ||
+        requested[8..24].iter().any(|&b| b != 0) {
+        return;
+    }
+    let mut header = [0u8; 12];
+    if capacity < 12 || !crate::guestmem::read(out, &mut header) {
+        return;
+    }
+    let old_size = u32::from_le_bytes(header[0..4].try_into().unwrap()) as u64;
+    let offset = i32::from_le_bytes(header[4..8].try_into().unwrap()) as i64;
+    let length = u32::from_le_bytes(header[8..12].try_into().unwrap()) as u64;
+    if offset < 8 || length == 0 || length > 1024 || old_size > capacity ||
+        (offset as u64).checked_add(4 + length).is_none_or(|end| end > old_size) {
+        return;
+    }
+    let mut path = vec![0u8; length as usize];
+    if !crate::guestmem::read(out + 4 + offset as u64, &mut path) {
+        return;
+    }
+    let Some(end) = path.iter().position(|&c| c == 0) else { return };
+    let Ok(host) = std::str::from_utf8(&path[..end]) else { return };
+    let Some(guest) = crate::paths::guest_path(host) else { return };
+    let Ok(guest) = std::ffi::CString::new(guest) else { return };
+    let bytes = guest.as_bytes_with_nul();
+    let size = (12 + bytes.len() + 3) & !3;
+    if size as u64 > capacity {
+        set_err(cpu, libc::ERANGE as u64);
+        return;
+    }
+    let mut rewritten = vec![0u8; size];
+    rewritten[0..4].copy_from_slice(&(size as u32).to_le_bytes());
+    rewritten[4..8].copy_from_slice(&8i32.to_le_bytes());
+    rewritten[8..12].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+    rewritten[12..12 + bytes.len()].copy_from_slice(bytes);
+    if !crate::guestmem::write(out, &rewritten) {
+        set_err(cpu, libc::EFAULT as u64);
+    }
+}
+
 fn bsd(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
     // Path-taking syscalls: (path arg index, dirfd arg index for *at variants).
     let (pidx, at) = match n {
         5 | 398 => (Some(0), false),
         33 | 58 | 188 | 190 | 220 | 338 | 340 => (Some(0), false),
-        463 | 464 | 469 | 470 => (Some(1), true),
+        463 | 464 | 466 | 469 | 470 | 473 | 476 => (Some(1), true),
         _ => (None, false),
     };
     let mut keep: Option<std::ffi::CString> = None;
@@ -129,7 +215,7 @@ fn bsd(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
                 Some(orig.clone())
             } else if at {
                 let dfd = args[0] as i32;
-                FD_VPATHS.lock().unwrap().as_ref().and_then(|m| m.get(&dfd).map(|b| vpath_join(b, &orig)))
+                fd_guest_path(dfd).map(|b| vpath_join(&b, &orig))
             } else {
                 None
             };
@@ -137,7 +223,13 @@ fn bsd(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
                 eprintln!("[path] #{n} {orig} -> {full:?}");
             }
             if let Some(full) = full {
-                if let Some(new) = crate::paths::redirect(&full) {
+                // A relative path beneath an overlaid directory may be absent
+                // from the payload. In that case fall back to the real guest
+                // absolute path, rather than looking only inside the overlay.
+                let replacement = crate::paths::redirect(&full).or_else(|| {
+                    (at && !orig.starts_with('/') && crate::paths::overlay_root().is_some()).then(|| full.clone())
+                });
+                if let Some(new) = replacement {
                     if let Ok(c) = std::ffi::CString::new(new) {
                         args[i] = c.as_ptr() as u64;
                         if at {
@@ -152,14 +244,36 @@ fn bsd(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
     }
     bsd_inner(cpu, n, args);
     drop(keep);
+    if cpu.cf == 0 && crate::paths::overlay_root().is_some() {
+        if matches!(n, 92 | 406) && matches!(args[1], 50 | 102) {
+            rewrite_fd_path(cpu, &args);
+        } else if matches!(n, 220 | 228 | 476) {
+            rewrite_fullpath_attribute(cpu, n, &args);
+        }
+    }
     if matches!(n, 5 | 398 | 463 | 464) && cpu.cf == 0 {
+        // An untracked open can reuse a descriptor number previously populated
+        // by dup2 or inherited files: do not leave a stale virtual path behind.
+        if let Some(m) = FD_VPATHS.lock().unwrap().as_mut() {
+            m.remove(&(cpu.x[0] as i32));
+        }
         if let Some(g) = guest_path {
-            if g == "/" || g.starts_with("/System") {
+            if g == "/" || g.starts_with("/System") || crate::paths::overlay_root().is_some() {
                 let g = if g.len() > 1 { g.trim_end_matches('/').to_string() } else { g };
                 FD_VPATHS.lock().unwrap().get_or_insert_with(Default::default).insert(cpu.x[0] as i32, g);
             }
         }
-    } else if matches!(n, 6 | 399) {
+    } else if cpu.cf == 0 && (matches!(n, 41 | 90) || (matches!(n, 92 | 406) && matches!(args[1], 0 | 67))) {
+        let source = fd_guest_path(args[0] as i32);
+        let target = if n == 90 { args[1] as i32 } else { cpu.x[0] as i32 };
+        let mut paths = FD_VPATHS.lock().unwrap();
+        let paths = paths.get_or_insert_with(Default::default);
+        if let Some(path) = source {
+            paths.insert(target, path);
+        } else {
+            paths.remove(&target);
+        }
+    } else if matches!(n, 6 | 399) && cpu.cf == 0 {
         if let Some(m) = FD_VPATHS.lock().unwrap().as_mut() {
             m.remove(&(args[0] as i32));
         }
@@ -198,14 +312,22 @@ fn bsd_inner(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
             }
         }
         SYS_SIGALTSTACK => {
-            if args[1] != 0 {
-                unsafe { std::ptr::write_bytes(args[1] as *mut u8, 0, 24) };
-                unsafe { *((args[1] + 16) as *mut u32) = 4 }; // SS_DISABLE
+            match crate::signals::sigaltstack(args[0], args[1]) {
+                Ok(()) => set_ok(cpu, 0, 0),
+                Err(e) => set_err(cpu, e as u64),
             }
-            set_ok(cpu, 0, 0);
         }
         SYS_SIGRETURN => {
-            crate::signals::sigreturn(cpu, args[0], args[1] as i32);
+            if let Err(e) = crate::signals::sigreturn(cpu, args[0], args[1] as i32, args[2]) {
+                set_err(cpu, e as u64);
+            }
+        }
+        111 => { // sigsuspend: its argument is a mask value, not a pointer.
+            let r = hostsys::unix(n, &args);
+            if r.carry && r.rax == libc::EINTR as u64 {
+                crate::signals::interrupted_suspend(args[0] as u32);
+            }
+            set_res(cpu, r);
         }
         SYS_MMAP => {
             let was_exec = args[2] & PROT_EXEC != 0;
@@ -314,10 +436,15 @@ fn bsd_inner(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
             let r = crate::workq::kevent_redirect(n, &args).unwrap_or_else(|| hostsys::unix(n, &args));
             set_res(cpu, r);
         }
-        // bsdthread_ctl(BSDTHREAD_CTL_SET_SELF): thread QoS/priority/voucher. Guest threads are
-        // host threads we schedule ourselves, and the host kernel rejects some arm64-era
-        // priority combinations with EINVAL (libdispatch then aborts), so just accept it.
-        478 if args[0] == 0x100 => set_ok(cpu, 0, 0),
+        // Translate requested QoS through the public host pthread API. Never
+        // pass ARM priority/voucher combinations into the host syscall: a host
+        // EINVAL here makes guest libdispatch abort. Host errors are counted.
+        478 if args[0] == 0x100 => {
+            if args[3] & 0x1 != 0 {
+                crate::macflow::set_guest_priority(args[1]);
+            }
+            set_ok(cpu, 0, 0);
+        }
         92 if matches!(args[1], 59 | 61 | 97 | 98 | 103) => {
             // Code-signing fcntls (F_ADDSIGS, F_ADDFILESIGS[_RETURN/_INFO], F_CHECK_LV):
             // the Intel host kernel cannot validate arm64 signatures, so accept them.
@@ -434,7 +561,11 @@ fn sysctl_override(name: &str) -> Option<i64> {
         "hw.optional.neon" | "hw.optional.AdvSIMD" | "hw.optional.floatingpoint" => 1,
         "hw.optional.armv8_crc32" | "hw.optional.arm.FEAT_CRC32" => 1,
         "hw.optional.armv8_1_atomics" | "hw.optional.arm.FEAT_LSE" => 1,
-        "hw.optional.arm.FEAT_LSE2" | "hw.optional.arm.FEAT_LRCPC" | "hw.optional.arm.FEAT_LRCPC2" => 1,
+        // Aligned 128-bit pairs are supported on AVX Intel/AMD hosts, but
+        // LSE2 also promises unaligned accesses within a 16-byte granule.
+        // Do not advertise the full feature until that contract is met.
+        "hw.optional.arm.FEAT_LSE2" => 0,
+        "hw.optional.arm.FEAT_LRCPC" | "hw.optional.arm.FEAT_LRCPC2" => 1,
         "hw.optional.arm.FEAT_PAuth" | "hw.optional.arm.FEAT_JSCVT" | "hw.optional.arm.FEAT_FlagM"
         | "hw.optional.arm.FEAT_FlagM2" | "hw.optional.arm.FEAT_DotProd" | "hw.optional.arm.FEAT_FRINTTS"
         | "hw.optional.arm.FEAT_SB" | "hw.optional.arm.FEAT_DPB" | "hw.optional.arm.FEAT_DPB2" => 1,

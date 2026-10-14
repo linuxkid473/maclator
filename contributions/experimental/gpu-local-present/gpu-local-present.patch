@@ -1,0 +1,269 @@
+--- a/gpu/mclmetal.m
++++ b/gpu/mclmetal.m
+@@ -29,6 +29,12 @@
+ static NSMapTable *gProxies; // handle -> proxy (weak)
+ static NSLock *gProxyLock;
+ static BOOL gTrace;
++// Experimental and default OFF. Keeps actual guest CAMetalDrawable objects local.
++static BOOL gLocalPresent;
++@class MCLProxy;
++static BOOL local_present_record(MCLProxy *command, SEL selector, id drawable);
++static BOOL local_present_commit(MCLProxy *command);
++
+ 
+ static void mcl_init(void) {
+     static dispatch_once_t once;
+@@ -36,6 +42,7 @@
+         gProxies = [[NSMapTable mapTableWithKeyOptions:NSPointerFunctionsOpaquePersonality | NSPointerFunctionsOpaqueMemory valueOptions:NSPointerFunctionsOpaquePersonality | NSPointerFunctionsOpaqueMemory] retain];
+         gProxyLock = [NSLock new];
+         gTrace = getenv("MCL_TRACE") != NULL;
++        gLocalPresent = getenv("MCL_LOCAL_PRESENT") && strcmp(getenv("MCL_LOCAL_PRESENT"), "1") == 0;
+         gStats = getenv("MCL_STATS") != NULL;
+         gNoFast = getenv("MCL_NOFAST") != NULL;
+         gNoAsync = getenv("MCL_NOASYNC") != NULL;
+@@ -190,10 +197,21 @@
+     if (gStats) legacy_note(sel);
+     NSMethodSignature *sig = inv.methodSignature;
+     NSMutableArray *args = [NSMutableArray array];
++    NSString *selName = @(sel_getName(sel));
++    // The first call and MCL_NOFAST use forwarding. Intercept before encoding
++    // CAMetalDrawable as a descriptor; the fast hook below handles later calls.
++    if (gLocalPresent) {
++        if ([selName hasPrefix:@"presentDrawable:"] && sig.numberOfArguments >= 3) {
++            __unsafe_unretained id drawable = nil;
++            [inv getArgument:&drawable atIndex:2];
++            if (local_present_record(self, sel, drawable)) return;
++        } else if ([selName isEqualToString:@"commit"] && sig.numberOfArguments == 2) {
++            if (local_present_commit(self)) return;
++        }
++    }
++    // Hooks above may throw; allocate no raw out slots until they have returned.
+     // Reflection and error are separate out objects on pipeline-creation APIs.
+-    // Keep one caller slot per argument instead of treating every ^@ as NSError **.
+     id **objectOut = calloc(sig.numberOfArguments, sizeof(id *));
+-    NSString *selName = @(sel_getName(sel));
+     NSArray *parts = [selName componentsSeparatedByString:@":"];
+     for (NSUInteger i = 2; i < sig.numberOfArguments; i++) {
+         const char *t = [sig getArgumentTypeAtIndex:i];
+@@ -424,7 +442,20 @@
+             NSDictionary *ent = [[gBlocks[ev[@"blk"]] retain] autorelease]; // survive removal below
+             if ([ent[@"once"] boolValue]) [gBlocks removeObjectForKey:ev[@"blk"]];
+             [gBlockLock unlock];
+-            if (!ent) { atomic_fetch_add(&gEvHandled, 1); continue; }
++            if (!ent) {
++                // A cancelled internal completion may still arrive if transport
++                // lost a reply after host acceptance. Decode/discard its mentions
++                // rather than losing their normal proxy reference accounting.
++                if (gLocalPresent) {
++                    @try {
++                        for (id value in ev[@"args"]) (void)decode(value, NO);
++                    } @catch (NSException *exception) {
++                        fprintf(stderr, "[mclmetal] orphan event cleanup exception: %s: %s\n", exception.name.UTF8String, exception.reason.UTF8String);
++                    }
++                }
++                atomic_fetch_add(&gEvHandled, 1);
++                continue;
++            }
+             void *a[4] = {0, 0, 0, 0};
+             NSMutableArray *keep = [NSMutableArray array];
+             NSArray *args = ev[@"args"];
+@@ -446,6 +477,179 @@
+         }
+     }
+     return NULL;
++}
++
++
++// ---- experimental local guest drawable presentation ----------------------------------
++// Default OFF. This revision accepts local presentation and its actual commit
++// only on the guest main thread, and reports real synchronous commit failures.
++// A proxy with no local drawable keeps the original command-buffer commit path.
++static char gLocalPresentKey;
++static pthread_mutex_t gLocalPresentLock = PTHREAD_MUTEX_INITIALIZER;
++
++static BOOL local_command_proxy(MCLProxy *command) {
++    return object_getClass(command) == gProxyClass &&
++           [command->_protos containsObject:@"MTLCommandBuffer"];
++}
++
++static BOOL local_guest_drawable(id drawable) {
++    if (!drawable || object_getClass(drawable) != objc_getClass("CAMetalDrawable")) return NO;
++    id texture = ((id(*)(id, SEL))objc_msgSend)(drawable, sel_registerName("texture"));
++    id layer = ((id(*)(id, SEL))objc_msgSend)(drawable, sel_registerName("layer"));
++    if (!texture || object_getClass(texture) != gProxyClass || !layer ||
++        object_getClass(layer) != objc_getClass("CAMetalLayer")) return NO;
++    id device = ((id(*)(id, SEL))objc_msgSend)(layer, sel_registerName("device"));
++    return device && object_getClass(device) == gProxyClass &&
++           [((MCLProxy *)texture)->_protos containsObject:@"MTLTexture"] &&
++           [((MCLProxy *)device)->_protos containsObject:@"MTLDevice"];
++}
++
++// Caller holds gLocalPresentLock. No host calls, queue flushes or user callbacks
++// occur while holding this state lock.
++static NSMutableDictionary *local_present_state(MCLProxy *command, NSString *initialPhase) {
++    NSMutableDictionary *state = objc_getAssociatedObject(command, &gLocalPresentKey);
++    if (!state) {
++        state = [NSMutableDictionary dictionaryWithObjectsAndKeys:
++                 [NSMutableArray array], @"drawables", initialPhase, @"phase", @NO, @"cancelled", nil];
++        objc_setAssociatedObject(command, &gLocalPresentKey, state, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
++    }
++    return state;
++}
++
++static BOOL local_present_record(MCLProxy *command, SEL selector, id drawable) {
++    if (!local_command_proxy(command) || !local_guest_drawable(drawable)) return NO;
++    if (strcmp(sel_getName(selector), "presentDrawable:") != 0) {
++        [NSException raise:@"MCLLocalPresentUnsupported"
++                    format:@"Experimental local presentation supports only presentDrawable:; %@ is not implemented", NSStringFromSelector(selector)];
++    }
++    if (![NSThread isMainThread]) {
++        [NSException raise:@"MCLLocalPresentThreadUnsupported" format:@"Experimental local present registration requires the guest main thread"];
++    }
++    // MTLCommandBuffer NotEnqueued=0, Enqueued=1, Committed=2.
++    uint64_t status = ((uint64_t(*)(id, SEL))objc_msgSend)(command, sel_registerName("status"));
++    if (status >= 2) {
++        [NSException raise:@"MCLLocalPresentInvalidState" format:@"presentDrawable: must precede commandBuffer commit (status=%llu)", status];
++    }
++    pthread_mutex_lock(&gLocalPresentLock);
++    NSMutableDictionary *state = local_present_state(command, @"pending");
++    NSMutableArray *drawables = state[@"drawables"];
++    BOOL pending = [state[@"phase"] isEqualToString:@"pending"];
++    BOOL duplicate = [drawables containsObject:drawable];
++    BOOL full = drawables.count >= 16;
++    if (pending && !duplicate && !full) [drawables addObject:drawable];
++    pthread_mutex_unlock(&gLocalPresentLock);
++    if (!pending || duplicate || full) {
++        [NSException raise:@"MCLLocalPresentInvalidState" format:@"Experimental present registration rejected (pending=%d duplicate=%d limit=%d)", pending, duplicate, full];
++    }
++    if (gTrace) fprintf(stderr, "[mclmetal] local present recorded h=%llu drawable=%s\n", command->_h, object_getClassName(drawable));
++    return YES;
++}
++
++static void local_present_cancel_block(NSDictionary *encoded) {
++    [gBlockLock lock];
++    [gBlocks removeObjectForKey:encoded[@"blk"]];
++    [gBlockLock unlock];
++}
++
++// YES means this function performed the only actual host commit. Both callers
++// must return immediately and must not encode/forward another commit afterward.
++static BOOL local_present_commit(MCLProxy *command) {
++    if (!local_command_proxy(command)) return NO;
++    pthread_mutex_lock(&gLocalPresentLock);
++    NSMutableDictionary *state = local_present_state(command, @"sealed");
++    NSString *phase = state[@"phase"];
++    if ([phase isEqualToString:@"sealed"]) {
++        // Seal empty states before the original commit. A concurrent late local
++        // registration cannot be accepted after this hook has seen no drawable.
++        pthread_mutex_unlock(&gLocalPresentLock);
++        return NO;
++    }
++    BOOL pending = [phase isEqualToString:@"pending"];
++    BOOL mainThread = [NSThread isMainThread];
++    if (!pending || !mainThread) {
++        pthread_mutex_unlock(&gLocalPresentLock);
++        [NSException raise:@"MCLLocalPresentInvalidState" format:@"Local command commit rejected (pending=%d guest_main=%d); concurrent/repeated/cross-thread local commits are unsupported", pending, mainThread];
++    }
++    state[@"phase"] = @"preparing";
++    NSArray *drawables = [state[@"drawables"] copy];
++    pthread_mutex_unlock(&gLocalPresentLock);
++
++    NSDictionary *encoded = nil;
++    @try {
++        // MRC copies retain both the snapshot and cancellation state. Capture no
++        // command proxy, so command associated state cannot own itself in a cycle.
++        encoded = encodeBlock(^(id completedCommand) {
++            uint64_t status = 0;
++            @try {
++                if (!completedCommand || !local_command_proxy(completedCommand)) {
++                    fprintf(stderr, "[mclmetal] local present skipped: invalid completed command proxy\n");
++                    return;
++                }
++                status = ((uint64_t(*)(id, SEL))objc_msgSend)(completedCommand, sel_registerName("status"));
++            } @catch (NSException *exception) {
++                fprintf(stderr, "[mclmetal] local present skipped: completion status exception: %s: %s\n", exception.name.UTF8String, exception.reason.UTF8String);
++                return; // internal RPC failure must not escape the event pump
++            }
++            if (status != 4) { // MTLCommandBufferStatusCompleted
++                fprintf(stderr, "[mclmetal] local present skipped: GPU command status=%llu\n", status);
++                return;
++            }
++            dispatch_async(dispatch_get_main_queue(), ^{
++                if (![NSThread isMainThread]) {
++                    fprintf(stderr, "[mclmetal] local present skipped: guest main queue is not on main thread\n");
++                    return;
++                }
++                pthread_mutex_lock(&gLocalPresentLock);
++                BOOL accepted = ![state[@"cancelled"] boolValue] && [state[@"phase"] isEqualToString:@"accepted"];
++                pthread_mutex_unlock(&gLocalPresentLock);
++                // The synchronous local commit runs on this same main thread.
++                // This task cannot run before its success/failure verdict; a
++                // queued completion after a failed commit must not present.
++                if (!accepted) {
++                    fprintf(stderr, "[mclmetal] local present skipped: host commit was not accepted\n");
++                    return;
++                }
++                for (id drawable in drawables) {
++                    @try {
++                        if (gTrace) fprintf(stderr, "[mclmetal] local present on guest main thread drawable=%s\n", object_getClassName(drawable));
++                        ((void(*)(id, SEL))objc_msgSend)(drawable, sel_registerName("present"));
++                    } @catch (NSException *exception) {
++                        fprintf(stderr, "[mclmetal] local present exception: %s: %s\n", exception.name.UTF8String, exception.reason.UTF8String);
++                    }
++                }
++            });
++            // gEvHandled tracks enqueueing only, never main-queue execution.
++        }, @"addCompletedHandler:");
++        NSDictionary *registered = mcl_rpc(@{@"c": @"msg", @"h": @(command->_h),
++                                             @"sel": @"addCompletedHandler:", @"args": @[encoded]});
++        if (registered[@"x"]) {
++            [NSException raise:@"MCLLocalPresentRegistrationFailed" format:@"%@", registered[@"x"]];
++        }
++        if (gTrace) fprintf(stderr, "[mclmetal] local present completion armed h=%llu\n", command->_h);
++        // Synchronous RPC reports native Objective-C commit rejection. Earlier
++        // batch work was flushed before registration; no fast commit is queued.
++        NSDictionary *committed = mcl_rpc(@{@"c": @"msg", @"h": @(command->_h),
++                                            @"sel": @"commit", @"args": @[]});
++        if (committed[@"x"]) {
++            [NSException raise:@"MCLLocalPresentCommitFailed" format:@"%@", committed[@"x"]];
++        }
++        pthread_mutex_lock(&gLocalPresentLock);
++        state[@"phase"] = @"accepted";
++        [state[@"drawables"] removeAllObjects];
++        pthread_mutex_unlock(&gLocalPresentLock);
++        if (gTrace) fprintf(stderr, "[mclmetal] local present host commit accepted h=%llu\n", command->_h);
++    } @catch (NSException *exception) {
++        pthread_mutex_lock(&gLocalPresentLock);
++        state[@"cancelled"] = @YES;
++        state[@"phase"] = @"failed";
++        [state[@"drawables"] removeAllObjects];
++        pthread_mutex_unlock(&gLocalPresentLock);
++        if (encoded) local_present_cancel_block(encoded);
++        [drawables release];
++        @throw; // caller receives failure; internal completion cannot present it
++    }
++    [drawables release];
++    return YES;
+ }
+ 
+ // Number of elements of a `const id *` argument, derived from the selector's shape.
+@@ -1111,6 +1315,19 @@
+     MCLProxy *self = (MCLProxy *)R[0];
+     Plan *pl = plan_find((SEL)R[1]);
+     if (!pl) { fprintf(stderr, "[mclmetal] no plan for %s\n", sel_getName((SEL)R[1])); return 0; }
++    // This hook must precede tq()->busy=1: completion registration flushes
++    // earlier queued work and must not reenter a half-built fast record.
++    if (gLocalPresent) {
++        if (strncmp(pl->name, "presentDrawable:", 16) == 0 && pl->nargs >= 1 &&
++            pl->a[0].cls == AK_ID && local_present_record(self, pl->sel, (id)R[pl->a[0].xi])) {
++            pl->nCalls++;
++            return 0;
++        }
++        if (pl->isCommit && pl->nargs == 0 && local_present_commit(self)) {
++            pl->nCalls++;
++            return 0; // the helper submitted exactly once through synchronous RPC
++        }
++    }
+     uint64_t t0 = gStats ? mach_absolute_time() : 0;
+     uint64_t self_h = self->_h;
+     uint64_t ckey = 0;

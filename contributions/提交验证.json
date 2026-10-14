@@ -1,0 +1,357 @@
+{
+  "runtime_sha256": "04c091e6fd27afa680343a222a7d97818143104d4e1f71591cdebbfe01f1ed03",
+  "selftest_processes": 15,
+  "selftests": [
+    {
+      "case": "budgetflags",
+      "count": null,
+      "environment": {},
+      "exit_code": 0,
+      "passed": true,
+      "summary": [
+        "jit selftest [budgetflags]: checkpoints=60 mismatch=0 missing_dead_flag_coverage=0"
+      ]
+    },
+    {
+      "case": "branchcache",
+      "count": "1200",
+      "environment": {},
+      "exit_code": 0,
+      "passed": true,
+      "summary": [
+        "jit selftest [branchcache]: ok=1200 mismatch=0 native=1200"
+      ]
+    },
+    {
+      "case": "fma",
+      "count": "2000",
+      "environment": {},
+      "exit_code": 0,
+      "passed": true,
+      "summary": [
+        "jit selftest [fma]: ok=34768 mismatch=0 edge_cases=32768 random=2000 native_fma=true"
+      ]
+    },
+    {
+      "case": "operandcache",
+      "count": "4000",
+      "environment": {},
+      "exit_code": 0,
+      "passed": true,
+      "summary": [
+        "jit selftest [operandcache]: ok=4000 mismatch=0 blocks=4000 direct_operands=true"
+      ]
+    },
+    {
+      "case": "fp-modes",
+      "count": "2000",
+      "environment": {},
+      "exit_code": 0,
+      "passed": true,
+      "summary": [
+        "jit selftest [fp-modes]: ok=34768 mismatch=0 edges=32768 random=2000 default_fast=150"
+      ]
+    },
+    {
+      "case": "loopcache",
+      "count": "500",
+      "environment": {},
+      "exit_code": 0,
+      "passed": true,
+      "summary": [
+        "jit selftest [loopcache-pairs]: ok=48 checkpoints=336 yields=288 pair_fast=false loop_cache=true register_budget=true",
+        "jit selftest [loopcache]: ok=1284 mismatch=0 yields=7023 cached=2566 vector_cached=1780 clobbering_helper_calls=11829"
+      ]
+    },
+    {
+      "case": "cselchain",
+      "count": "2000",
+      "environment": {},
+      "exit_code": 0,
+      "passed": true,
+      "summary": [
+        "jit selftest [cselchain]: ok=5072 mismatch=0 fixed=3072 random=2000 retained=1824 discarded=3248 fallback_cases=1250 enabled=true"
+      ]
+    },
+    {
+      "case": "effectiveaddress",
+      "count": null,
+      "environment": {
+        "MACLATOR_JIT_EFFECTIVE_ADDRESS": "0"
+      },
+      "exit_code": 0,
+      "passed": true,
+      "summary": [
+        "jit selftest [effectiveaddress]: ok=3728 mismatch=0 checkpoints=29824 yields=26096 cached_base_emissions=0 memory_base_emissions=0 helper_calls=6524 options=[0, 0, 840, 1024, 0, 0, 840, 1024] shifts=[2360, 496, 408, 320, 144] shapes=[736, 736, 368, 736, 736, 416] locations=[932, 932, 932, 932]"
+      ]
+    },
+    {
+      "case": "effectiveaddress",
+      "count": null,
+      "environment": {
+        "MACLATOR_JIT_EFFECTIVE_ADDRESS": "1"
+      },
+      "exit_code": 0,
+      "passed": true,
+      "summary": [
+        "jit selftest [effectiveaddress]: ok=3728 mismatch=0 checkpoints=29824 yields=26096 cached_base_emissions=1264 memory_base_emissions=352 helper_calls=6524 options=[0, 0, 840, 1024, 0, 0, 840, 1024] shifts=[2360, 496, 408, 320, 144] shapes=[736, 736, 368, 736, 736, 416] locations=[932, 932, 932, 932]"
+      ]
+    },
+    {
+      "case": "cachedstore",
+      "count": null,
+      "environment": {
+        "MACLATOR_JIT_CACHED_STORE": "0"
+      },
+      "exit_code": 0,
+      "passed": true,
+      "summary": [
+        "jit selftest [cachedstore]: ok=3104 mismatch=0 checkpoints=24832 yields=21728 slot_size_emissions=[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] helper_calls=5572 interp_calls=2240 modes=[384, 448, 320, 256, 256, 320, 320, 160, 320, 320] shapes=[672, 480, 64, 64, 608, 608, 608]"
+      ]
+    },
+    {
+      "case": "cachedstore",
+      "count": null,
+      "environment": {
+        "MACLATOR_JIT_CACHED_STORE": "1"
+      },
+      "exit_code": 0,
+      "passed": true,
+      "summary": [
+        "jit selftest [cachedstore]: ok=3104 mismatch=0 checkpoints=24832 yields=21728 slot_size_emissions=[152, 128, 152, 128, 128, 128, 152, 128, 128, 148, 128, 128, 128, 148, 128, 128] helper_calls=5572 interp_calls=2240 modes=[384, 448, 320, 256, 256, 320, 320, 160, 320, 320] shapes=[672, 480, 64, 64, 608, 608, 608]"
+      ]
+    },
+    {
+      "case": "scalarwriteback",
+      "count": null,
+      "environment": {
+        "MACLATOR_JIT_SCALAR_WRITEBACK": "0"
+      },
+      "exit_code": 0,
+      "passed": true,
+      "summary": [
+        "jit selftest [scalarwriteback]: checked=25920 mismatch=0 blocks=0 skipped_cpu_store_emissions=0 original_helper_checks=41760 clobbering_commpage_calls=62640"
+      ]
+    },
+    {
+      "case": "scalarwriteback",
+      "count": null,
+      "environment": {
+        "MACLATOR_JIT_SCALAR_WRITEBACK": "1"
+      },
+      "exit_code": 0,
+      "passed": true,
+      "summary": [
+        "jit selftest [scalarwriteback]: checked=25920 mismatch=0 blocks=480 skipped_cpu_store_emissions=1440 original_helper_checks=41760 clobbering_commpage_calls=62640"
+      ]
+    },
+    {
+      "case": "gprwriteback",
+      "count": null,
+      "environment": {
+        "MACLATOR_JIT_GPR_WRITEBACK": "0"
+      },
+      "exit_code": 0,
+      "passed": true,
+      "summary": [
+        "jit selftest [gprwriteback]: checked=16648 mismatch=0 blocks=0 skipped_cpu_store_emissions=0 chained_transfers=38 public_reentries=6 rejected_shapes=17"
+      ]
+    },
+    {
+      "case": "gprwriteback",
+      "count": null,
+      "environment": {
+        "MACLATOR_JIT_GPR_WRITEBACK": "1"
+      },
+      "exit_code": 0,
+      "passed": true,
+      "summary": [
+        "jit selftest [gprwriteback]: checked=16648 mismatch=0 blocks=36 skipped_cpu_store_emissions=216 chained_transfers=38 public_reentries=6 rejected_shapes=17"
+      ]
+    }
+  ],
+  "spawn": {
+    "thin-arm": {
+      "exit_code": 0,
+      "expected_architecture": "arm64",
+      "passed": true
+    },
+    "fat32-be-arm": {
+      "exit_code": 0,
+      "expected_architecture": "arm64",
+      "passed": true
+    },
+    "fat32-le-arm": {
+      "exit_code": 0,
+      "expected_architecture": "arm64",
+      "passed": true
+    },
+    "fat64-be-arm": {
+      "exit_code": 0,
+      "expected_architecture": "arm64",
+      "passed": true
+    },
+    "fat64-le-arm": {
+      "exit_code": 0,
+      "expected_architecture": "arm64",
+      "passed": true
+    },
+    "late-native": {
+      "exit_code": 0,
+      "expected_architecture": "x86_64",
+      "passed": true
+    }
+  },
+  "signal_modes": {
+    "register": [
+      {
+        "case": "basic",
+        "returncode": 0,
+        "timeout": false,
+        "success": true
+      },
+      {
+        "case": "mask",
+        "returncode": 0,
+        "timeout": false,
+        "success": true
+      },
+      {
+        "case": "suspend",
+        "returncode": 0,
+        "timeout": false,
+        "success": true
+      },
+      {
+        "case": "altstack",
+        "returncode": 0,
+        "timeout": false,
+        "success": true
+      },
+      {
+        "case": "registers",
+        "returncode": 0,
+        "timeout": false,
+        "success": true
+      },
+      {
+        "case": "nested",
+        "returncode": 0,
+        "timeout": false,
+        "success": true
+      },
+      {
+        "case": "reset",
+        "returncode": 0,
+        "timeout": false,
+        "success": true
+      },
+      {
+        "case": "read",
+        "returncode": 0,
+        "timeout": false,
+        "success": true
+      },
+      {
+        "case": "restart",
+        "returncode": 0,
+        "timeout": false,
+        "success": true
+      },
+      {
+        "case": "worker",
+        "returncode": 0,
+        "timeout": false,
+        "success": true
+      },
+      {
+        "case": "alarm",
+        "returncode": 0,
+        "timeout": false,
+        "success": true
+      },
+      {
+        "case": "invalid",
+        "returncode": 0,
+        "timeout": false,
+        "success": true
+      }
+    ],
+    "memory": [
+      {
+        "case": "basic",
+        "returncode": 0,
+        "timeout": false,
+        "success": true
+      },
+      {
+        "case": "mask",
+        "returncode": 0,
+        "timeout": false,
+        "success": true
+      },
+      {
+        "case": "suspend",
+        "returncode": 0,
+        "timeout": false,
+        "success": true
+      },
+      {
+        "case": "altstack",
+        "returncode": 0,
+        "timeout": false,
+        "success": true
+      },
+      {
+        "case": "registers",
+        "returncode": 0,
+        "timeout": false,
+        "success": true
+      },
+      {
+        "case": "nested",
+        "returncode": 0,
+        "timeout": false,
+        "success": true
+      },
+      {
+        "case": "reset",
+        "returncode": 0,
+        "timeout": false,
+        "success": true
+      },
+      {
+        "case": "read",
+        "returncode": 0,
+        "timeout": false,
+        "success": true
+      },
+      {
+        "case": "restart",
+        "returncode": 0,
+        "timeout": false,
+        "success": true
+      },
+      {
+        "case": "worker",
+        "returncode": 0,
+        "timeout": false,
+        "success": true
+      },
+      {
+        "case": "alarm",
+        "returncode": 0,
+        "timeout": false,
+        "success": true
+      },
+      {
+        "case": "invalid",
+        "returncode": 0,
+        "timeout": false,
+        "success": true
+      }
+    ]
+  },
+  "all_passed": true,
+  "new_performance_measurement": false
+}

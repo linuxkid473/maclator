@@ -1,0 +1,31 @@
+[package]
+name = "macflow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[dependencies]
+macflow-protocol = { path = "../protocol" }
+macflow-core = { path = "../core" }
+macflow-platform = { path = "../platform" }
+serde.workspace = true
+serde_json.workspace = true
+libc.workspace = true
+objc2.workspace = true
+objc2-foundation.workspace = true
+objc2-app-kit.workspace = true
+objc2-service-management.workspace = true
+block2.workspace = true
+
+[[bin]]
+name = "macflow"
+path = "src/bin/cli.rs"
+[[bin]]
+name = "macflow-agent"
+path = "src/bin/agent.rs"
+[[bin]]
+name = "macflow-helper"
+path = "src/bin/helper.rs"
+[[bin]]
+name = "macflow-ui"
+path = "src/bin/app.rs"
+

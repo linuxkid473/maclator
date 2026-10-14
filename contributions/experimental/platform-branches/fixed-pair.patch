@@ -1,0 +1,214 @@
+--- a/crates/maclator/src/jit/emit.rs
++++ b/crates/maclator/src/jit/emit.rs
+@@ -135,6 +135,21 @@
+     *ENABLED.get_or_init(|| std::env::var("MACLATOR_JIT_PAIR_FAST").as_deref() == Ok("1")
+         && std::is_x86_feature_detected!("sse4.1"))
+ }
++/// Experimental aligned GPR64 pair loads for a fixed self-loop mapping only.
++/// Keep the single atomic guest read, commit adjacent Cpu slots together, and
++/// extract only destinations that are actually resident in the fixed cache.
++/// Ordinary blocks keep the original scalar Cpu commits and cache behavior.
++pub fn pair_fixed_fast() -> bool {
++    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ENABLED.get_or_init(|| std::env::var("MACLATOR_JIT_PAIR_FIXED").as_deref() == Ok("1")
++        && std::is_x86_feature_detected!("sse4.1"))
++}
++/// Translation counts grouped by zero, one or two cached destinations.
++pub static PAIR_FIXED_LOADS: [std::sync::atomic::AtomicU64; 3] = [
++    std::sync::atomic::AtomicU64::new(0),
++    std::sync::atomic::AtomicU64::new(0),
++    std::sync::atomic::AtomicU64::new(0),
++];
+ pub static LOOP_CACHE_BLOCKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+ pub static VECTOR_LOOP_CACHE_BLOCKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+ pub static DEAD_FLAG_SKIPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+@@ -2428,6 +2443,31 @@
+         }
+     }
+ 
++    /// A fixed-loop-only variant avoids all GPR extraction for uncached
++    /// destinations. Cpu memory remains authoritative before the next guest
++    /// instruction, including across external re-entry and budget suspension.
++    fn pair_gpr_load_fixed_slots(&mut self, rt: u32, rt2: u32) {
++        debug_assert!(self.u.rc_fixed && self.u.rc_frozen);
++        debug_assert!(rt < 31 && rt2 < 31 && rt.abs_diff(rt2) == 1);
++        let mut cached = 0;
++        for (n, high) in [(rt, false), (rt2, true)] {
++            self.u.gpr_uses[n as usize] += 1;
++            if let Some(s) = self.rc_find(n) {
++                if high { a!(self, pextrq(CREGS[s], xmm0, 1)); }
++                else { a!(self, movq(CREGS[s], xmm0)); }
++                self.rc_touch(s);
++                cached += 1;
++            }
++        }
++        if rt2 == rt + 1 {
++            a!(self, movdqu(xmmword_ptr(r15 + xoff(rt)), xmm0));
++        } else {
++            a!(self, pshufd(xmm1, xmm0, 0x4e));
++            a!(self, movdqu(xmmword_ptr(r15 + xoff(rt2)), xmm1));
++        }
++        PAIR_FIXED_LOADS[cached].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++    }
++
+     /// Prepare an adjacent GPR store pair in xmm0. Guest writes are always
+     /// write-through, so Cpu slots also contain the current cached sources.
+     fn pair_gpr_store_slots(&mut self, rt: u32, rt2: u32) {
+@@ -2482,6 +2522,8 @@
+         }
+         let atomic_pair = kind == 3 && maclator_core::mem::native_pair_atomic();
+         let fast_gpr_pair = !v && rt < 31 && rt2 < 31 && rt.abs_diff(rt2) == 1 && pair_fast();
++        let fixed_gpr_load = l && !v && self.u.rc_fixed && rt < 31 && rt2 < 31
++            && rt.abs_diff(rt2) == 1 && pair_fixed_fast();
+         let mut ordinary = self.u.a.create_label();
+         let mut accessed = self.u.a.create_label();
+         if atomic_pair {
+@@ -2493,7 +2535,9 @@
+                 // One aligned read preserves ARM LSE2 single-copy atomicity,
+                 // including when the guest mapping is read-only.
+                 a!(self, vmovdqa(xmm0, xmmword_ptr(rax)));
+-                if fast_gpr_pair {
++                if fixed_gpr_load {
++                    self.pair_gpr_load_fixed_slots(rt, rt2);
++                } else if fast_gpr_pair {
+                     self.pair_gpr_load_slots(rt, rt2);
+                 } else {
+                     if v {
+--- a/crates/maclator/src/jit/loop_selftest.rs
++++ b/crates/maclator/src/jit/loop_selftest.rs
+@@ -69,7 +69,7 @@
+     // base alias 1/2 means rn == rt/rt2. Writeback overlap forms intentionally
+     // test the interpreter's chosen behavior for constrained-unpredictable ISA
+     // encodings; they do not advertise an architectural guarantee for that form.
+-    const FIXTURES: [(&str, bool, bool, u32, u32, i32, bool); 24] = [
++    const FIXTURES: [(&str, bool, bool, u32, u32, i32, bool); 30] = [
+         ("ldp-offset", true, false, 2, 0, 16, false),
+         ("ldp-offset-reversed", true, true, 2, 0, 16, false),
+         ("ldp-pre", true, false, 3, 0, 16, false),
+@@ -94,6 +94,12 @@
+         ("stp-pre-base-rt2", false, false, 3, 2, 16, false),
+         ("ldp-readonly-base-rt", true, false, 2, 1, 16, true),
+         ("ldp-readonly-base-rt-reversed", true, true, 2, 1, 16, true),
++        ("ldp-sp-offset", true, false, 2, 3, 16, false),
++        ("ldp-sp-pre", true, false, 3, 3, 16, false),
++        ("ldp-sp-post-reversed", true, true, 1, 3, 16, false),
++        ("ldp-xzr-low", true, false, 2, 4, 16, false),
++        ("ldp-xzr-high", true, false, 2, 5, 16, false),
++        ("ldpsw-offset", true, false, 2, 6, 16, false),
+     ];
+     const ITERATIONS: u64 = 7;
+     const DATA_LEN: usize = 4096;
+@@ -103,18 +109,25 @@
+     let data_addr = data as u64;
+     let mut rng = Rng(0x61d6_5834_23bc_59ae);
+     let (mut cases, mut yields, mut checkpoints) = (0, 0, 0);
++    let before_fixed: [u64; 3] = std::array::from_fn(|i| emit::PAIR_FIXED_LOADS[i].load(Ordering::Relaxed));
+     for &(name, load, reverse, index, alias, stride, read_only) in &FIXTURES {
++        // Additional high-frequency scalar registers force the fixed plan to
++        // retain both, one, or neither of the pair destinations.
++        for pressure in [0, 3, 4] {
+         for misalignment in [0u64, 8] {
+             assert_eq!(unsafe { libc::mprotect(data, DATA_LEN, libc::PROT_READ | libc::PROT_WRITE) }, 0);
+             unsafe { std::ptr::write_bytes(data as *mut u8, 0xa5, DATA_LEN); }
+-            let (rt, rt2) = if reverse { (11, 10) } else { (10, 11) };
+-            let rn = match alias { 1 => rt, 2 => rt2, _ => 24 };
++            let (rt, rt2) = match alias {
++                4 => (31, 11), 5 => (10, 31),
++                _ => if reverse { (11, 10) } else { (10, 11) },
++            };
++            let rn = match alias { 1 => rt, 2 => rt2, 3 => 31, _ => 24 };
+             let first = data_addr + 0x200 + misalignment
+                 + if stride < 0 { (ITERATIONS - 1) * 16 } else { 0 };
+             for i in 0..ITERATIONS {
+                 let address = first.wrapping_add((i as i64 * stride as i64) as u64);
+                 let mut values = [0xdead_beef_4321_0000 + i, 0x1234_5678_9abc_0000 + i * 3];
+-                if load && alias != 0 && matches!(index, 0 | 2) {
++                if load && matches!(alias, 1 | 2) && matches!(index, 0 | 2) {
+                     // rn==rt is the benchmark's LDP x10,x11,[x10] list shape.
+                     values[(alias - 1) as usize] = address.wrapping_add(stride as u64);
+                 }
+@@ -134,17 +147,21 @@
+             init.set_nzcv(0xb);
+             let offset = if matches!(index, 1 | 3) { stride } else { 0 };
+             let mut program = Vec::new();
++            for n in 0..pressure {
++                for _ in 0..4 { program.push(add_imm(n, n, 1)); }
++            }
+             if !load {
+                 // Cpu slots must contain the latest write-through values even
+                 // when both source registers are fixed-cache residents.
+                 if rt != rn { program.push(add_imm(rt, rt, 1)); }
+                 if rt2 != rn { program.push(add_imm(rt2, rt2, 3)); }
+             }
+-            program.push(gpr_pair(load, rt, rt2, rn, index, offset));
++            let pair = gpr_pair(load, rt, rt2, rn, index, offset);
++            program.push(if alias == 6 { pair ^ 0xc000_0000 } else { pair });
+             program.push(0x8b00_0000 | (rt << 16) | (8 << 5) | 8);
+             program.push(0xca00_0000 | (rt2 << 16) | (9 << 5) | 9);
+             if load && !read_only { program.push(gpr_pair(false, rt, rt2, 25, 2, 0)); }
+-            if matches!(index, 0 | 2) && (!load || alias == 0) {
++            if matches!(index, 0 | 2) && (!load || !matches!(alias, 1 | 2)) {
+                 program.push(add_imm(rn, rn, stride));
+             }
+             program.push(add_imm(20, 20, -1));
+@@ -201,10 +218,15 @@
+             }
+             cases += 1;
+         }
++        }
+     }
+     unsafe { libc::munmap(data, DATA_LEN); }
+-    println!("jit selftest [loopcache-pairs]: ok={cases} checkpoints={checkpoints} yields={yields} pair_fast={} loop_cache={} register_budget={}",
+-        emit::pair_fast(), emit::loop_cache(), emit::register_budget());
++    let fixed: [u64; 3] = std::array::from_fn(|i| emit::PAIR_FIXED_LOADS[i].load(Ordering::Relaxed) - before_fixed[i]);
++    if emit::pair_fixed_fast() && emit::loop_cache() && mem::native_pair_atomic() {
++        assert!(fixed.iter().all(|&n| n != 0), "fixed pair fixtures must cover zero, one and two cached destinations: {fixed:?}");
++    }
++    println!("jit selftest [loopcache-pairs]: ok={cases} checkpoints={checkpoints} yields={yields} pair_fast={} pair_fixed={} fixed_cache_destinations={fixed:?} loop_cache={} register_budget={}",
++        emit::pair_fast(), emit::pair_fixed_fast(), emit::loop_cache(), emit::register_budget());
+     (cases, yields)
+ }
+ 
+--- a/crates/maclator/src/jit/mod.rs
++++ b/crates/maclator/src/jit/mod.rs
+@@ -474,6 +474,10 @@
+         eprintln!("[maclator] loop cache: {} blocks ({} with vector registers)",
+             emit::LOOP_CACHE_BLOCKS.load(Ordering::Relaxed),
+             emit::VECTOR_LOOP_CACHE_BLOCKS.load(Ordering::Relaxed));
++        eprintln!("[maclator] fixed pair loads: {} without cache, {} with one destination, {} with both destinations",
++            emit::PAIR_FIXED_LOADS[0].load(Ordering::Relaxed),
++            emit::PAIR_FIXED_LOADS[1].load(Ordering::Relaxed),
++            emit::PAIR_FIXED_LOADS[2].load(Ordering::Relaxed));
+     }
+ }
+ 
+--- a/crates/maclator/src/aot.rs
++++ b/crates/maclator/src/aot.rs
+@@ -23,7 +23,7 @@
+ 
+ const MAGIC: &[u8; 8] = b"MCLAOT04";
+ /// Bump when the translator's output changes.
+-const TRANSLATOR_VERSION: u32 = 20;
++const TRANSLATOR_VERSION: u32 = 21;
+ 
+ #[derive(Clone)]
+ struct Image {
+@@ -83,6 +83,7 @@
+         | ((crate::jit::emit::pair_fast() as u32) << 6)
+         | ((crate::jit::emit::cold_budget() as u32) << 7)
+         | ((crate::jit::emit::csel_chain() as u32) << 8)
++        | ((crate::jit::emit::pair_fixed_fast() as u32) << 9)
+ }
+ 
+ /// Register the main executable (mapped at a fixed address).
+@@ -588,6 +589,10 @@
+         assert_eq!(cache_layout(&different_features, expected_len), None);
+         different_features[12..16].copy_from_slice(&(flags_word() ^ 16).to_le_bytes());
+         assert_eq!(cache_layout(&different_features, expected_len), None);
++        different_features[12..16].copy_from_slice(&(flags_word() ^ (1 << 6)).to_le_bytes());
++        assert_eq!(cache_layout(&different_features, expected_len), None);
++        different_features[12..16].copy_from_slice(&(flags_word() ^ (1 << 9)).to_le_bytes());
++        assert_eq!(cache_layout(&different_features, expected_len), None);
+     }
+ 
+     #[test]

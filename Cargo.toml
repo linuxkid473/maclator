@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/core", "crates/maclator", "crates/difftest"]
+exclude = ["integration/macflow"]
 
 [profile.release]
 debug = 1

@@ -1,0 +1,188 @@
+{
+  "upstream_local_source_commit": "67ba56f",
+  "base": "integration/macflow",
+  "changes": [
+    {
+      "path": ".gitattributes",
+      "base_sha256": null,
+      "target_sha256": "a0ae51a3f03403f515ec880bc5df5fc033c39b6f649086f68b5c3421cea21ba9"
+    },
+    {
+      "path": ".gitignore",
+      "base_sha256": "36223f4f9fe4146944f130b5a893329849942beffd8ec6dd000db4761f30daaa",
+      "target_sha256": "ed79907d1e4acb59b788a04bd5b657ffc18b39c92b260b2d3e4c83727859a96e"
+    },
+    {
+      "path": "Cargo.toml",
+      "base_sha256": "c1c1a4b03feef8618db7591183e04a9a3b3e7590b31a0c7fa1fb28a54953312c",
+      "target_sha256": "8478a7d84b282577032d54d7563ce9f4a2bcaa1f6ef5391559360f137b5ccdb2"
+    },
+    {
+      "path": "README.md",
+      "base_sha256": "d719a0503e819033aee88b1ceacf0f170d234d7b908f4b9c50f4ee6b546fcee6",
+      "target_sha256": "e8ec610edea21bd8d55c19d078fab89b0b4bf5fc1a08f6cb3e22ba2eff47a9c4"
+    },
+    {
+      "path": "crates/core/Cargo.toml",
+      "base_sha256": "2f0d3c3aaaecd3911abd60d2112847ff22672ce3e7740b0b6fcf5caba156b860",
+      "target_sha256": "bfef3da135ee63ecb5ca0fd99a5c309a50bfddc48c58b1bfcfa6623952b23a48"
+    },
+    {
+      "path": "crates/core/src/feedback.rs",
+      "base_sha256": null,
+      "target_sha256": "e053214e1f1d5dc7711dbbff7130fd13810afbabcace6a0cb45a4c3790845a25"
+    },
+    {
+      "path": "crates/core/src/lib.rs",
+      "base_sha256": "8b060bccb24a92e619c462565e03df19f5d67ae3cd9b64b96852f1eadcfa9cf0",
+      "target_sha256": "2f844e877331f0c23806df95863f55d6bdc6e39443039277df95d30a6897c97f"
+    },
+    {
+      "path": "crates/macflow/Cargo.toml",
+      "base_sha256": "4b247b3b2c85c3f0715aa3667162fb362d65879eb5d0d7c8114e4108feb5a60e",
+      "target_sha256": "47f720e3387eaaf45b7782beb1a56dcf83b6f692ce5d009ff85940e2c4b1f2b8"
+    },
+    {
+      "path": "crates/macflow/examples/measure_idle.rs",
+      "base_sha256": "483572b54b2070ff9e04c78c5f6959c87d73a2c05de359b5dc712d5b789d18fa",
+      "target_sha256": "9035c4559a06a8903566cad83b5bf380c1d22fe63b3e1cc129c52ef8e134306b"
+    },
+    {
+      "path": "crates/macflow/src/agent.rs",
+      "base_sha256": "9fef76822227f54a0c5ab46c27fb657051e64c3857c3e536cf75fbc78d951600",
+      "target_sha256": "e9fcf26b1c4da91a5ef7e289841ba9c1d1090ba6bd56254a36992caa66cf53ec"
+    },
+    {
+      "path": "crates/macflow/src/bin/cli.rs",
+      "base_sha256": "b3f363072b4279facdb38d955f7bd1b0af45a11e85dc680b358b936d4cb31b14",
+      "target_sha256": "de7a5fbd485d2eb6dc0e6d78cdd2ab56e7b0678753cdcd815a5b1a1248cc95ab"
+    },
+    {
+      "path": "crates/macflow/src/helper.rs",
+      "base_sha256": "1cf4336d16e1240295a9917982125aeeaaed85f001800be16f158faf43c17225",
+      "target_sha256": "6f3afa1f22ac90aac803290c2cf752afab98b97e80ede45685ae0e87d772914f"
+    },
+    {
+      "path": "crates/macflow/src/lifecycle.rs",
+      "base_sha256": "292e6c895460ab48be2fa6c4c84f53c2ab5e4707a578664ae6428d7181493941",
+      "target_sha256": "60fe0f7fe7ab47b62d9d806434854211825a4b957b123a058ecf5d60a7460294"
+    },
+    {
+      "path": "crates/macflow/src/runtime.rs",
+      "base_sha256": "309d965bec6941dd1d8107aca3e94d5fc571ea152d9d4f26bed6055fb48313f3",
+      "target_sha256": "c3493ced5e2c1cf8d15b8ba2ecd9188508b3da5ea4e641165be8e28b72f3657c"
+    },
+    {
+      "path": "crates/macflow/src/storage.rs",
+      "base_sha256": "160396c27eca64767592d999521213a5dd255bb65cab0883378b9c5e3784744e",
+      "target_sha256": "ad325f234fd4511242fb761817e586a2774d9fcefd02443f08fd25256b34bc70"
+    },
+    {
+      "path": "crates/macflow/src/ui.rs",
+      "base_sha256": "6abfc7de6e66327dd2e476c1c355c7ca47aedd9d4d3f0cbb6c921741689c0d87",
+      "target_sha256": "0c0ebef723fa7e210089ab36da00f74f4cc6cd58c2486a03ad68167f0df3565d"
+    },
+    {
+      "path": "crates/macflow/src/ui/app_icon.rs",
+      "base_sha256": null,
+      "target_sha256": "8e9b0c45b7e5ab2f920740bf256f7f1654bfe8a408efa1532b8be3f9777e45fd"
+    },
+    {
+      "path": "crates/macflow/src/ui/chart.rs",
+      "base_sha256": null,
+      "target_sha256": "6d706e19012154ece96f7451d2212392aa42c89a52a708807ecab9b640239c44"
+    },
+    {
+      "path": "crates/macflow/src/ui/history.rs",
+      "base_sha256": null,
+      "target_sha256": "c2726b1b3553237d7614ce927aebd7a2e4e3d82c48a22d6c6c80c5f6812c607e"
+    },
+    {
+      "path": "crates/macflow/src/ui/model.rs",
+      "base_sha256": null,
+      "target_sha256": "9dc1af19eaf30dbc592d559ac23bcec3b632e01089fec00f477877566bb4e5f2"
+    },
+    {
+      "path": "crates/macflow/src/ui/widgets.rs",
+      "base_sha256": null,
+      "target_sha256": "4e1acff7f024f5f9bc21a4d76efae6f0654685c33054d25fcc13dd7a44069ed6"
+    },
+    {
+      "path": "crates/platform/Cargo.toml",
+      "base_sha256": "228b2b64670dad3d4ac3ac7dd89b0cc2f1de9feae7bb5fb92465fe6ebec65707",
+      "target_sha256": "ec4df8dd6650f84c5e11a37690181b0c3a745e6b9e67b548a877ff1d202390bc"
+    },
+    {
+      "path": "crates/platform/src/lib.rs",
+      "base_sha256": "f84f4217ea6e2d8d27c848a5fb117d078bf17ef1290cc2c692cede4dc4db2c41",
+      "target_sha256": "a22a220024ff787e1362f43bbb7669eaa0bcd023566082d487e203e1fb2efa29"
+    },
+    {
+      "path": "crates/protocol/Cargo.toml",
+      "base_sha256": "d8f3029036f1794ec6fae48efee2ff45e6a97f80bf67f8bf3083cb7ae4d0f2ef",
+      "target_sha256": "92b046c3cb4ae0c0bd6b495c0f02f56cb528eb96a8b0adfc115aa0b2691d3821"
+    },
+    {
+      "path": "crates/protocol/src/lib.rs",
+      "base_sha256": "6dd626b7a3def2831cf307bb69546a0cb97d0d41ea9d8709e783bd80a854517b",
+      "target_sha256": "e1f830ba3c04392b10f115f56272a02a3c7f718d6a18671470cd53b76b4cdd18"
+    },
+    {
+      "path": "docs/CPU_COMPARISON.md",
+      "base_sha256": "574c4a7a80707fc9fdf4679c3b539e64ccbf9def0d2267a7ddfee961866650a2",
+      "target_sha256": "065da53515c63936a5ca8679783542a509b89223ddf8d1e0f775ca733937d45b"
+    },
+    {
+      "path": "docs/IMPLEMENTATION_REPORT.md",
+      "base_sha256": "81b0370968576f35ed347e21f2c3ab0473a4f1f6366fd580a481cdfab0bc023c",
+      "target_sha256": "3c0109c383efa17d6bc8e1e81e138f1d2a9fb5fa8766966e02ebef2a43c2f51a"
+    },
+    {
+      "path": "docs/TESTING.md",
+      "base_sha256": "c48a433ea271338bb083b6f48bb573562c14afd4e568acb0d900e86ee554722f",
+      "target_sha256": "5aa540da7911788be7fdcb2ab8ce67a37da3095a96ff00d040a9f1db6afb9bbb"
+    },
+    {
+      "path": "docs/UI_REDESIGN_REPORT.md",
+      "base_sha256": null,
+      "target_sha256": "22abddf8b374588ab55bcc7b09f31e9d45243b958d1a8d8f29dbfb2b8baad73e"
+    },
+    {
+      "path": "rust-toolchain.toml",
+      "base_sha256": "d15af4a8c8054613482ef8828b975c2498d3b4be38808e61b97735f635e8ed24",
+      "target_sha256": "515c80a149c1e927d497dbebc399e241822aa0197e8f778c21bf5c136c90afd2"
+    },
+    {
+      "path": "scripts/compare_responsiveness.py",
+      "base_sha256": "bb14160c13103076f4b1546dbdb784d43dc2410218efdc673165e59a09bfafcd",
+      "target_sha256": "6010da9e05f32617fd394f92ff89ec62b710977511108fe9c449ae7ae146c91f"
+    },
+    {
+      "path": "scripts/deploy_maclator.py",
+      "base_sha256": "3df2c07770c83a06766bd91f2f7bd8b05d1867fe11233441bb08fee63895d14c",
+      "target_sha256": "9c3564be715dd41d92213c920be7a46dbb49783c3fd8447404ee71cedf1031e5"
+    },
+    {
+      "path": "scripts/feedback_integration_test.py",
+      "base_sha256": null,
+      "target_sha256": "04911350fa00ca346eaa180359899df7f3b050fd5502f3efdeeb995e7a9af995"
+    },
+    {
+      "path": "scripts/package.py",
+      "base_sha256": "1bb933ae9d9d5d545aecb7331c7167f9e47a0f45a9de97bc6c4183a2b93a4d5c",
+      "target_sha256": "b1e9977cf125b725660ed65abaf010a712e05412b2e1392fb68c6f496872a884"
+    }
+  ],
+  "excluded": [
+    "validation/",
+    "dist/",
+    "target/",
+    ".git/"
+  ],
+  "public_relocation_changes": [
+    "generic unit-test home paths",
+    "historical docs no private logs or images",
+    "parameterized UID/GID helper scripts retained",
+    "MACLATOR_SOURCE_ROOT optional explicit runtime repo path"
+  ]
+}

@@ -86,7 +86,78 @@ rw!(r8, w8, u8);
 rw!(r16, w16, u16);
 rw!(r32, w32, u32);
 rw!(r64, w64, u64);
-rw!(r128, w128, u128);
+
+/// Intel and AMD AVX processors guarantee naturally aligned, cacheable
+/// 128-bit single loads/stores are atomic. Do not assume this for other
+/// vendors or old processors. AVX detection also checks OSXSAVE/XCR0.
+/// AMD APM Volume 2, section 7.3.2; Intel SDM Volume 3, access atomicity.
+pub fn native_pair_atomic() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let vendor = std::arch::x86_64::__cpuid(0);
+            let name = [vendor.ebx.to_le_bytes(), vendor.edx.to_le_bytes(), vendor.ecx.to_le_bytes()].concat();
+            (name == b"GenuineIntel" || name == b"AuthenticAMD") && std::is_x86_feature_detected!("avx")
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        { false }
+    })
+}
+
+/// A single aligned 128-bit load, including read-only memory. Unaligned
+/// accesses and unsupported hosts retain the ordinary non-atomic behavior.
+#[inline(always)]
+pub unsafe fn atomic_pair_load(addr: u64) -> u128 {
+    let p = host(addr);
+    #[cfg(target_arch = "x86_64")]
+    if p as usize & 15 == 0 && native_pair_atomic() {
+        let lo: u64;
+        let hi: u64;
+        std::arch::asm!(
+            "vmovdqa xmm0, xmmword ptr [{p}]",
+            "vmovq {lo}, xmm0",
+            "vpsrldq xmm0, xmm0, 8",
+            "vmovq {hi}, xmm0",
+            p = in(reg) p,
+            lo = lateout(reg) lo,
+            hi = lateout(reg) hi,
+            out("xmm0") _,
+            options(readonly, nostack, preserves_flags),
+        );
+        return lo as u128 | (hi as u128) << 64;
+    }
+    std::ptr::read_unaligned(p as *const u128)
+}
+
+/// A single aligned 128-bit store, with the same host eligibility as loads.
+#[inline(always)]
+pub unsafe fn atomic_pair_store(addr: u64, value: u128) {
+    note_write(addr, 16);
+    let p = host(addr);
+    #[cfg(target_arch = "x86_64")]
+    if p as usize & 15 == 0 && native_pair_atomic() {
+        std::arch::asm!(
+            "vmovq xmm0, {lo}",
+            "vmovq xmm1, {hi}",
+            "vpunpcklqdq xmm0, xmm0, xmm1",
+            "vmovdqa xmmword ptr [{p}], xmm0",
+            p = in(reg) p,
+            lo = in(reg) value as u64,
+            hi = in(reg) (value >> 64) as u64,
+            out("xmm0") _,
+            out("xmm1") _,
+            options(nostack, preserves_flags),
+        );
+        return;
+    }
+    std::ptr::write_unaligned(p as *mut u128, value);
+}
+
+#[inline(always)]
+pub unsafe fn r128(addr: u64) -> u128 { atomic_pair_load(addr) }
+#[inline(always)]
+pub unsafe fn w128(addr: u64, value: u128) { atomic_pair_store(addr, value); }
 
 /// Read a little-endian value of `size` bytes (1,2,4,8), zero-extended.
 #[inline(always)]
@@ -171,5 +242,75 @@ pub unsafe fn rmw_sized(addr: u64, size: u32, mut op: impl FnMut(u64) -> u64) ->
             return old;
         }
         old = seen;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pair_access_all_alignments_and_tagged_addresses() {
+        let mut bytes = [0u8; 64];
+        let value = 0x1234_5678_9abc_def0_fedc_ba98_7654_3210u128;
+        for offset in 0..16 {
+            let address = unsafe { bytes.as_mut_ptr().add(offset) as u64 };
+            unsafe {
+                atomic_pair_store(address, value ^ offset as u128);
+                assert_eq!(atomic_pair_load(address), value ^ offset as u128);
+                let tagged = address | 0xab00_0000_0000_0000;
+                w128(tagged, !value);
+                assert_eq!(r128(tagged), !value);
+            }
+        }
+    }
+
+    #[test]
+    fn pair_store_logging_captures_one_complete_write() {
+        let mut value = 0xabba_9876_1234_aaaa_bbbb_ffff_eeee_6666u128;
+        let address = &mut value as *mut u128 as u64;
+        let previous = LOGGING_ENABLED.swap(true, Ordering::Relaxed);
+        log_start();
+        unsafe { atomic_pair_store(address, 0x1234); }
+        let log = log_stop();
+        LOGGING_ENABLED.store(previous, Ordering::Relaxed);
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0], (address, 0xabba_9876_1234_aaaa_bbbb_ffff_eeee_6666u128.to_le_bytes(), 16));
+        assert_eq!(value, 0x1234);
+    }
+
+    #[test]
+    fn aligned_pair_loads_do_not_tear_under_compare_exchange() {
+        if !native_pair_atomic() { return; }
+        use std::cell::UnsafeCell;
+        use std::sync::Arc;
+        #[repr(align(16))]
+        struct Shared(UnsafeCell<u128>);
+        unsafe impl Sync for Shared {}
+        let shared = Arc::new(Shared(UnsafeCell::new(0)));
+        let mut writers = Vec::new();
+        for _ in 0..3 {
+            let shared = shared.clone();
+            writers.push(std::thread::spawn(move || {
+                let address = shared.0.get() as u64;
+                for _ in 0..30000 {
+                    let mut expected = unsafe { atomic_pair_load(address) };
+                    loop {
+                        let count = (expected as u64).wrapping_add(1);
+                        let next = count as u128 | (count as u128) << 64;
+                        let actual = unsafe { cas128(address, expected, next) };
+                        if actual == expected { break; }
+                        expected = actual;
+                    }
+                }
+            }));
+        }
+        let address = shared.0.get() as u64;
+        for _ in 0..90000 {
+            let value = unsafe { atomic_pair_load(address) };
+            assert_eq!(value as u64, (value >> 64) as u64);
+        }
+        for writer in writers { writer.join().unwrap(); }
+        assert_eq!(unsafe { atomic_pair_load(address) }, 90000u128 | 90000u128 << 64);
     }
 }

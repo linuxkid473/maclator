@@ -451,7 +451,9 @@ fn sysctl_override(name: &str) -> Option<i64> {
         "hw.optional.neon" | "hw.optional.AdvSIMD" | "hw.optional.floatingpoint" => 1,
         "hw.optional.armv8_crc32" | "hw.optional.arm.FEAT_CRC32" => 1,
         "hw.optional.armv8_1_atomics" | "hw.optional.arm.FEAT_LSE" => 1,
-        "hw.optional.arm.FEAT_LSE2" | "hw.optional.arm.FEAT_LRCPC" | "hw.optional.arm.FEAT_LRCPC2" => 1,
+        // Aligned 128-bit support is narrower than the full LSE2 contract.
+        "hw.optional.arm.FEAT_LSE2" => 0,
+        "hw.optional.arm.FEAT_LRCPC" | "hw.optional.arm.FEAT_LRCPC2" => 1,
         "hw.optional.arm.FEAT_PAuth" | "hw.optional.arm.FEAT_JSCVT" | "hw.optional.arm.FEAT_FlagM"
         | "hw.optional.arm.FEAT_FlagM2" | "hw.optional.arm.FEAT_DotProd" | "hw.optional.arm.FEAT_FRINTTS"
         | "hw.optional.arm.FEAT_SB" | "hw.optional.arm.FEAT_DPB" | "hw.optional.arm.FEAT_DPB2" => 1,

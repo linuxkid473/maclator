@@ -24,6 +24,9 @@ pub const EXIT_PENDING: u64 = 2;
 
 pub const MAX_BLOCK_INSNS: usize = 96;
 
+/// Conservative block-entry charge, also exposed to boundary tests.
+pub const fn budget_charge(_block_insns: usize) -> u64 { MAX_BLOCK_INSNS as u64 }
+
 /// How a block leaves to a direct successor that isn't part of this unit.
 #[derive(Clone, Copy, PartialEq)]
 pub enum StubKind {
@@ -720,6 +723,19 @@ pub fn emit_block(u: &mut Unit, pc: u64, read: &dyn Fn(u64) -> Option<u32>) -> u
     u.a.set_label(&mut label).unwrap();
     // set_label updates the label; keep the updated value for label_ip().
     u.labels.insert(pc, label);
+    // Chained code must return to the dispatcher to deliver pending signals.
+    // Charge the maximum block size before each entry, so every run is bounded
+    // without touching host flags between a fused producer and its consumer.
+    // Single-block differential tests deliberately do not execute chained code.
+    if !u.no_internal_jumps {
+        let mut ready = u.a.create_label();
+        u.a.cmp(qword_ptr(r15 + off::BUDGET), budget_charge(MAX_BLOCK_INSNS) as i32).unwrap();
+        u.a.jae(ready).unwrap();
+        let mut e = E { u, pc, fuse_in: None };
+        e.st_pc_and_exit(pc);
+        e.u.a.set_label(&mut ready).unwrap();
+        e.u.a.sub(qword_ptr(r15 + off::BUDGET), budget_charge(MAX_BLOCK_INSNS) as i32).unwrap();
+    }
     let mut cur = pc;
     let mut count = 0;
     loop {
@@ -744,8 +760,9 @@ pub fn emit_block(u: &mut Unit, pc: u64, read: &dyn Fn(u64) -> Option<u32>) -> u
                     // cmp/adds/ands feeding B.cond: the flags are dead if both successors overwrite them
                     let target = (cur + 4).wrapping_add((sext(((nx >> 5) & 0x7ffff) as u64, 19) << 2) as u64);
                     if flags_dead_at(target, read) && flags_dead_at(cur + 8, read) {
-                        u.dead_flags = true;
-                        DEAD_FLAG_SKIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // A budget exit on either successor exposes NZCV.
+                        // Preserve all four architectural flag bytes.
+                        u.dead_flags = false;
                     }
                 }
             }

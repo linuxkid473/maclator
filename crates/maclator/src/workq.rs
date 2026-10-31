@@ -792,7 +792,7 @@ pub fn kernreturn(_cpu: &mut Cpu, a: &[u64; 8]) -> Result<u64, u64> {
     match a[0] {
         WQOPS_QUEUE_NEWSPISUPP | WQOPS_SET_EVENT_MANAGER_PRIORITY | WQOPS_SETUP_DISPATCH | WQOPS_SHOULD_NARROW => Ok(0),
         WQOPS_QUEUE_REQTHREADS | WQOPS_QUEUE_REQTHREADS2 => {
-            let count = a[1].max(1);
+            let count = requested_thread_count(a)?;
             let pp = a[3];
             anon_kq();
             for _ in 0..count {
@@ -863,6 +863,37 @@ pub fn kernreturn(_cpu: &mut Cpu, a: &[u64; 8]) -> Result<u64, u64> {
                 eprintln!("[maclator] unhandled workq op {:#x}", op);
             }
             Ok(0)
+        }
+    }
+}
+
+fn requested_thread_count(a: &[u64; 8]) -> Result<u64, u64> {
+    // libpthread calls __workq_kernreturn(op, NULL, numthreads, priority):
+    // `item` is not the count. dispatch_apply waits for every requested worker,
+    // so starting one worker for a multi-thread request can deadlock the guest.
+    let count = a[2] as u32 as i32;
+    if count <= 0 {
+        return Err(libc::EINVAL as u64);
+    }
+    Ok(count as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn libpthread_thread_request_uses_affinity_argument() {
+        // The Xcode linker requests 31 parallel workers with a NULL item.
+        for op in [WQOPS_QUEUE_REQTHREADS, WQOPS_QUEUE_REQTHREADS2] {
+            assert_eq!(requested_thread_count(&[op, 0, 31, 0x0400_08ff, 0, 0, 0, 0]), Ok(31));
+        }
+    }
+
+    #[test]
+    fn invalid_thread_requests_do_not_create_a_worker() {
+        for count in [0, u32::MAX as u64] {
+            assert_eq!(requested_thread_count(&[WQOPS_QUEUE_REQTHREADS, 0, count, 0, 0, 0, 0, 0]), Err(libc::EINVAL as u64));
         }
     }
 }

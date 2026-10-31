@@ -61,7 +61,7 @@ extern "C" fn dump_current(_: i32) {
             cpu.x[21],
             cpu.x[22],
         );
-        libc::write(2, buf.as_ptr() as *const libc::c_void, n.max(0) as usize);
+        libc::write(2, buf.as_ptr() as *const libc::c_void, (n.max(0) as usize).min(buf.len() - 1));
         let (blocks, ms, interp, entries, fb) = crate::jit::stats_snapshot();
         let n = libc::snprintf(
             buf.as_mut_ptr() as *mut libc::c_char,
@@ -74,17 +74,20 @@ extern "C" fn dump_current(_: i32) {
             entries,
             fb,
         );
-        libc::write(2, buf.as_ptr() as *const libc::c_void, n.max(0) as usize);
+        libc::write(2, buf.as_ptr() as *const libc::c_void, (n.max(0) as usize).min(buf.len() - 1));
     }
 }
 
 pub fn run_thread(cpu: &mut Cpu) {
+    crate::signals::enter_thread();
     CURRENT_CPU.with(|c| c.set(cpu as *mut Cpu as usize));
     EXIT_REQUESTED.with(|f| f.set(false));
     let key = cpu as *mut Cpu as usize;
     CPUS.lock().unwrap().push(key);
     crate::jit::run(cpu);
     CPUS.lock().unwrap().retain(|&k| k != key);
+    CURRENT_CPU.with(|c| c.set(0));
+    crate::signals::leave_thread();
 }
 
 extern "C" fn dump_threads(_: i32) {
@@ -118,13 +121,31 @@ pub fn install_debug_handler() {
     unsafe { libc::signal(libc::SIGUSR2, dump_current as usize) };
     if std::env::var_os("MACLATOR_DUMP_ON_FAULT").is_some() {
         unsafe {
-            libc::signal(libc::SIGSEGV, fault_dump as usize);
-            libc::signal(libc::SIGBUS, fault_dump as usize);
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = fault_dump as *const () as usize;
+            action.sa_flags = libc::SA_SIGINFO;
+            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigaction(libc::SIGSEGV, &action, std::ptr::null_mut());
+            libc::sigaction(libc::SIGBUS, &action, std::ptr::null_mut());
         }
     }
 }
 
-extern "C" fn fault_dump(sig: i32) {
+// libc does not expose Darwin's ucontext_t. This prefix follows the public
+// sys/_types/_ucontext.h layout; the x86_64 mcontext begins with a 16-byte
+// exception state, followed by x86_thread_state64 (RIP is register 16).
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+#[repr(C)]
+struct HostUContext {
+    onstack: i32,
+    sigmask: u32,
+    stack: libc::stack_t,
+    link: *mut libc::c_void,
+    mcsize: usize,
+    mcontext: *mut libc::c_void,
+}
+
+extern "C" fn fault_dump(sig: i32, info: *mut libc::siginfo_t, context: *mut libc::c_void) {
     // Helper processes often have stderr closed or /dev/null: write the dump to a file.
     unsafe {
         let path = format!("/tmp/maclator-fault-{}.log\0", libc::getpid());
@@ -134,6 +155,32 @@ extern "C" fn fault_dump(sig: i32) {
         }
     }
     eprintln!("maclator: host signal {sig} in emulator; guest state:");
+    // Always emit the current thread first: the registry mutex may be held by
+    // another thread, especially in a fork child or during thread creation.
+    dump_current(sig);
+    unsafe {
+        let address = if info.is_null() { std::ptr::null_mut() } else { (*info).si_addr };
+        let code = if info.is_null() { 0 } else { (*info).si_code };
+        let mut rip = 0u64;
+        let mut rsp = 0u64;
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        if !context.is_null() {
+            let uc = &*(context as *const HostUContext);
+            if !uc.mcontext.is_null() && uc.mcsize >= 16 + 17 * 8 {
+                let regs = (uc.mcontext as *const u8).add(16) as *const u64;
+                rip = *regs.add(16);
+                rsp = *regs.add(7);
+            }
+        }
+        let mut buf = [0u8; 192];
+        let n = libc::snprintf(
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            b"[host fault] pid=%d code=%d address=%p rip=%llx rsp=%llx\n\0".as_ptr() as *const libc::c_char,
+            libc::getpid(), code, address, rip, rsp,
+        );
+        libc::write(2, buf.as_ptr() as *const libc::c_void, (n.max(0) as usize).min(buf.len() - 1));
+    }
     dump_threads(sig);
     unsafe { libc::_exit(128 + sig) };
 }
@@ -219,6 +266,9 @@ fn read_insn(a: u64) -> Option<u32> {
 /// Plain interpreter loop (used by `--interp` and as the reference path).
 pub fn interp_loop(cpu: &mut Cpu) {
     loop {
+        if let Err(errno) = crate::signals::poll(cpu) {
+            crash(cpu, &format!("guest signal delivery failed: errno {errno}"));
+        }
         match interp::step(cpu) {
             Ok(()) => {}
             Err(e) => {

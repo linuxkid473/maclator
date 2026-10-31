@@ -5,7 +5,7 @@
 
 use crate::hostsys::{self, SysResult};
 use std::ffi::CString;
-use std::io::Read;
+use crate::slices::arm64_only;
 use std::sync::Mutex;
 
 const SYS_EXECVE: u64 = 59;
@@ -15,38 +15,6 @@ static FORWARD: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 pub fn configure(flags: Vec<String>) {
     *FORWARD.lock().unwrap() = flags;
-}
-
-const CPU_TYPE_X86_64: u32 = 0x0100_0007;
-const CPU_TYPE_ARM64: u32 = 0x0100_000c;
-
-/// True when `path` is a Mach-O that has an arm64 slice and no x86-64 slice.
-fn arm64_only(path: &str) -> bool {
-    let mut buf = [0u8; 512];
-    let Ok(mut f) = std::fs::File::open(path) else { return false };
-    let Ok(n) = f.read(&mut buf) else { return false };
-    if n < 8 {
-        return false;
-    }
-    let be = |o: usize| u32::from_be_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
-    let le = |o: usize| u32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
-    if be(0) == 0xcafe_babe {
-        let narch = (be(4) as usize).min(8);
-        let (mut arm, mut x86) = (false, false);
-        for i in 0..narch {
-            let o = 8 + i * 20;
-            if o + 4 > n {
-                break;
-            }
-            match be(o) {
-                CPU_TYPE_ARM64 => arm = true,
-                CPU_TYPE_X86_64 => x86 = true,
-                _ => {}
-            }
-        }
-        return arm && !x86;
-    }
-    le(0) == 0xfeed_facf && le(4) == CPU_TYPE_ARM64
 }
 
 unsafe fn cstr(p: u64) -> String {
@@ -104,11 +72,16 @@ fn scrub_shim(n: u64, args: &mut [u64; 8]) -> Option<(Vec<CString>, Vec<u64>)> {
 
 pub fn exec_like(n: u64, args: &[u64; 8]) -> SysResult {
     let (pidx, aidx) = if n == SYS_EXECVE { (0, 1) } else { (1, 3) };
-    let path = unsafe { cstr(args[pidx]) };
+    let original_path = unsafe { cstr(args[pidx]) };
+    let path = crate::paths::redirect(&original_path).unwrap_or(original_path);
     if path.is_empty() {
         return hostsys::unix(n, args);
     }
     let mut args = *args;
+    let physical_path = CString::new(path.as_str()).ok();
+    if let Some(ref c) = physical_path {
+        args[pidx] = c.as_ptr() as u64;
+    }
     let _env = scrub_shim(n, &mut args);
     let args = &args;
     if !arm64_only(&path) {

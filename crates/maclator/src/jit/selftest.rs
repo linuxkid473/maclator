@@ -309,6 +309,7 @@ pub fn run_selftest(class: &str, count: usize) {
     if class == "blocks" {
         return run_selftest_blocks(count);
     }
+    if class == "signal-budget" { return super::signal_budget_selftest::run(); }
     let (mask, val): (u32, u32) = match class {
         "dpimm" => (0x1C00_0000, 0x1000_0000),
         "dpreg" => (0x0E00_0000, 0x0A00_0000),

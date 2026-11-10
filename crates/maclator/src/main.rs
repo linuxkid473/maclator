@@ -13,6 +13,7 @@ mod loader;
 mod macho;
 mod paths;
 mod signals;
+mod slices;
 mod spawn;
 mod symbols;
 mod syscalls;
@@ -29,6 +30,7 @@ fn usage() -> ! {
     eprintln!("  --no-aot        JIT only: don't load or build AOT translations");
     eprintln!("  --dyld PATH     arm64 dyld to use (default /usr/lib/dyld)");
     eprintln!("  --sysroot DIR   directory with the arm64 dyld shared cache files");
+    eprintln!("  --overlay-root DIR  local Xcode component payloads (experimental)");
     eprintln!("  --trace         trace system calls");
     eprintln!("  --gpu           route the guest's Metal API to the host GPU");
     std::process::exit(2);
@@ -37,6 +39,7 @@ fn usage() -> ! {
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let mut dyld = std::env::var("MACLATOR_DYLD").unwrap_or_else(|_| "/usr/lib/dyld".to_string());
+    let mut no_aot = false;
     while let Some(a) = args.first().cloned() {
         match a.as_str() {
             "--trace-file" => {
@@ -81,6 +84,7 @@ fn main() {
             }
             "--no-aot" => {
                 aot::set_enabled(false);
+                no_aot = true;
                 args.remove(0);
             }
             "--sysroot" => {
@@ -89,6 +93,16 @@ fn main() {
                     usage();
                 }
                 paths::set_cache_dir(&args.remove(0));
+            }
+            "--overlay-root" => {
+                args.remove(0);
+                if args.is_empty() {
+                    usage();
+                }
+                if let Err(e) = paths::set_overlay_root(&args.remove(0)) {
+                    eprintln!("maclator: overlay: {e}");
+                    std::process::exit(1);
+                }
             }
             "--aot" => {
                 args.remove(0);
@@ -139,8 +153,15 @@ fn main() {
             fwd.push("--sysroot".into());
             fwd.push(d);
         }
+        if let Some(root) = paths::overlay_root() {
+            fwd.push("--overlay-root".into());
+            fwd.push(root.to_string_lossy().into_owned());
+        }
         if !jit::JIT_ENABLED.load(Ordering::Relaxed) {
             fwd.push("--interp".into());
+        }
+        if no_aot {
+            fwd.push("--no-aot".into());
         }
         if std::env::var_os("MACLATOR_GPU").is_some() {
             fwd.push("--gpu".into());
@@ -224,6 +245,9 @@ fn main() {
 }
 
 fn resolve_path(p: &str) -> String {
+    if let Some(physical) = paths::redirect(p) {
+        return physical;
+    }
     if p.contains('/') {
         return std::fs::canonicalize(p).map(|x| x.to_string_lossy().into_owned()).unwrap_or_else(|_| p.to_string());
     }

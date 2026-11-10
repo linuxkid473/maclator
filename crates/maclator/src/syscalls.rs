@@ -69,6 +69,33 @@ fn cstr_at(p: u64) -> String {
     unsafe { std::ffi::CStr::from_ptr(p as *const libc::c_char).to_string_lossy().into_owned() }
 }
 
+/// Longest path name read from guest memory, NUL included. Above XNU's MAXPATHLEN (1024), so any
+/// name the kernel would accept fits; a longer one is passed to the host kernel unread.
+const GUEST_NAME_MAX: usize = 8192;
+
+/// The NUL-terminated string at guest address `p`, read with `read` (a fault-safe copy) in pieces
+/// that stop at each 4 KiB boundary, so a name that ends just before an unmapped page is still read.
+/// None if any byte before the NUL cannot be read, or no NUL comes within `max` bytes.
+fn guest_cstr(p: u64, max: usize, mut read: impl FnMut(u64, &mut [u8]) -> bool) -> Option<String> {
+    const PIECE: u64 = 4096;
+    let mut name = Vec::new();
+    let mut at = p;
+    while name.len() < max {
+        let n = ((PIECE - at % PIECE) as usize).min(max - name.len());
+        let mut buf = vec![0u8; n];
+        if !read(at, &mut buf) {
+            return None;
+        }
+        if let Some(end) = buf.iter().position(|&c| c == 0) {
+            name.extend_from_slice(&buf[..end]);
+            return Some(String::from_utf8_lossy(&name).into_owned());
+        }
+        name.extend_from_slice(&buf);
+        at = at.checked_add(n as u64)?;
+    }
+    None
+}
+
 /// Handle SVC. `cpu.pc` already points after the SVC.
 pub fn handle_svc(cpu: &mut Cpu) {
     let num = cpu.x[16] as u32 as i32;
@@ -86,6 +113,7 @@ pub fn handle_svc(cpu: &mut Cpu) {
     }
     let mut n = num as u64;
     let mut args = [cpu.x[0], cpu.x[1], cpu.x[2], cpu.x[3], cpu.x[4], cpu.x[5], cpu.x[6], cpu.x[7]];
+    let original_args = args;
     if n == SYS_SYSCALL {
         n = args[0];
         args = [args[1], args[2], args[3], args[4], args[5], args[6], args[7], 0];
@@ -98,10 +126,17 @@ pub fn handle_svc(cpu: &mut Cpu) {
     if trace {
         eprintln!("[sys]   -> {}{:#x}", if cpu.cf != 0 { "ERR " } else { "" }, cpu.x[0]);
     }
+    // Host callbacks never run ARM code, and must interrupt host waits so we
+    // can deliver at a guest boundary. For SA_RESTART, save a context that
+    // retries this SVC after the guest signal trampoline has returned.
+    if cpu.cf != 0 && cpu.x[0] == libc::EINTR as u64 && crate::signals::should_restart(n) {
+        cpu.x[..8].copy_from_slice(&original_args);
+        cpu.pc = cpu.pc.wrapping_sub(4);
+    }
 }
 
-/// Guest paths of open fds under the redirected cache prefixes ("/", "/System", ...),
-/// so `openat(dirfd, "rel")` walks (as dyld does) can be resolved to a full guest path.
+/// Guest paths of open fds, so relative *at lookups can resolve both the dyld
+/// cache and optional Xcode component overlay without changing the host files.
 static FD_VPATHS: std::sync::Mutex<Option<std::collections::HashMap<i32, String>>> = std::sync::Mutex::new(None);
 
 fn vpath_join(base: &str, rel: &str) -> String {
@@ -112,24 +147,105 @@ fn vpath_join(base: &str, rel: &str) -> String {
     }
 }
 
+fn fd_guest_path(fd: i32) -> Option<String> {
+    if let Some(path) = FD_VPATHS.lock().unwrap().as_ref().and_then(|m| m.get(&fd).cloned()) {
+        return Some(path);
+    }
+    // A descriptor may have been inherited from a native parent. Recover its
+    // guest spelling from the host path rather than requiring a prior open.
+    if crate::paths::overlay_root().is_some() {
+        let mut path = [0u8; 1024];
+        if unsafe { libc::fcntl(fd, libc::F_GETPATH, path.as_mut_ptr()) } == 0 {
+            let end = path.iter().position(|&c| c == 0)?;
+            let host = std::str::from_utf8(&path[..end]).ok()?;
+            return crate::paths::guest_path(host).or_else(|| Some(host.to_string()));
+        }
+    }
+    None
+}
+
+fn rewrite_fd_path(cpu: &mut Cpu, args: &[u64; 8]) {
+    let mut path = [0u8; 1024];
+    if !crate::guestmem::read(args[2], &mut path) {
+        return;
+    }
+    let Some(end) = path.iter().position(|&c| c == 0) else { return };
+    let Ok(host) = std::str::from_utf8(&path[..end]) else { return };
+    let Some(guest) = crate::paths::guest_path(host) else { return };
+    let Ok(guest) = std::ffi::CString::new(guest) else { return };
+    if !crate::guestmem::write(args[2], guest.as_bytes_with_nul()) {
+        set_err(cpu, libc::EFAULT as u64);
+    }
+}
+
+fn rewrite_fullpath_attribute(cpu: &mut Cpu, n: u64, args: &[u64; 8]) {
+    // The general attribute buffer contains variable layouts. Handle only the
+    // exact FULLPATH-only request whose ABI is a length and one attrreference;
+    // never reinterpret a mixed attribute list using this small layout.
+    let (attrs, out, capacity) = if n == 476 { (args[2], args[3], args[4]) } else { (args[1], args[2], args[3]) };
+    let mut requested = [0u8; 24];
+    if !crate::guestmem::read(attrs, &mut requested) ||
+        u16::from_le_bytes(requested[0..2].try_into().unwrap()) != 5 ||
+        u32::from_le_bytes(requested[4..8].try_into().unwrap()) != 0x0800_0000 ||
+        requested[8..24].iter().any(|&b| b != 0) {
+        return;
+    }
+    let mut header = [0u8; 12];
+    if capacity < 12 || !crate::guestmem::read(out, &mut header) {
+        return;
+    }
+    let old_size = u32::from_le_bytes(header[0..4].try_into().unwrap()) as u64;
+    let offset = i32::from_le_bytes(header[4..8].try_into().unwrap()) as i64;
+    let length = u32::from_le_bytes(header[8..12].try_into().unwrap()) as u64;
+    if offset < 8 || length == 0 || length > 1024 || old_size > capacity ||
+        (offset as u64).checked_add(4 + length).is_none_or(|end| end > old_size) {
+        return;
+    }
+    let mut path = vec![0u8; length as usize];
+    if !crate::guestmem::read(out + 4 + offset as u64, &mut path) {
+        return;
+    }
+    let Some(end) = path.iter().position(|&c| c == 0) else { return };
+    let Ok(host) = std::str::from_utf8(&path[..end]) else { return };
+    let Some(guest) = crate::paths::guest_path(host) else { return };
+    let Ok(guest) = std::ffi::CString::new(guest) else { return };
+    let bytes = guest.as_bytes_with_nul();
+    let size = (12 + bytes.len() + 3) & !3;
+    if size as u64 > capacity {
+        set_err(cpu, libc::ERANGE as u64);
+        return;
+    }
+    let mut rewritten = vec![0u8; size];
+    rewritten[0..4].copy_from_slice(&(size as u32).to_le_bytes());
+    rewritten[4..8].copy_from_slice(&8i32.to_le_bytes());
+    rewritten[8..12].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+    rewritten[12..12 + bytes.len()].copy_from_slice(bytes);
+    if !crate::guestmem::write(out, &rewritten) {
+        set_err(cpu, libc::EFAULT as u64);
+    }
+}
+
 fn bsd(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
     // Path-taking syscalls: (path arg index, dirfd arg index for *at variants).
     let (pidx, at) = match n {
         5 | 398 => (Some(0), false),
         33 | 58 | 188 | 190 | 220 | 338 | 340 => (Some(0), false),
-        463 | 464 | 469 | 470 => (Some(1), true),
+        463 | 464 | 466 | 469 | 470 | 473 | 476 => (Some(1), true),
         _ => (None, false),
     };
     let mut keep: Option<std::ffi::CString> = None;
     let mut guest_path: Option<String> = None;
     if let Some(i) = pidx {
-        if args[i] != 0 {
-            let orig = cstr_at(args[i]);
+        // A name we cannot read (or longer than GUEST_NAME_MAX) is passed through untouched:
+        // the host kernel then returns the appropriate error (EFAULT for an unreadable name),
+        // instead of the translator faulting on the guest's pointer.
+        let name = if args[i] != 0 { guest_cstr(args[i], GUEST_NAME_MAX, crate::guestmem::read) } else { None };
+        if let Some(orig) = name {
             let full = if orig.starts_with('/') {
                 Some(orig.clone())
             } else if at {
                 let dfd = args[0] as i32;
-                FD_VPATHS.lock().unwrap().as_ref().and_then(|m| m.get(&dfd).map(|b| vpath_join(b, &orig)))
+                fd_guest_path(dfd).map(|b| vpath_join(&b, &orig))
             } else {
                 None
             };
@@ -137,7 +253,13 @@ fn bsd(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
                 eprintln!("[path] #{n} {orig} -> {full:?}");
             }
             if let Some(full) = full {
-                if let Some(new) = crate::paths::redirect(&full) {
+                // A relative path beneath an overlaid directory may be absent
+                // from the payload. In that case fall back to the real guest
+                // absolute path, rather than looking only inside the overlay.
+                let replacement = crate::paths::redirect(&full).or_else(|| {
+                    (at && !orig.starts_with('/') && crate::paths::overlay_root().is_some()).then(|| full.clone())
+                });
+                if let Some(new) = replacement {
                     if let Ok(c) = std::ffi::CString::new(new) {
                         args[i] = c.as_ptr() as u64;
                         if at {
@@ -152,14 +274,36 @@ fn bsd(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
     }
     bsd_inner(cpu, n, args);
     drop(keep);
+    if cpu.cf == 0 && crate::paths::overlay_root().is_some() {
+        if matches!(n, 92 | 406) && matches!(args[1], 50 | 102) {
+            rewrite_fd_path(cpu, &args);
+        } else if matches!(n, 220 | 228 | 476) {
+            rewrite_fullpath_attribute(cpu, n, &args);
+        }
+    }
     if matches!(n, 5 | 398 | 463 | 464) && cpu.cf == 0 {
+        // An untracked open can reuse a descriptor number previously populated
+        // by dup2 or inherited files: do not leave a stale virtual path behind.
+        if let Some(m) = FD_VPATHS.lock().unwrap().as_mut() {
+            m.remove(&(cpu.x[0] as i32));
+        }
         if let Some(g) = guest_path {
-            if g == "/" || g.starts_with("/System") {
+            if g == "/" || g.starts_with("/System") || crate::paths::overlay_root().is_some() {
                 let g = if g.len() > 1 { g.trim_end_matches('/').to_string() } else { g };
                 FD_VPATHS.lock().unwrap().get_or_insert_with(Default::default).insert(cpu.x[0] as i32, g);
             }
         }
-    } else if matches!(n, 6 | 399) {
+    } else if cpu.cf == 0 && (matches!(n, 41 | 90) || (matches!(n, 92 | 406) && matches!(args[1], 0 | 67))) {
+        let source = fd_guest_path(args[0] as i32);
+        let target = if n == 90 { args[1] as i32 } else { cpu.x[0] as i32 };
+        let mut paths = FD_VPATHS.lock().unwrap();
+        let paths = paths.get_or_insert_with(Default::default);
+        if let Some(path) = source {
+            paths.insert(target, path);
+        } else {
+            paths.remove(&target);
+        }
+    } else if matches!(n, 6 | 399) && cpu.cf == 0 {
         if let Some(m) = FD_VPATHS.lock().unwrap().as_mut() {
             m.remove(&(args[0] as i32));
         }
@@ -198,14 +342,22 @@ fn bsd_inner(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
             }
         }
         SYS_SIGALTSTACK => {
-            if args[1] != 0 {
-                unsafe { std::ptr::write_bytes(args[1] as *mut u8, 0, 24) };
-                unsafe { *((args[1] + 16) as *mut u32) = 4 }; // SS_DISABLE
+            match crate::signals::sigaltstack(args[0], args[1]) {
+                Ok(()) => set_ok(cpu, 0, 0),
+                Err(e) => set_err(cpu, e as u64),
             }
-            set_ok(cpu, 0, 0);
         }
         SYS_SIGRETURN => {
-            crate::signals::sigreturn(cpu, args[0], args[1] as i32);
+            if let Err(e) = crate::signals::sigreturn(cpu, args[0], args[1] as i32, args[2]) {
+                set_err(cpu, e as u64);
+            }
+        }
+        111 => { // sigsuspend: its argument is a mask value, not a pointer.
+            let r = hostsys::unix(n, &args);
+            if r.carry && r.rax == libc::EINTR as u64 {
+                crate::signals::interrupted_suspend(args[0] as u32);
+            }
+            set_res(cpu, r);
         }
         SYS_MMAP => {
             let was_exec = args[2] & PROT_EXEC != 0;
@@ -641,5 +793,48 @@ pub fn syscall_name(n: u64) -> &'static str {
         536 => "shared_region_map_and_slide_2_np",
         550 => "map_with_linking_np",
         _ => "?",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Guest memory for the tests: `bytes` at address `base`; reads below `limit` succeed.
+    fn reader(base: u64, bytes: &[u8], limit: u64) -> impl FnMut(u64, &mut [u8]) -> bool + '_ {
+        move |at, buf| {
+            if at < base || at + buf.len() as u64 > limit {
+                return false;
+            }
+            let off = (at - base) as usize;
+            buf.copy_from_slice(&bytes[off..off + buf.len()]);
+            true
+        }
+    }
+
+    #[test]
+    fn guest_cstr_reads_up_to_an_unreadable_page_and_no_further() {
+        let base = 0x10_0000u64;
+        let mut mem = vec![b'a'; 8192];
+        // "name\0" ending exactly at the end of the readable page.
+        mem[4096 - 5..4096].copy_from_slice(b"name\0");
+        let p = base + 4096 - 5;
+        assert_eq!(guest_cstr(p, GUEST_NAME_MAX, reader(base, &mem, base + 4096)).as_deref(), Some("name"));
+        // The same bytes with no NUL before the unreadable page: unreadable, not a crash.
+        mem[4095] = b'x';
+        assert_eq!(guest_cstr(p, GUEST_NAME_MAX, reader(base, &mem, base + 4096)), None);
+        // A pointer into the unreadable page itself.
+        assert_eq!(guest_cstr(base + 4096, GUEST_NAME_MAX, reader(base, &mem, base + 4096)), None);
+    }
+
+    #[test]
+    fn guest_cstr_reads_across_pages_and_stops_at_max() {
+        let base = 0x20_0000u64;
+        let mut mem = vec![b'b'; 8192];
+        mem[5000] = 0;
+        let p = base + 3000;
+        assert_eq!(guest_cstr(p, GUEST_NAME_MAX, reader(base, &mem, base + 8192)).map(|s| s.len()), Some(2000));
+        assert_eq!(guest_cstr(p, 2000, reader(base, &mem, base + 8192)), None);
+        assert_eq!(guest_cstr(p, 2001, reader(base, &mem, base + 8192)).map(|s| s.len()), Some(2000));
     }
 }

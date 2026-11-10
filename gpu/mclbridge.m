@@ -352,9 +352,9 @@ static NSDictionary *doMsg(NSDictionary *req) {
     [inv retainArguments];
     NSArray *args = req[@"args"];
     NSMutableArray *keep = [NSMutableArray new];
-    NSError *__autoreleasing *errSlot = NULL;
-    NSError *__autoreleasing errStore = nil;
-    BOOL wantErr = NO;
+    id __autoreleasing *objectOut = (id __autoreleasing *)calloc(sig.numberOfArguments, sizeof(id));
+    BOOL *wantOut = calloc(sig.numberOfArguments, sizeof(BOOL));
+    NSUInteger legacyError = 0;
     void **idArrays[8]; int nIdArr = 0;
     CFTypeRef surfs[4]; int nSurf = 0;
     for (NSUInteger i = 2; i < sig.numberOfArguments; i++) {
@@ -390,9 +390,10 @@ static NSDictionary *doMsg(NSDictionary *req) {
                 idArrays[nIdArr++] = arr;
                 [inv setArgument:&arr atIndex:i];
             } else {
-                wantErr = [v isKindOfClass:[NSDictionary class]] && v[@"outerr"];
-                errSlot = wantErr ? &errStore : NULL;
-                [inv setArgument:&errSlot atIndex:i];
+                wantOut[i] = [v isKindOfClass:[NSDictionary class]] && (v[@"outobj"] || v[@"outerr"]);
+                if ([v isKindOfClass:[NSDictionary class]] && v[@"outerr"]) legacyError = i;
+                id __autoreleasing *slot = wantOut[i] ? &objectOut[i] : NULL;
+                [inv setArgument:&slot atIndex:i];
             }
         } else {
             setBytesArg(inv, i, t, v);
@@ -400,6 +401,8 @@ static NSDictionary *doMsg(NSDictionary *req) {
     }
     NSNumber *memoKey = nil;
     NSData *memoData = nil;
+    // Memo entries are stored only when all object outputs are nil. A successful
+    // NSError-only call can still be cached; calls returning reflection cannot.
     if ([gMemoLegacy containsObject:selName]) {
         NSData *ab = [NSPropertyListSerialization dataWithPropertyList:@{@"h": req[@"h"], @"s": selName, @"a": args ?: @[]} format:NSPropertyListBinaryFormat_v1_0 options:0 error:NULL];
         if (ab) {
@@ -407,6 +410,8 @@ static NSDictionary *doMsg(NSDictionary *req) {
             id hit = memoGet(ab, &memoKey);
             if (hit) {
                 for (int k = 0; k < nIdArr; k++) free(idArrays[k]);
+                for (int k = 0; k < nSurf; k++) CFRelease(surfs[k]);
+                free(objectOut); free(wantOut);
                 return @{@"r": encObj(hit, NO)};
             }
         }
@@ -416,11 +421,15 @@ static NSDictionary *doMsg(NSDictionary *req) {
     } @catch (NSException *e) {
         for (int k = 0; k < nIdArr; k++) free(idArrays[k]);
         for (int k = 0; k < nSurf; k++) CFRelease(surfs[k]);
+        free(objectOut); free(wantOut);
         return @{@"x": [NSString stringWithFormat:@"%@: %@", e.name, e.reason]};
     }
     for (int k = 0; k < nIdArr; k++) free(idArrays[k]);
     for (int k = 0; k < nSurf; k++) CFRelease(surfs[k]);
     NSMutableDictionary *reply = [NSMutableDictionary new];
+    BOOL hasOutputValue = NO;
+    for (NSUInteger i = 2; i < sig.numberOfArguments; i++)
+        if (wantOut[i] && objectOut[i]) hasOutputValue = YES;
     const char *rt = skipQual([sig methodReturnType]);
     if (rt[0] == 'v') {
     } else if (rt[0] == '@') {
@@ -429,7 +438,7 @@ static NSDictionary *doMsg(NSDictionary *req) {
         // NSInvocation does not retain the result; new-family results are +1, others +0.
         // The handle table takes its own reference, so drop ours for the +1 case.
         BOOL nw = r && isNewFamily(selName);
-        if (r && memoKey && !(wantErr && errStore)) memoPut(memoKey, memoData, r);
+        if (r && memoKey && !hasOutputValue) memoPut(memoKey, memoData, r);
         reply[@"r"] = encObj(r, NO);
         if (nw) CFRelease((__bridge CFTypeRef)r);
     } else {
@@ -439,7 +448,13 @@ static NSDictionary *doMsg(NSDictionary *req) {
         [inv getReturnValue:d.mutableBytes];
         reply[@"r"] = d;
     }
-    if (wantErr && errStore) reply[@"err"] = encObj(errStore, NO);
+    NSMutableDictionary *outputs = [NSMutableDictionary new];
+    for (NSUInteger i = 2; i < sig.numberOfArguments; i++) {
+        if (wantOut[i]) outputs[[NSString stringWithFormat:@"%lu", (unsigned long)i]] = encObj(objectOut[i], NO);
+    }
+    if (outputs.count) reply[@"out"] = outputs;
+    if (legacyError && objectOut[legacyError]) reply[@"err"] = encObj(objectOut[legacyError], NO);
+    free(objectOut); free(wantOut);
     return reply;
 }
 

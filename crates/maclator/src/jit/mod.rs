@@ -1,6 +1,7 @@
 //! JIT runtime: code cache, dispatcher, block chaining, indirect-branch
 //! cache, invalidation. Blocks can also come from the AOT cache (`aot.rs`).
 
+pub mod signal_budget_selftest;
 pub mod emit;
 pub mod selftest;
 pub mod fp_mode_selftest;
@@ -645,6 +646,9 @@ pub fn run(cpu: &mut Cpu) {
     setup_cpu(cpu);
     let (mut last_pc, mut repeats) = (u64::MAX, 0u64);
     loop {
+        if let Err(code) = crate::signals::poll(cpu) {
+            unsafe { libc::_exit(code); }
+        }
         if cpu.pc == last_pc {
             repeats += 1;
             if repeats == 20000 && std::env::var_os("MACLATOR_SPIN_DEBUG").is_some() {

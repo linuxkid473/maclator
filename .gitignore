@@ -2,5 +2,6 @@
 /ref/tree_*.json
 /tests/guest/*
 !/tests/guest/*.c
+!/tests/guest/signals_registers.S
 gpu/out/
 .claude/

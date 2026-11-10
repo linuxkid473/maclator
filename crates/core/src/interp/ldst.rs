@@ -210,6 +210,9 @@ fn pair(cpu: &mut Cpu, insn: u32) -> R {
             if l {
                 let (a, b) = if scale == 4 {
                     (r128(addr), r128(addr + 16))
+                } else if scale == 3 {
+                    let value = atomic_pair_load(addr);
+                    ((value as u64) as u128, (value >> 64) as u128)
                 } else {
                     (read_sized(addr, nb as u32) as u128, read_sized(addr + nb, nb as u32) as u128)
                 };
@@ -219,14 +222,20 @@ fn pair(cpu: &mut Cpu, insn: u32) -> R {
                 let (a, b) = (cpu.vq(rt), cpu.vq(rt2));
                 w128(addr, a);
                 w128(addr + 16, b);
+            } else if scale == 3 {
+                atomic_pair_store(addr, cpu.vd(rt) as u128 | (cpu.vd(rt2) as u128) << 64);
             } else {
                 let (a, b) = (cpu.vd(rt), cpu.vd(rt2));
                 write_sized(addr, nb as u32, a);
                 write_sized(addr + nb, nb as u32, b);
             }
         } else if l {
-            let mut a = read_sized(addr, nb as u32);
-            let mut b = read_sized(addr + nb, nb as u32);
+            let (mut a, mut b) = if nb == 8 {
+                let value = atomic_pair_load(addr);
+                (value as u64, (value >> 64) as u64)
+            } else {
+                (read_sized(addr, nb as u32), read_sized(addr + nb, nb as u32))
+            };
             if signed {
                 a = sext(a, 32);
                 b = sext(b, 32);
@@ -235,8 +244,12 @@ fn pair(cpu: &mut Cpu, insn: u32) -> R {
             cpu.setx(rt2, b);
         } else {
             let (a, b) = (cpu.xr(rt), cpu.xr(rt2));
-            write_sized(addr, nb as u32, a);
-            write_sized(addr + nb, nb as u32, b);
+            if nb == 8 {
+                atomic_pair_store(addr, a as u128 | (b as u128) << 64);
+            } else {
+                write_sized(addr, nb as u32, a);
+                write_sized(addr + nb, nb as u32, b);
+            }
         }
     }
     if idx == 1 || idx == 3 {

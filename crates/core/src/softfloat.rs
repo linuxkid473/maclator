@@ -183,6 +183,263 @@ pub fn fmla<T: Fp>(a: T, n: T, m: T) -> T {
     fix(n.mul_add(m, a))
 }
 
+// The usual helpers above retain the historical default-mode behavior used by
+// the JIT. Non-default FPCR needs a real rounding step, rather than a host fma
+// followed by adjustment: cancellation can discard every bit of the product.
+// This fixed-width integer representation covers the entire binary64 product
+// range (2^-2148 through just below 2^2048), with room for an addition carry.
+const FMA_SCALE: i32 = -2148;
+const FMA_LIMBS: usize = 66;
+const IOC: u64 = 1 << 0;
+const OFC: u64 = 1 << 2;
+const UFC: u64 = 1 << 3;
+const IXC: u64 = 1 << 4;
+const IDC: u64 = 1 << 7;
+
+#[derive(Clone, Copy)]
+struct Format { frac: u32, bias: i32, exp_mask: u64, sign_mask: u64 }
+
+impl Format {
+    fn of<T: Fp>() -> Self {
+        if T::BITS == 32 {
+            Self { frac: 23, bias: 127, exp_mask: 255, sign_mask: 1 << 31 }
+        } else {
+            Self { frac: 52, bias: 1023, exp_mask: 2047, sign_mask: 1 << 63 }
+        }
+    }
+    fn fraction(self, bits: u64) -> u64 { bits & ((1 << self.frac) - 1) }
+    fn exponent(self, bits: u64) -> u64 { (bits >> self.frac) & self.exp_mask }
+    fn nan(self, bits: u64) -> bool { self.exponent(bits) == self.exp_mask && self.fraction(bits) != 0 }
+    fn snan(self, bits: u64) -> bool { self.nan(bits) && bits & (1 << (self.frac - 1)) == 0 }
+    fn inf(self, bits: u64) -> bool { self.exponent(bits) == self.exp_mask && self.fraction(bits) == 0 }
+    fn zero(self, bits: u64) -> bool { bits & !self.sign_mask == 0 }
+    fn sign(self, bits: u64) -> bool { bits & self.sign_mask != 0 }
+    fn signed(self, bits: u64, sign: bool) -> u64 { bits | if sign { self.sign_mask } else { 0 } }
+    fn infinity(self, sign: bool) -> u64 { self.signed(self.exp_mask << self.frac, sign) }
+    fn default_nan(self) -> u64 { (self.exp_mask << self.frac) | (1 << (self.frac - 1)) }
+    fn unpack(self, bits: u64) -> (u64, i32) {
+        let e = self.exponent(bits);
+        let mantissa = self.fraction(bits) | if e == 0 { 0 } else { 1 << self.frac };
+        (mantissa, (e.max(1) as i32) - self.bias - self.frac as i32)
+    }
+    fn flush_input(self, bits: u64, fpcr: u64, fpsr: &mut u64) -> u64 {
+        if fpcr & (1 << 24) != 0 && self.exponent(bits) == 0 && self.fraction(bits) != 0 {
+            *fpsr |= IDC;
+            bits & self.sign_mask
+        } else { bits }
+    }
+}
+
+struct FmaMagnitude([u64; FMA_LIMBS]);
+
+impl FmaMagnitude {
+    fn shifted(value: u128, shift: usize) -> Self {
+        let mut out = Self([0; FMA_LIMBS]);
+        let limb = shift / 64;
+        let bit = shift % 64;
+        let lo = value as u64;
+        let hi = (value >> 64) as u64;
+        out.0[limb] = lo << bit;
+        if bit == 0 {
+            out.0[limb + 1] = hi;
+        } else {
+            out.0[limb + 1] = (lo >> (64 - bit)) | (hi << bit);
+            out.0[limb + 2] = hi >> (64 - bit);
+        }
+        out
+    }
+    fn cmp(&self, rhs: &Self) -> std::cmp::Ordering {
+        for i in (0..FMA_LIMBS).rev() {
+            if self.0[i] != rhs.0[i] { return self.0[i].cmp(&rhs.0[i]); }
+        }
+        std::cmp::Ordering::Equal
+    }
+    fn add(&mut self, rhs: &Self) {
+        let mut carry = 0u128;
+        for i in 0..FMA_LIMBS {
+            let v = self.0[i] as u128 + rhs.0[i] as u128 + carry;
+            self.0[i] = v as u64;
+            carry = v >> 64;
+        }
+        debug_assert_eq!(carry, 0);
+    }
+    // The caller ensures self >= rhs.
+    fn sub(&mut self, rhs: &Self) {
+        let mut borrow = false;
+        for i in 0..FMA_LIMBS {
+            let (v, b1) = self.0[i].overflowing_sub(rhs.0[i]);
+            let (v, b2) = v.overflowing_sub(borrow as u64);
+            self.0[i] = v;
+            borrow = b1 || b2;
+        }
+        debug_assert!(!borrow);
+    }
+    fn highest(&self) -> Option<usize> {
+        for i in (0..FMA_LIMBS).rev() {
+            if self.0[i] != 0 { return Some(i * 64 + 63 - self.0[i].leading_zeros() as usize); }
+        }
+        None
+    }
+    fn bit(&self, bit: usize) -> bool { self.0[bit / 64] & (1 << (bit % 64)) != 0 }
+    fn any_below(&self, bit: usize) -> bool {
+        self.0[..bit / 64].iter().any(|&v| v != 0)
+            || (bit % 64 != 0 && self.0[bit / 64] & ((1 << (bit % 64)) - 1) != 0)
+    }
+    fn shr_u64(&self, bit: usize) -> u64 {
+        let i = bit / 64;
+        let shift = bit % 64;
+        (self.0[i] >> shift)
+            | if shift != 0 && i + 1 < FMA_LIMBS { self.0[i + 1] << (64 - shift) } else { 0 }
+    }
+}
+
+fn round_magnitude(mag: &FmaMagnitude, sign: bool, fmt: Format, fpcr: u64, fpsr: &mut u64) -> u64 {
+    let highest = mag.highest().expect("nonzero exact result");
+    let mut exponent = highest as i32 + FMA_SCALE;
+    let minimum = 1 - fmt.bias;
+    if exponent < minimum && fpcr & (1 << 24) != 0 {
+        // Arm flushes before rounding and raises UFC alone, even for an exact
+        // subnormal. x86 FTZ is not a substitute for this rule.
+        *fpsr |= UFC;
+        return fmt.signed(0, sign);
+    }
+    let shift = (exponent.max(minimum) - fmt.frac as i32 - FMA_SCALE) as usize;
+    let mut mantissa = mag.shr_u64(shift);
+    let inexact = mag.any_below(shift);
+    if exponent < minimum && inexact { *fpsr |= UFC; }
+    let rmode = (fpcr >> 22) & 3;
+    let up = match rmode {
+        0 => shift != 0 && mag.bit(shift - 1)
+            && (mag.any_below(shift - 1) || mantissa & 1 != 0),
+        1 => inexact && !sign,
+        2 => inexact && sign,
+        _ => false,
+    };
+    exponent = exponent.max(minimum);
+    if up {
+        mantissa += 1;
+        if mantissa == 1 << (fmt.frac + 1) {
+            mantissa >>= 1;
+            exponent += 1;
+        }
+    }
+    if exponent > fmt.bias {
+        *fpsr |= OFC | IXC;
+        let infinity = rmode == 0 || (rmode == 1 && !sign) || (rmode == 2 && sign);
+        return if infinity { fmt.infinity(sign) }
+            else { fmt.signed((fmt.exp_mask << fmt.frac) - 1, sign) };
+    }
+    if inexact { *fpsr |= IXC; }
+    let encoded_exp = if mantissa >= 1 << fmt.frac { (exponent + fmt.bias) as u64 } else { 0 };
+    fmt.signed((encoded_exp << fmt.frac) | (mantissa & ((1 << fmt.frac) - 1)), sign)
+}
+
+/// Scalar binary32/binary64 FMA under non-default FPCR. Uses integer arithmetic
+/// so the host's rounding mode, FTZ/DAZ state and exception flags are untouched.
+/// Default-mode FPSR is deliberately unchanged until the JIT fast paths collect
+/// exceptions too. FP exception traps and FEAT_AFP alternative handling remain
+/// outside this helper; the existing interpreter does not implement them.
+pub fn fmla_controlled<T: Fp>(a: T, n: T, m: T, fpcr: u64, fpsr: &mut u64) -> T {
+    if fpcr == 0 { return fmla(a, n, m); }
+    let fmt = Format::of::<T>();
+    let a = fmt.flush_input(a.to_bits64(), fpcr, fpsr);
+    let n = fmt.flush_input(n.to_bits64(), fpcr, fpsr);
+    let m = fmt.flush_input(m.to_bits64(), fpcr, fpsr);
+    let invalid_product = (fmt.inf(n) && fmt.zero(m)) || (fmt.zero(n) && fmt.inf(m));
+    if fmt.snan(a) || fmt.snan(n) || fmt.snan(m) { *fpsr |= IOC; }
+    if fmt.nan(a) && !fmt.snan(a) && invalid_product {
+        *fpsr |= IOC;
+        return T::from_bits64(fmt.default_nan());
+    }
+    if let Some(nan) = [a, n, m].into_iter().find(|&v| fmt.snan(v))
+        .or_else(|| [a, n, m].into_iter().find(|&v| fmt.nan(v))) {
+        return T::from_bits64(if fpcr & (1 << 25) != 0 { fmt.default_nan() }
+            else { nan | (1 << (fmt.frac - 1)) });
+    }
+    let product_sign = fmt.sign(n) != fmt.sign(m);
+    if invalid_product || ((fmt.inf(n) || fmt.inf(m)) && fmt.inf(a) && fmt.sign(a) != product_sign) {
+        *fpsr |= IOC;
+        return T::from_bits64(fmt.default_nan());
+    }
+    if fmt.inf(a) { return T::from_bits64(a); }
+    if fmt.inf(n) || fmt.inf(m) { return T::from_bits64(fmt.infinity(product_sign)); }
+    let (ns, ne) = fmt.unpack(n);
+    let (ms, me) = fmt.unpack(m);
+    let (asig, ae) = fmt.unpack(a);
+    let mut product = FmaMagnitude::shifted(ns as u128 * ms as u128, (ne + me - FMA_SCALE) as usize);
+    let mut addend = FmaMagnitude::shifted(asig as u128, (ae - FMA_SCALE) as usize);
+    let sign = if product_sign == fmt.sign(a) {
+        product.add(&addend);
+        product_sign
+    } else {
+        match product.cmp(&addend) {
+            std::cmp::Ordering::Greater => { product.sub(&addend); product_sign }
+            std::cmp::Ordering::Less => { addend.sub(&product); product = addend; fmt.sign(a) }
+            std::cmp::Ordering::Equal => {
+                product = FmaMagnitude([0; FMA_LIMBS]);
+                ((fpcr >> 22) & 3) == 2
+            }
+        }
+    };
+    if product.highest().is_none() { return T::from_bits64(fmt.signed(0, sign)); }
+    T::from_bits64(round_magnitude(&product, sign, fmt, fpcr, fpsr))
+}
+
+/// Non-default FPCR scalar multiply/add/subtract/min/max. Unsupported opcodes
+/// return None so callers can retain their existing paths (notably division).
+pub fn binary_controlled<T: Fp>(a: T, b: T, opcode: u32, fpcr: u64, fpsr: &mut u64) -> Option<T> {
+    if !matches!(opcode, 0 | 2..=8) { return None; }
+    // Preserve the existing JIT/reference contract for default-mode execution.
+    if fpcr == 0 {
+        return Some(match opcode {
+            0 => fmul(a, b), 2 => fadd(a, b), 3 => fsub(a, b),
+            4 => fmax(a, b), 5 => fmin(a, b), 6 => fmaxnm(a, b),
+            7 => fminnm(a, b), _ => -fmul(a, b),
+        });
+    }
+    let fmt = Format::of::<T>();
+    let a = fmt.flush_input(a.to_bits64(), fpcr, fpsr);
+    let b = fmt.flush_input(b.to_bits64(), fpcr, fpsr);
+    let nan = if fmt.snan(a) { Some(a) } else if fmt.snan(b) { Some(b) }
+        else if fmt.nan(a) { Some(a) } else if fmt.nan(b) { Some(b) } else { None };
+    if let Some(nan) = nan {
+        if fmt.snan(a) || fmt.snan(b) { *fpsr |= IOC; }
+        else if matches!(opcode, 6 | 7) && (fmt.nan(a) != fmt.nan(b)) {
+            return Some(T::from_bits64(if fmt.nan(a) { b } else { a }));
+        }
+        let mut result = if fpcr & (1 << 25) != 0 { fmt.default_nan() }
+            else { nan | (1 << (fmt.frac - 1)) };
+        if opcode == 8 { result ^= fmt.sign_mask; }
+        return Some(T::from_bits64(result));
+    }
+    let a_value = T::from_bits64(a);
+    let b_value = T::from_bits64(b);
+    let result = match opcode {
+        0 | 8 => {
+            let sign = fmt.sign(a) != fmt.sign(b);
+            let zero = T::from_bits64(fmt.signed(0, sign));
+            let result = fmla_controlled(zero, a_value, b_value, fpcr, fpsr).to_bits64();
+            T::from_bits64(if opcode == 8 { result ^ fmt.sign_mask } else { result })
+        }
+        2 => fmla_controlled(b_value, a_value, T::from_f64(1.), fpcr, fpsr),
+        3 => fmla_controlled(T::from_bits64(b ^ fmt.sign_mask), a_value, T::from_f64(1.), fpcr, fpsr),
+        _ => {
+            let minimum = matches!(opcode, 5 | 7);
+            let result = if fmt.zero(a) && fmt.zero(b) {
+                fmt.signed(0, if minimum { fmt.sign(a) || fmt.sign(b) } else { fmt.sign(a) && fmt.sign(b) })
+            } else {
+                // Monotonic integer keys avoid host FP comparisons (including
+                // their exception flags) for finite values and infinities.
+                let key = |v| if fmt.sign(v) { !v & (fmt.sign_mask | (fmt.sign_mask - 1)) }
+                    else { v | fmt.sign_mask };
+                if (key(a) < key(b)) == minimum { a } else { b }
+            };
+            T::from_bits64(result)
+        }
+    };
+    Some(result)
+}
+
 #[inline(always)]
 pub fn fmax<T: Fp>(a: T, b: T) -> T {
     if let Some(n) = process_nans(a, b) {
@@ -452,4 +709,216 @@ pub fn f64_to_f16(v: f64) -> u16 {
 pub fn f32_to_f16(v: f32) -> u16 {
     // Converting f32 -> f64 is exact, so a single rounding happens.
     f64_to_f16(v as f64)
+}
+
+#[cfg(test)]
+mod controlled_tests {
+    use super::*;
+    const DN: u64 = 1 << 25;
+    const FZ: u64 = 1 << 24;
+
+    #[test]
+    fn binary_modes_nan_and_minmax() {
+        let mut fpsr = 0;
+        let half_ulp = f32::from_bits(103 << 23);
+        assert_eq!(binary_controlled(1f32, half_ulp, 2, 1 << 22, &mut fpsr).unwrap().to_bits(), 0x3f80_0001);
+        assert_eq!(fpsr, IXC);
+        fpsr = 0;
+        assert_eq!(binary_controlled(1f64, 1., 3, 2 << 22, &mut fpsr).unwrap().to_bits(), 1 << 63);
+        assert_eq!(fpsr, 0);
+        assert_eq!(binary_controlled(-2f32, 1., 4, DN, &mut fpsr), Some(1.));
+        assert_eq!(binary_controlled(-2f32, 1., 5, DN, &mut fpsr), Some(-2.));
+        assert_eq!(binary_controlled(-2f32, -1., 4, DN, &mut fpsr), Some(-1.));
+        assert_eq!(binary_controlled(0f32, -0., 5, DN, &mut fpsr).unwrap().to_bits(), 1 << 31);
+        assert_eq!(binary_controlled(0f32, -0., 4, DN, &mut fpsr).unwrap().to_bits(), 0);
+        let qnan = f32::from_bits(0xffc0_1234);
+        let snan = f32::from_bits(0x7f80_5678);
+        assert_eq!(binary_controlled(qnan, -1., 6, DN, &mut fpsr), Some(-1.));
+        assert_eq!(binary_controlled(qnan, 1., 3, 1 << 22, &mut fpsr).unwrap().to_bits(), qnan.to_bits());
+        assert_eq!(binary_controlled(1f32, qnan, 3, 1 << 22, &mut fpsr).unwrap().to_bits(), qnan.to_bits());
+        assert_eq!(binary_controlled(snan, -1., 6, DN, &mut fpsr).unwrap().to_bits(), DEFAULT_NAN32);
+        assert_eq!(fpsr, IOC);
+        fpsr = 0;
+        assert_eq!(binary_controlled(0f64, f64::INFINITY, 0, DN, &mut fpsr).unwrap().to_bits(), DEFAULT_NAN64);
+        assert_eq!(fpsr, IOC);
+        assert_eq!(binary_controlled(0f64, f64::INFINITY, 8, DN, &mut fpsr).unwrap().to_bits(), DEFAULT_NAN64 ^ (1 << 63));
+    }
+
+    #[test]
+    fn fma_directed_rounding_and_single_rounding() {
+        for (mode, positive, negative) in [
+            (0, 0x3f80_0000, 0xbf80_0000),
+            (1, 0x3f80_0001, 0xbf80_0000),
+            (2, 0x3f80_0000, 0xbf80_0001),
+            (3, 0x3f80_0000, 0xbf80_0000),
+        ] {
+            let fpcr = DN | (mode << 22);
+            let mut fpsr = 1 << 27;
+            let half_ulp = f32::from_bits(103 << 23); // 2^-24
+            assert_eq!(fmla_controlled(1f32, half_ulp, 1., fpcr, &mut fpsr).to_bits(), positive);
+            assert_eq!(fmla_controlled(-1f32, -half_ulp, 1., fpcr, &mut fpsr).to_bits(), negative);
+            assert_eq!(fpsr, (1 << 27) | IXC);
+            let half_ulp = f64::from_bits(970u64 << 52); // 2^-53
+            let expected = 0x3ff0_0000_0000_0000 + u64::from(mode == 1);
+            assert_eq!(fmla_controlled(1f64, half_ulp, 1., fpcr, &mut fpsr).to_bits(), expected);
+        }
+        let mut fpsr = 0;
+        let (n, m) = (f32::from_bits(0x3f80_0001), f32::from_bits(0x3f7f_fffe));
+        assert_eq!(fmla_controlled(-1f32, n, m, DN, &mut fpsr).to_bits(), 0xa880_0000); // -2^-46
+        let (n, m) = (f64::from_bits(0x3ff0_0000_0000_0001), f64::from_bits(0x3fef_ffff_ffff_fffe));
+        assert_eq!(fmla_controlled(-1f64, n, m, DN, &mut fpsr).to_bits(), 0xb970_0000_0000_0000); // -2^-104
+        assert_eq!(fpsr, 0);
+    }
+
+    #[test]
+    fn fma_tininess_before_rounding_and_flush_flags() {
+        let minimum = f32::from_bits(0x0080_0000);
+        let below_one = f32::from_bits(0x3f7f_ffff);
+        let mut fpsr = 0;
+        // This exact product is halfway below the smallest normal. Arm detects
+        // tininess before the result rounds up to a normal number.
+        assert_eq!(fmla_controlled(0f32, minimum, below_one, DN, &mut fpsr).to_bits(), minimum.to_bits());
+        assert_eq!(fpsr, UFC | IXC);
+        fpsr = 0;
+        assert_eq!(fmla_controlled(0f32, minimum, below_one, FZ, &mut fpsr).to_bits(), 0);
+        assert_eq!(fpsr, UFC);
+        fpsr = 0;
+        assert_eq!(fmla_controlled(-0f32, -minimum, 0.5, FZ, &mut fpsr).to_bits(), 0x8000_0000);
+        assert_eq!(fpsr, UFC); // exact subnormal flush does not raise IXC
+        fpsr = 0;
+        assert_eq!(fmla_controlled(0f32, minimum, 0.5, DN, &mut fpsr).to_bits(), 0x0040_0000);
+        assert_eq!(fpsr, 0);
+        fpsr = 0;
+        assert_eq!(fmla_controlled(1f32, f32::from_bits(1), f32::INFINITY, FZ, &mut fpsr).to_bits(), DEFAULT_NAN32);
+        assert_eq!(fpsr, IDC | IOC);
+        let mut fpsr = 0;
+        let minimum = f64::from_bits(0x0010_0000_0000_0000);
+        let below_one = f64::from_bits(0x3fef_ffff_ffff_ffff);
+        assert_eq!(fmla_controlled(0f64, minimum, below_one, DN, &mut fpsr).to_bits(), minimum.to_bits());
+        assert_eq!(fpsr, UFC | IXC);
+    }
+
+    #[test]
+    fn fma_nan_priority_overflow_and_zero_signs() {
+        let mut fpsr = 0;
+        let qnan = f32::from_bits(0xffc0_1234);
+        let snan = f32::from_bits(0x7f80_5678);
+        assert_eq!(fmla_controlled(qnan, snan, 1., 1 << 22, &mut fpsr).to_bits(), 0x7fc0_5678);
+        assert_eq!(fpsr, IOC);
+        fpsr = 0;
+        assert_eq!(fmla_controlled(qnan, 1., 2., DN, &mut fpsr).to_bits(), DEFAULT_NAN32);
+        assert_eq!(fpsr, 0);
+        assert_eq!(fmla_controlled(qnan, f32::INFINITY, 0., 1 << 22, &mut fpsr).to_bits(), DEFAULT_NAN32);
+        assert_eq!(fpsr, IOC);
+        for mode in 0..4 {
+            fpsr = 0;
+            let fpcr = DN | (mode << 22);
+            let result = fmla_controlled(0f32, f32::MAX, 2., fpcr, &mut fpsr);
+            assert_eq!(result.to_bits(), if mode < 2 { 0x7f80_0000 } else { 0x7f7f_ffff });
+            assert_eq!(fpsr, OFC | IXC);
+            fpsr = 0;
+            assert_eq!(fmla_controlled(-1f64, 1., 1., fpcr, &mut fpsr).to_bits(), if mode == 2 { 1 << 63 } else { 0 });
+            assert_eq!(fmla_controlled(-0f64, -0., 1., fpcr, &mut fpsr).to_bits(), 1 << 63);
+            assert_eq!(fmla_controlled(0f64, 0., 1., fpcr, &mut fpsr).to_bits(), 0);
+            assert_eq!(fpsr, 0);
+        }
+    }
+
+    #[test]
+    fn default_mode_retains_jit_reference_contract() {
+        let mut fpsr = 1 << 27;
+        assert_eq!(fmla_controlled(0f64, f64::INFINITY, 0., 0, &mut fpsr).to_bits(), DEFAULT_NAN64);
+        assert_eq!(fpsr, 1 << 27);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn binary_matches_independent_hardware_rounding_and_exception_flags() {
+        fn next(state: &mut u64) -> u64 {
+            *state ^= *state << 13; *state ^= *state >> 7; *state ^= *state << 17; *state
+        }
+        let mut seed = 0x8903_023c_3742_bcadu64;
+        macro_rules! check {
+            ($t:ty, $mask:expr, $operation:literal, $opcode:expr) => {
+                for mode in 0..4 {
+                    let control = 0x1f80u32 | ([0, 2, 1, 3][mode as usize] << 13);
+                    for _ in 0..256 {
+                        let (ab, bb) = (next(&mut seed) & $mask, next(&mut seed) & $mask);
+                        let (a, b) = (<$t>::from_bits(ab as _), <$t>::from_bits(bb as _));
+                        let mut host = a;
+                        let (mut saved, mut raised) = (0u32, 0u32);
+                        unsafe {
+                            std::arch::asm!("stmxcsr [{saved}]", "ldmxcsr [{control}]", $operation,
+                                "stmxcsr [{raised}]", "ldmxcsr [{saved}]",
+                                saved = in(reg) &mut saved, control = in(reg) &control, raised = in(reg) &mut raised,
+                                result = inout(xmm_reg) host, b = in(xmm_reg) b, options(nostack));
+                        }
+                        let mut fpsr = 0;
+                        let result = binary_controlled(a, b, $opcode, DN | (mode << 22), &mut fpsr).unwrap();
+                        assert_eq!(result.to_bits(), host.to_bits(), "{} opcode {} mode {mode}, a={ab:x} b={bb:x}", stringify!($t), $opcode);
+                        // Overflow and inexact are IEEE flags shared by both
+                        // ISAs. Underflow differs at the pre-rounding boundary
+                        // and is checked analytically by the Arm-specific test.
+                        let expected_flags = (((raised as u64 >> 3) & 1) << 2)
+                            | (((raised as u64 >> 5) & 1) << 4);
+                        assert_eq!(fpsr & (OFC | IXC), expected_flags);
+                        let mut after = 0u32;
+                        unsafe { std::arch::asm!("stmxcsr [{out}]", out = in(reg) &mut after, options(nostack)); }
+                        assert_eq!(after, saved);
+                    }
+                }
+            }
+        }
+        check!(f32, 0xff7f_ffffu64, "addss {result}, {b}", 2);
+        check!(f32, 0xff7f_ffffu64, "subss {result}, {b}", 3);
+        check!(f32, 0xff7f_ffffu64, "mulss {result}, {b}", 0);
+        check!(f64, 0xffef_ffff_ffff_ffffu64, "addsd {result}, {b}", 2);
+        check!(f64, 0xffef_ffff_ffff_ffffu64, "subsd {result}, {b}", 3);
+        check!(f64, 0xffef_ffff_ffff_ffffu64, "mulsd {result}, {b}", 0);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn fma_matches_hardware_all_rounding_modes_without_touching_mxcsr() {
+        if !std::is_x86_feature_detected!("avx") || !std::is_x86_feature_detected!("fma") { return; }
+        // Hardware is an independent oracle for finite IEEE rounding. Arm NaN
+        // priority, FZ and before-rounding tininess are tested separately above.
+        fn next(state: &mut u64) -> u64 {
+            *state ^= *state << 13; *state ^= *state >> 7; *state ^= *state << 17; *state
+        }
+        let mut seed = 0x0ef1_b173_e73c_492bu64;
+        for mode in 0..4 {
+            let rc = [0, 2, 1, 3][mode as usize];
+            let control = 0x1f80u32 | (rc << 13);
+            for _ in 0..1024 {
+                let bits = [next(&mut seed), next(&mut seed), next(&mut seed)];
+                let [a, n, m] = bits.map(|v| f64::from_bits(v & !0x0010_0000_0000_0000));
+                let mut host = n;
+                let (mut saved, mut raised) = (0u32, 0u32);
+                unsafe {
+                    std::arch::asm!("stmxcsr [{saved}]", "ldmxcsr [{control}]", "vfmadd213sd {result}, {m}, {a}",
+                        "stmxcsr [{raised}]", "ldmxcsr [{saved}]",
+                        saved = in(reg) &mut saved, control = in(reg) &control, raised = in(reg) &mut raised,
+                        result = inout(xmm_reg) host, m = in(xmm_reg) m, a = in(xmm_reg) a, options(nostack));
+                }
+                let mut fpsr = 0;
+                assert_eq!(fmla_controlled(a, n, m, DN | (mode << 22), &mut fpsr).to_bits(), host.to_bits(), "f64 mode {mode}, {bits:x?}");
+                let mut after = 0u32;
+                unsafe { std::arch::asm!("stmxcsr [{out}]", out = in(reg) &mut after, options(nostack)); }
+                assert_eq!(after, saved);
+                let [a, n, m] = bits.map(|v| f32::from_bits(v as u32 & !0x0080_0000));
+                let mut host = n;
+                unsafe {
+                    std::arch::asm!("stmxcsr [{saved}]", "ldmxcsr [{control}]", "vfmadd213ss {result}, {m}, {a}",
+                        "stmxcsr [{raised}]", "ldmxcsr [{saved}]",
+                        saved = in(reg) &mut saved, control = in(reg) &control, raised = in(reg) &mut raised,
+                        result = inout(xmm_reg) host, m = in(xmm_reg) m, a = in(xmm_reg) a, options(nostack));
+                }
+                fpsr = 0;
+                assert_eq!(fmla_controlled(a, n, m, DN | (mode << 22), &mut fpsr).to_bits(), host.to_bits(), "f32 mode {mode}, {bits:x?}");
+                unsafe { std::arch::asm!("stmxcsr [{out}]", out = in(reg) &mut after, options(nostack)); }
+                assert_eq!(after, saved);
+            }
+        }
+    }
 }

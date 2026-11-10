@@ -23,7 +23,7 @@ use std::sync::Mutex;
 
 const MAGIC: &[u8; 8] = b"MCLAOT04";
 /// Bump when the translator's output changes.
-const TRANSLATOR_VERSION: u32 = 23;
+const TRANSLATOR_VERSION: u32 = 25;
 
 #[derive(Clone)]
 struct Image {
@@ -34,6 +34,8 @@ struct Image {
     /// Static entry points (function starts), if known.
     entries: Vec<u64>,
     loaded: bool,
+    /// Whether a cache for this translator version was successfully loaded.
+    cached: bool,
 }
 
 static IMAGES: Mutex<Vec<Image>> = Mutex::new(Vec::new());
@@ -73,25 +75,32 @@ fn fnv(parts: &[&[u8]]) -> String {
 }
 
 fn flags_word() -> u32 {
-    crate::jit::commpage_checks() as u32
+    crate::jit::commpage_checks() as u32 | ((crate::jit::emit::native_fma() as u32) << 1)
+        | ((crate::jit::emit::direct_operands() as u32) << 2)
+        | ((crate::jit::emit::loop_cache() as u32) << 3)
+        | ((maclator_core::mem::native_pair_atomic() as u32) << 4)
+        | ((crate::jit::emit::register_budget() as u32) << 5)
+        | ((crate::jit::emit::cold_budget() as u32) << 7)
+        | ((crate::jit::emit::csel_chain() as u32) << 8)
+        | ((crate::jit::emit::packed_flags() as u32) << 11)
 }
 
 /// Register the main executable (mapped at a fixed address).
 pub fn register_main(path: &str, uuid: [u8; 16], start: u64, end: u64, entries: Vec<u64>) {
     let key = format!("main-{}-{}", hex(&uuid), fnv(&[path.as_bytes()]));
-    add_image(Image { name: path.rsplit('/').next().unwrap_or(path).to_string(), key, start, end, entries, loaded: false });
+    add_image(Image { name: path.rsplit('/').next().unwrap_or(path).to_string(), key, start, end, entries, loaded: false, cached: false });
 }
 
 /// Register dyld (also mapped at a fixed address).
 pub fn register_dyld(path: &str, uuid: [u8; 16], start: u64, end: u64) {
     let key = format!("dyld-{}-{}", hex(&uuid), fnv(&[path.as_bytes()]));
-    add_image(Image { name: "dyld".into(), key, start, end, entries: vec![], loaded: false });
+    add_image(Image { name: "dyld".into(), key, start, end, entries: vec![], loaded: false, cached: false });
 }
 
 /// Register the shared cache once dyld has had us map it.
 pub fn register_cache(uuid: [u8; 16], start: u64, end: u64) {
     let key = format!("dsc-{}", hex(&uuid));
-    add_image(Image { name: "dyld_shared_cache".into(), key, start, end, entries: vec![], loaded: false });
+    add_image(Image { name: "dyld_shared_cache".into(), key, start, end, entries: vec![], loaded: false, cached: false });
     ensure_loaded();
 }
 
@@ -152,7 +161,7 @@ pub fn register_image_at(addr: u64) {
     if std::env::var_os("MACLATOR_STATS").is_some() {
         eprintln!("[maclator] aot: registered image {key} [{start:#x}, {end:#x})");
     }
-    add_image(Image { name: format!("lib-{}", &hex(&uuid)[..8]), key, start, end, entries: vec![], loaded: false });
+    add_image(Image { name: format!("lib-{}", &hex(&uuid)[..8]), key, start, end, entries: vec![], loaded: false, cached: false });
     ensure_loaded();
 }
 
@@ -232,10 +241,12 @@ pub fn ensure_loaded() {
             continue;
         }
         img.loaded = true;
-        match load_file(&file_for(img, "aot")) {
+        let begun = std::time::Instant::now();
+        match load_file(&file_for(img, "aot"), img.start, img.end) {
             Ok(n) if n > 0 => {
+                img.cached = true;
                 if std::env::var_os("MACLATOR_TRACE").is_some() || std::env::var_os("MACLATOR_STATS").is_some() {
-                    eprintln!("[maclator] aot: loaded {n} blocks for {}", img.name);
+                    eprintln!("[maclator] aot: loaded {n} blocks for {} in {:.1} ms", img.name, begun.elapsed().as_secs_f64() * 1000.0);
                 }
             }
             _ => {}
@@ -249,24 +260,48 @@ fn code_offset(n: usize) -> usize {
     (32 + n * 16 + CODE_ALIGN - 1) & !(CODE_ALIGN - 1)
 }
 
-fn load_file(path: &std::path::Path) -> std::io::Result<usize> {
+// Bound disk-controlled sizes before allocating memory or publishing executable
+// code. The current cache is normally a few MiB to tens of MiB per image.
+const MAX_AOT_BLOCKS: usize = 4_000_000;
+const MAX_AOT_CODE: usize = 512 << 20;
+
+fn cache_layout(head: &[u8; 32], file_len: u64) -> Option<(usize, usize, usize)> {
+    let rd32 = |o| u32::from_le_bytes(head[o..o + 4].try_into().unwrap());
+    let rd64 = |o| u64::from_le_bytes(head[o..o + 8].try_into().unwrap());
+    if &head[..8] != MAGIC || rd32(8) != TRANSLATOR_VERSION || rd32(12) != flags_word() {
+        return None;
+    }
+    let n = usize::try_from(rd64(16)).ok()?;
+    let code_len = usize::try_from(rd64(24)).ok()?;
+    if n == 0 || n > MAX_AOT_BLOCKS || code_len == 0 || code_len > MAX_AOT_CODE {
+        return None;
+    }
+    let code_off = code_offset(n);
+    if (code_off + code_len) as u64 > file_len {
+        return None;
+    }
+    Some((n, code_len, code_off))
+}
+
+fn load_file(path: &std::path::Path, start: u64, end: u64) -> std::io::Result<usize> {
     let mut f = std::fs::File::open(path)?;
     let mut head = [0u8; 32];
-    if f.read_exact(&mut head).is_err() || &head[..8] != MAGIC {
+    if f.read_exact(&mut head).is_err() {
         return Ok(0);
     }
-    let rd32 = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
     let rd64 = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
-    if rd32(&head, 8) != TRANSLATOR_VERSION || rd32(&head, 12) != flags_word() {
+    let Some((n, code_len, code_off)) = cache_layout(&head, f.metadata()?.len()) else {
         return Ok(0);
-    }
-    let n = rd64(&head, 16) as usize;
-    let code_len = rd64(&head, 24) as usize;
-    let code_off = code_offset(n);
+    };
     let mut idx = vec![0u8; n * 16];
     f.read_exact(&mut idx)?;
-    if f.metadata()?.len() < (code_off + code_len) as u64 {
-        return Ok(0);
+    // Never let an invalid index publish arbitrary host addresses. Validate the
+    // whole image before registering any entry; a partial load is not useful.
+    for entry in idx.chunks_exact(16) {
+        let pc = rd64(entry, 0);
+        if pc < start || pc >= end || pc & 3 != 0 || rd64(entry, 8) >= code_len as u64 {
+            return Ok(0);
+        }
     }
     // Copy the code into the JIT code cache. (Mapping the file itself PROT_EXEC makes macOS
     // run a Gatekeeper assessment on every cache file and pop up "could not verify" dialogs.)
@@ -278,11 +313,7 @@ fn load_file(path: &std::path::Path) -> std::io::Result<usize> {
         let dst = unsafe { std::slice::from_raw_parts_mut(base as *mut u8, code_len) };
         f.read_exact(dst)?;
     }
-    for i in 0..n {
-        let pc = rd64(&idx, i * 16);
-        let off = rd64(&idx, i * 16 + 8);
-        crate::jit::register_block(pc, base + off);
-    }
+    crate::jit::register_blocks(idx.chunks_exact(16).map(|entry| (rd64(entry, 0), base + rd64(entry, 8))));
     Ok(n)
 }
 
@@ -312,7 +343,9 @@ pub fn save_profile() {
         let mut prof = read_profile(&path);
         let before = prof.len();
         prof.extend(seen[i].iter().copied());
-        let aot_missing = !file_for(img, "aot").exists();
+        // A file left by an older translator is present but unusable. Rebuild
+        // it even when this run saw no blocks beyond the existing profile.
+        let aot_missing = !img.cached;
         if prof.len() != before || (aot_missing && (!prof.is_empty() || !img.entries.is_empty())) {
             let mut buf = Vec::with_capacity(prof.len() * 8);
             for pc in &prof {
@@ -438,7 +471,9 @@ fn build(img: &Image, profile: &BTreeSet<u64>) -> std::io::Result<()> {
         }
     }
     let path = file_for(img, "aot");
-    let tmp = path.with_extension("aot.tmp");
+    // Several applications can finish simultaneously. Each builder writes its
+    // own temporary file, then atomically replaces the complete cache.
+    let tmp = path.with_extension(format!("aot.{}.tmp", std::process::id()));
     let mut f = std::fs::File::create(&tmp)?;
     let mut hdr = Vec::new();
     hdr.extend_from_slice(MAGIC);
@@ -485,7 +520,7 @@ pub fn build_standalone(path: &str) -> std::io::Result<usize> {
     let img_start = lo.wrapping_add(slide);
     let img_end = hi.wrapping_add(slide);
     let key = format!("main-{}-{}", hex(&m.uuid), fnv(&[path.as_bytes()]));
-    let img = Image { name: path.to_string(), key, start: img_start, end: img_end, entries, loaded: false };
+    let img = Image { name: path.to_string(), key, start: img_start, end: img_end, entries, loaded: false, cached: false };
     let _ = std::fs::create_dir_all(cache_dir());
     let prof = read_profile(&file_for(&img, "profile"));
     build(&img, &prof)?;
@@ -494,7 +529,13 @@ pub fn build_standalone(path: &str) -> std::io::Result<usize> {
 }
 
 fn load_count(p: &std::path::Path) -> usize {
-    std::fs::read(p).ok().filter(|d| d.len() >= 32).map(|d| u64::from_le_bytes(d[16..24].try_into().unwrap()) as usize).unwrap_or(0)
+    // This query only needs the header, not another read of the entire code.
+    let Ok(mut f) = std::fs::File::open(p) else { return 0 };
+    let mut head = [0u8; 32];
+    if f.read_exact(&mut head).is_err() {
+        return 0;
+    }
+    f.metadata().ok().and_then(|m| cache_layout(&head, m.len())).map(|(n, _, _)| n).unwrap_or(0)
 }
 
 /// Function entry points from LC_FUNCTION_STARTS (runtime addresses).
@@ -510,4 +551,56 @@ pub fn function_starts(path: &str, m: &crate::macho::MachO, slide: u64) -> Vec<u
         return vec![];
     }
     crate::macho::decode_function_starts(&buf, m.text_vmaddr()).into_iter().map(|a| a.wrapping_add(slide)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header(n: u64, code_len: u64) -> [u8; 32] {
+        let mut h = [0u8; 32];
+        h[..8].copy_from_slice(MAGIC);
+        h[8..12].copy_from_slice(&TRANSLATOR_VERSION.to_le_bytes());
+        h[12..16].copy_from_slice(&flags_word().to_le_bytes());
+        h[16..24].copy_from_slice(&n.to_le_bytes());
+        h[24..32].copy_from_slice(&code_len.to_le_bytes());
+        h
+    }
+
+    #[test]
+    fn cache_header_rejects_stale_truncated_and_oversized_files() {
+        let h = header(20, 128);
+        let expected_len = (code_offset(20) + 128) as u64;
+        assert_eq!(cache_layout(&h, expected_len), Some((20, 128, code_offset(20))));
+        assert_eq!(cache_layout(&h, expected_len - 1), None);
+        assert_eq!(cache_layout(&header(u64::MAX, 128), u64::MAX), None);
+        assert_eq!(cache_layout(&header(20, u64::MAX), u64::MAX), None);
+        assert_eq!(cache_layout(&header(0, 128), expected_len), None);
+        let mut stale = h;
+        stale[8..12].copy_from_slice(&(TRANSLATOR_VERSION - 1).to_le_bytes());
+        assert_eq!(cache_layout(&stale, expected_len), None);
+        let mut different_features = h;
+        different_features[12..16].copy_from_slice(&(flags_word() ^ 2).to_le_bytes());
+        assert_eq!(cache_layout(&different_features, expected_len), None);
+        different_features[12..16].copy_from_slice(&(flags_word() ^ 4).to_le_bytes());
+        assert_eq!(cache_layout(&different_features, expected_len), None);
+        different_features[12..16].copy_from_slice(&(flags_word() ^ 8).to_le_bytes());
+        assert_eq!(cache_layout(&different_features, expected_len), None);
+        different_features[12..16].copy_from_slice(&(flags_word() ^ 16).to_le_bytes());
+        assert_eq!(cache_layout(&different_features, expected_len), None);
+        different_features[12..16].copy_from_slice(&(flags_word() ^ (1 << 11)).to_le_bytes());
+        assert_eq!(cache_layout(&different_features, expected_len), None);
+    }
+
+    #[test]
+    fn load_rejects_invalid_index_before_publishing_code() {
+        let p = std::env::temp_dir().join(format!("maclator-invalid-aot-{}", std::process::id()));
+        let mut bytes = header(1, 16).to_vec();
+        bytes.extend_from_slice(&0x1000u64.to_le_bytes());
+        bytes.extend_from_slice(&16u64.to_le_bytes()); // exactly past the code
+        bytes.resize(code_offset(1) + 16, 0);
+        std::fs::write(&p, bytes).unwrap();
+        assert_eq!(load_file(&p, 0x1000, 0x2000).unwrap(), 0);
+        std::fs::remove_file(p).unwrap();
+    }
 }

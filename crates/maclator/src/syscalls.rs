@@ -69,6 +69,33 @@ fn cstr_at(p: u64) -> String {
     unsafe { std::ffi::CStr::from_ptr(p as *const libc::c_char).to_string_lossy().into_owned() }
 }
 
+/// Longest path name read from guest memory, NUL included. Above XNU's MAXPATHLEN (1024), so any
+/// name the kernel would accept fits; a longer one is passed to the host kernel unread.
+const GUEST_NAME_MAX: usize = 8192;
+
+/// The NUL-terminated string at guest address `p`, read with `read` (a fault-safe copy) in pieces
+/// that stop at each 4 KiB boundary, so a name that ends just before an unmapped page is still read.
+/// None if any byte before the NUL cannot be read, or no NUL comes within `max` bytes.
+fn guest_cstr(p: u64, max: usize, mut read: impl FnMut(u64, &mut [u8]) -> bool) -> Option<String> {
+    const PIECE: u64 = 4096;
+    let mut name = Vec::new();
+    let mut at = p;
+    while name.len() < max {
+        let n = ((PIECE - at % PIECE) as usize).min(max - name.len());
+        let mut buf = vec![0u8; n];
+        if !read(at, &mut buf) {
+            return None;
+        }
+        if let Some(end) = buf.iter().position(|&c| c == 0) {
+            name.extend_from_slice(&buf[..end]);
+            return Some(String::from_utf8_lossy(&name).into_owned());
+        }
+        name.extend_from_slice(&buf);
+        at = at.checked_add(n as u64)?;
+    }
+    None
+}
+
 /// Handle SVC. `cpu.pc` already points after the SVC.
 pub fn handle_svc(cpu: &mut Cpu) {
     let num = cpu.x[16] as u32 as i32;
@@ -209,8 +236,11 @@ fn bsd(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
     let mut keep: Option<std::ffi::CString> = None;
     let mut guest_path: Option<String> = None;
     if let Some(i) = pidx {
-        if args[i] != 0 {
-            let orig = cstr_at(args[i]);
+        // A name we cannot read (or longer than GUEST_NAME_MAX) is passed through untouched:
+        // the host kernel then returns the appropriate error (EFAULT for an unreadable name),
+        // instead of the translator faulting on the guest's pointer.
+        let name = if args[i] != 0 { guest_cstr(args[i], GUEST_NAME_MAX, crate::guestmem::read) } else { None };
+        if let Some(orig) = name {
             let full = if orig.starts_with('/') {
                 Some(orig.clone())
             } else if at {
@@ -761,5 +791,48 @@ pub fn syscall_name(n: u64) -> &'static str {
         536 => "shared_region_map_and_slide_2_np",
         550 => "map_with_linking_np",
         _ => "?",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Guest memory for the tests: `bytes` at address `base`; reads below `limit` succeed.
+    fn reader(base: u64, bytes: &[u8], limit: u64) -> impl FnMut(u64, &mut [u8]) -> bool + '_ {
+        move |at, buf| {
+            if at < base || at + buf.len() as u64 > limit {
+                return false;
+            }
+            let off = (at - base) as usize;
+            buf.copy_from_slice(&bytes[off..off + buf.len()]);
+            true
+        }
+    }
+
+    #[test]
+    fn guest_cstr_reads_up_to_an_unreadable_page_and_no_further() {
+        let base = 0x10_0000u64;
+        let mut mem = vec![b'a'; 8192];
+        // "name\0" ending exactly at the end of the readable page.
+        mem[4096 - 5..4096].copy_from_slice(b"name\0");
+        let p = base + 4096 - 5;
+        assert_eq!(guest_cstr(p, GUEST_NAME_MAX, reader(base, &mem, base + 4096)).as_deref(), Some("name"));
+        // The same bytes with no NUL before the unreadable page: unreadable, not a crash.
+        mem[4095] = b'x';
+        assert_eq!(guest_cstr(p, GUEST_NAME_MAX, reader(base, &mem, base + 4096)), None);
+        // A pointer into the unreadable page itself.
+        assert_eq!(guest_cstr(base + 4096, GUEST_NAME_MAX, reader(base, &mem, base + 4096)), None);
+    }
+
+    #[test]
+    fn guest_cstr_reads_across_pages_and_stops_at_max() {
+        let base = 0x20_0000u64;
+        let mut mem = vec![b'b'; 8192];
+        mem[5000] = 0;
+        let p = base + 3000;
+        assert_eq!(guest_cstr(p, GUEST_NAME_MAX, reader(base, &mem, base + 8192)).map(|s| s.len()), Some(2000));
+        assert_eq!(guest_cstr(p, 2000, reader(base, &mem, base + 8192)), None);
+        assert_eq!(guest_cstr(p, 2001, reader(base, &mem, base + 8192)).map(|s| s.len()), Some(2000));
     }
 }

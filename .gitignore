@@ -5,3 +5,5 @@
 !/tests/guest/signals_registers.S
 gpu/out/
 .claude/
+.agents/
+openspec/

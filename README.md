@@ -36,7 +36,7 @@ free disk, and an internet connection for the one-time download of the arm64 dyl
 ```bash
 git clone https://github.com/linuxkid473/maclator && cd maclator
 scripts/install.sh            # builds maclator + the GPU bridge, installs to ~/bin
-scripts/fetch-sysroot.sh      # downloads the arm64e dyld shared cache (≈5.5 GB) into ~/maclator-sysroot
+scripts/fetch-sysroot.sh      # downloads the arm64e dyld shared cache (≈3–7 GB) into ~/maclator-sysroot
 maclator ./some-arm64-binary  # that's it; the sysroot is found automatically
 ```
 

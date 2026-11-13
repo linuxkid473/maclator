@@ -1,6 +1,7 @@
 //! Maclator: run arm64 macOS programs on x86-64 Macs.
 
 mod aot;
+mod bundle;
 mod cache;
 mod commpage;
 mod engine;
@@ -33,6 +34,11 @@ fn usage() -> ! {
     eprintln!("  --overlay-root DIR  local Xcode component payloads (experimental)");
     eprintln!("  --trace         trace system calls");
     eprintln!("  --gpu           route the guest's Metal API to the host GPU");
+    eprintln!("  --gpu-only SUBSTR  give the GPU only to guest processes whose arguments contain SUBSTR");
+    eprintln!("  --gpu-process  same as --gpu --gpu-only --type=gpu-process");
+    eprintln!("  --no-gpu        never load the GPU bridge (overrides automatic detection)");
+    eprintln!("  --print-plan    print the resolved launch plan to stderr, then run");
+    eprintln!("  --dry-run       print the resolved launch plan to stderr and exit");
     std::process::exit(2);
 }
 
@@ -40,6 +46,11 @@ fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let mut dyld = std::env::var("MACLATOR_DYLD").unwrap_or_else(|_| "/usr/lib/dyld".to_string());
     let mut no_aot = false;
+    let mut gpu_enabled: Option<bool> = None;
+    let mut gpu_scope: Option<String> = None;
+    let mut gpu_flag = false;
+    let mut print_plan = false;
+    let mut dry_run = false;
     while let Some(a) = args.first().cloned() {
         match a.as_str() {
             "--trace-file" => {
@@ -64,18 +75,44 @@ fn main() {
                 dyld = args.remove(0);
             }
             "--gpu" => {
-                // Route the guest's Metal API to the host GPU (see gpu.rs).
-                std::env::set_var("MACLATOR_GPU", "1");
+                // Route the guest's Metal API to the host GPU (see gpu.rs). Unchanged semantics:
+                // every guest process gets the bridge unless --gpu-only narrows it.
+                gpu_enabled = Some(true);
+                gpu_flag = true;
+                args.remove(0);
+            }
+            "--gpu-process" => {
+                // Convenience for the common case: the bridge for the GPU process only.
+                gpu_enabled = Some(true);
+                gpu_scope = Some("--type=gpu-process".to_string());
+                gpu_flag = true;
+                args.remove(0);
+            }
+            "--no-gpu" => {
+                // Explicitly off, including against automatic detection and any inherited
+                // MACLATOR_GPU in the environment.
+                gpu_enabled = Some(false);
+                gpu_flag = true;
+                args.remove(0);
+            }
+            "--print-plan" => {
+                print_plan = true;
+                args.remove(0);
+            }
+            "--dry-run" => {
+                dry_run = true;
                 args.remove(0);
             }
             "--gpu-only" => {
                 // Only guest processes whose arguments contain SUBSTR get the GPU (e.g. --type=gpu-process);
                 // others run untouched (saves the bridge start-up cost in every helper process).
+                // As before, this narrows the bridge but does not enable it on its own.
                 args.remove(0);
                 if args.is_empty() {
                     usage();
                 }
-                std::env::set_var("MACLATOR_GPU_ONLY", args.remove(0));
+                gpu_scope = Some(args.remove(0));
+                gpu_flag = true;
             }
             "--interp" => {
                 jit::JIT_ENABLED.store(false, Ordering::Relaxed);
@@ -109,7 +146,13 @@ fn main() {
                 if args.is_empty() {
                     usage();
                 }
-                let exe = resolve_path(&args[0]);
+                let exe = match resolve_target(&args[0]) {
+                    Ok(target) => target.executable().to_string(),
+                    Err(e) => {
+                        eprintln!("maclator: {e}");
+                        std::process::exit(1);
+                    }
+                };
                 match aot::build_standalone(&exe) {
                     Ok(n) => {
                         eprintln!("maclator: translated {n} blocks of {exe} ahead of time");
@@ -146,8 +189,87 @@ fn main() {
             paths::set_cache_dir(&d);
         }
     }
+    if std::env::var_os("MACLATOR_TRACE").is_some() {
+        syscalls::TRACE.store(true, Ordering::Relaxed);
+    }
+    let target = match resolve_target(&args[0]) {
+        Ok(target) => target,
+        Err(e) => {
+            eprintln!("maclator: {e}");
+            std::process::exit(1);
+        }
+    };
+    let exe = target.executable().to_string();
+
+    // Explicit flags win over anything inherited through the environment (see design D5); the
+    // environment only fills in what the command line left alone.
+    let mut source = if gpu_flag { "explicit" } else { "auto" };
+    if gpu_enabled.is_none() && std::env::var_os("MACLATOR_GPU").is_some() {
+        gpu_enabled = Some(true);
+        source = "explicit";
+    }
+    if gpu_scope.is_none() {
+        if let Ok(scope) = std::env::var("MACLATOR_GPU_ONLY") {
+            if !scope.is_empty() {
+                gpu_scope = Some(scope);
+            }
+        }
+    }
+
+    let shim = gpu::shim_path();
+    let mut reason = "explicit";
+    if gpu_enabled.is_none() {
+        // Automatic detection only applies to the new form (a bundle path); the historical
+        // "path to the executable inside the bundle" keeps behaving exactly as before.
+        match &target {
+            Target::Executable(_) => reason = "not-in-bundle",
+            Target::Bundle { root, .. } => {
+                if !slices::arm64_only(&exe) {
+                    reason = "not-arm64";
+                } else if !bundle::is_chromium_family(root) {
+                    reason = "not-chromium";
+                } else if shim.is_none() {
+                    reason = "bridge-missing";
+                    eprintln!("maclator: chromium-family app, but the GPU bridge library was not found; continuing without it");
+                } else {
+                    gpu_enabled = Some(true);
+                    if gpu_scope.is_none() {
+                        gpu_scope = Some("--type=gpu-process".to_string());
+                    }
+                    source = "auto";
+                    reason = "chromium-family";
+                    eprintln!("maclator: chromium-family app; enabling Metal bridge (--no-gpu to disable)");
+                }
+            }
+        }
+    }
+
+    // Normalise the environment so it describes exactly one state: children read it through
+    // spawn's forwarding instead, but keeping it truthful avoids surprises for other readers.
+    match gpu_enabled {
+        Some(true) => {
+            std::env::set_var("MACLATOR_GPU", "1");
+            match &gpu_scope {
+                Some(scope) => std::env::set_var("MACLATOR_GPU_ONLY", scope),
+                None => {
+                    std::env::remove_var("MACLATOR_GPU_ONLY");
+                }
+            }
+        }
+        Some(false) | None => {
+            std::env::remove_var("MACLATOR_GPU");
+            std::env::remove_var("MACLATOR_GPU_ONLY");
+        }
+    }
+    let gpu_active = gpu_enabled == Some(true)
+        && gpu_scope
+            .as_ref()
+            .map(|scope| args.iter().skip(1).any(|a| a.contains(scope.as_str())))
+            .unwrap_or(true);
+
     {
-        // Options that re-launched arm64 children must inherit.
+        // Options that re-launched arm64 children must inherit. Built after the decision so the
+        // decision itself reaches them (design D9).
         let mut fwd: Vec<String> = vec!["--dyld".into(), dyld.clone()];
         if let Some(d) = paths::cache_dir() {
             fwd.push("--sysroot".into());
@@ -163,12 +285,16 @@ fn main() {
         if no_aot {
             fwd.push("--no-aot".into());
         }
-        if std::env::var_os("MACLATOR_GPU").is_some() {
-            fwd.push("--gpu".into());
-            if let Ok(o) = std::env::var("MACLATOR_GPU_ONLY") {
-                fwd.push("--gpu-only".into());
-                fwd.push(o);
+        match gpu_enabled {
+            Some(true) => {
+                fwd.push("--gpu".into());
+                if let Some(scope) = &gpu_scope {
+                    fwd.push("--gpu-only".into());
+                    fwd.push(scope.clone());
+                }
             }
+            Some(false) => fwd.push("--no-gpu".into()),
+            None => {}
         }
         if std::env::var_os("MACLATOR_TRACE_FILE").is_some() {
             fwd.push("--trace-file".into());
@@ -180,19 +306,28 @@ fn main() {
         }
         spawn::configure(fwd);
     }
-    if std::env::var_os("MACLATOR_TRACE").is_some() {
-        syscalls::TRACE.store(true, Ordering::Relaxed);
+
+    if print_plan || dry_run {
+        emit_plan(&Plan {
+            target: &exe,
+            gpu: gpu_label(gpu_enabled, gpu_scope.as_deref()),
+            source,
+            reason,
+            shim: shim.as_deref(),
+            argv: &args[1..],
+        });
+        if dry_run {
+            std::process::exit(0);
+        }
     }
-    let exe = resolve_path(&args[0]);
-    let gpu_active = std::env::var_os("MACLATOR_GPU").is_some()
-        && std::env::var("MACLATOR_GPU_ONLY").map(|o| args.iter().skip(1).any(|a| a.contains(&o))).unwrap_or(true);
+
     let mut envp: Vec<String> = std::env::vars()
         .filter(|(k, _)| !k.starts_with("MACLATOR_") || matches!(k.as_str(), "MACLATOR_DUMP_ON_FAULT" | "MACLATOR_GPU_BRIDGE" | "MACLATOR_JIT_THRESHOLD" | "MACLATOR_STATS" | "MACLATOR_FALLBACK_HIST"))
         .map(|(k, v)| format!("{k}={v}"))
         .collect();
 
     if gpu_active && !gpu::inject(&mut envp) {
-        eprintln!("maclator: --gpu: libmclmetal.dylib not found (looked next to maclator, in ./gpu, ~/.maclator/gpu, $MACLATOR_GPU_DIR)");
+        eprintln!("maclator: GPU bridge: libmclmetal.dylib not found (looked next to maclator, in ./gpu, ~/.maclator/gpu, $MACLATOR_GPU_DIR)");
     }
     if std::env::var_os("MACLATOR_TRACE_FILE").is_some() {
         unsafe {
@@ -260,4 +395,65 @@ fn resolve_path(p: &str) -> String {
         }
     }
     p.to_string()
+}
+
+/// What the user pointed maclator at.
+enum Target {
+    /// A plain executable path (or a PATH lookup): historical behaviour, no automatic decisions.
+    Executable(String),
+    /// An application bundle: resolved to its main executable, eligible for automatic decisions.
+    Bundle { root: std::path::PathBuf, exe: String },
+}
+
+impl Target {
+    fn executable(&self) -> &str {
+        match self {
+            Target::Executable(path) => path,
+            Target::Bundle { exe, .. } => exe,
+        }
+    }
+}
+
+/// A launch request as maclator resolved it, for `--print-plan` / `--dry-run`.
+struct Plan<'a> {
+    target: &'a str,
+    gpu: &'a str,
+    source: &'a str,
+    reason: &'a str,
+    shim: Option<&'a str>,
+    argv: &'a [String],
+}
+
+fn gpu_label(enabled: Option<bool>, scope: Option<&str>) -> &'static str {
+    match (enabled, scope) {
+        (Some(true), Some(_)) => "scoped",
+        (Some(true), None) => "all",
+        (Some(false), _) => "off",
+        (None, _) => "unset",
+    }
+}
+
+fn emit_plan(p: &Plan<'_>) {
+    eprintln!("target={}", p.target);
+    eprintln!("gpu={}", p.gpu);
+    eprintln!("source={}", p.source);
+    eprintln!("reason={}", p.reason);
+    eprintln!("shim={}", p.shim.unwrap_or("none"));
+    eprintln!("argv={}", p.argv.join(" "));
+}
+
+/// Resolve the launch target: an application bundle becomes its main executable, anything else
+/// goes through the usual path/PATH handling. `resolve_path` canonicalises first, so symlinked
+/// and trailing-slash bundle paths behave like the physical path.
+fn resolve_target(arg: &str) -> Result<Target, String> {
+    let path = resolve_path(arg);
+    let candidate = std::path::Path::new(&path);
+    if candidate.is_dir() && bundle::is_bundle(candidate) {
+        let exe = bundle::resolve_executable(candidate)?;
+        return Ok(Target::Bundle {
+            root: candidate.to_path_buf(),
+            exe: exe.to_string_lossy().into_owned(),
+        });
+    }
+    Ok(Target::Executable(path))
 }

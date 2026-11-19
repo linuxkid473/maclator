@@ -8,7 +8,11 @@ maclator [options] ./arm64-binary [args...]
   --dyld PATH        arm64 dyld to use (default /usr/lib/dyld; $MACLATOR_DYLD)
   --sysroot DIR      directory with the arm64e dyld shared cache (else auto-discovered, see SETUP.md)
   --gpu              route the guest's Metal API to the host GPU
-  --gpu-only SUBSTR  give the GPU only to guest processes whose arguments contain SUBSTR (e.g. --type=gpu-process)
+  --gpu-only SUBSTR  give the GPU only to guest processes whose arguments contain SUBSTR
+  --gpu-process      same as --gpu --gpu-only --type=gpu-process
+  --no-gpu           never load the bridge (overrides automatic detection and $MACLATOR_GPU)
+  --print-plan       print the resolved launch plan on stderr, then run
+  --dry-run          print the resolved launch plan on stderr and exit
   --interp           interpreter only (no JIT/AOT): slow, useful to rule out JIT bugs
   --no-aot           do not load or save the translation cache
   --trace            log syscalls / Mach messages / path redirections
@@ -16,6 +20,13 @@ maclator [options] ./arm64-binary [args...]
 ```
 
 More flags, environment variables and signals: [DEBUGGING.md](DEBUGGING.md).
+
+`maclator /Applications/Foo.app` works as well: a bundle path is resolved to its main executable. For an
+arm64-only app whose bundle ships `Contents/Frameworks/<X> Framework.framework` (Electron and the other
+Chromium-family apps), the Metal bridge is enabled automatically and one line is printed; `--no-gpu` turns
+that off. Passing the executable path (`Foo.app/Contents/MacOS/Foo`) keeps the old behaviour: nothing is
+enabled unless you ask for it. `--dry-run` prints the decision (`target`, `gpu`, `source`, `reason`, `shim`,
+`argv`) without launching anything, and `--print-plan` prints it and keeps going.
 
 Notes that apply to every app:
 
@@ -83,6 +94,14 @@ Without `--gpu` the app aborts ("GPU … usable. Goodbye"): Electron cannot star
 device, so either use the launcher or add `--disable-gpu`. Flashing drives (raw disk access) has not been tested.
 
 ## Any other Electron/Chromium app
+
+```bash
+maclator /Applications/Foo.app             # bundle resolution + Metal bridge, chosen automatically
+maclator --dry-run /Applications/Foo.app   # show what would be used without launching anything
+```
+
+If the automatic decision is wrong, or the bridge makes rendering worse, `--no-gpu` turns it off. The
+explicit form still works and is the thing to reach for when debugging:
 
 ```bash
 maclator --gpu --gpu-only --type=gpu-process ./App --no-sandbox --disable-gpu-sandbox --disable-gpu-watchdog \

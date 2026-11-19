@@ -5,9 +5,9 @@
 | | |
 |---|---|
 | Machine | Intel Mac (x86-64). Developed on a Haswell i5-4440 (4 cores, 12 GB). The JIT needs SSE2 plus SSSE3/SSE4.1 (any Mac since ~2008–2010 has them). More cores and RAM help a lot: Chromium and VS Code are ~10 processes. |
-| macOS | 26 (Tahoe). Older releases are untested. The host's `/usr/lib/dyld` is a universal binary that contains the arm64e slice Maclator uses as guest dyld (`lipo -archs /usr/lib/dyld` should print `x86_64 arm64e`). |
+| macOS | 26 (Tahoe) is what the project targets. Other releases work as long as the cache matches the host's major version: `scripts/fetch-sysroot.sh` picks one automatically (13.7 hosts were verified with the 13.6 cache). The host's `/usr/lib/dyld` is a universal binary that contains the arm64e slice Maclator uses as guest dyld (`lipo -archs /usr/lib/dyld` should print `x86_64 arm64e`). |
 | Tools | Xcode Command Line Tools (`xcode-select --install`), Rust (`curl https://sh.rustup.rs -sSf \| sh`). |
-| Disk | ≈ 7 GB for the arm64 dyld shared cache, plus ≈ 1 GB for the AOT cache after heavy use. |
+| Disk | ≈ 3–7 GB for the arm64 dyld shared cache (depending on the release), plus ≈ 1 GB for the AOT cache after heavy use. |
 
 A second (any architecture) Mac is convenient for development: `cargo build --release --target x86_64-apple-darwin`
 cross-compiles, and the `bench/` scripts drive an Intel test Mac over ssh. It is not required to *use* Maclator.
@@ -42,8 +42,13 @@ Macs, so you download it once from an Apple Silicon macOS IPSW using [`ipsw`](ht
 (it extracts just the cache from the remote IPSW; nothing else is downloaded):
 
 ```bash
-scripts/fetch-sysroot.sh            # or: scripts/fetch-sysroot.sh 26.6.2
+scripts/fetch-sysroot.sh            # = scripts/fetch-sysroot.sh auto Mac14,2
+scripts/fetch-sysroot.sh 26.6.2     # or pick a release explicitly
 ```
+
+`auto` takes the newest release of the host's macOS major version that Apple still serves (13.7 host → 13.6,
+26.7 host → 26.6.2), because the guest userland and the host's `/usr/lib/dyld` have to match. The script also
+auto-detects which `ipsw` binary can stream from Apple's CDN (see the note below).
 
 which is equivalent to:
 
@@ -53,14 +58,23 @@ ipsw download ipsw --macos --version 26.6.2 --dyld --dyld-arch arm64e --extract-
      --output ~/maclator-sysroot/25G83__Mac14,2
 ```
 
-The directory must end up containing `dyld_shared_cache_arm64e`, `dyld_shared_cache_arm64e.01` … `.12` and the
-`.a2s/.atlas/.map` files. Maclator finds it automatically, in this order: `$MACLATOR_SYSROOT`, `~/.maclator/sysroot`
-(a directory, or a file containing a path), then the newest `~/maclator-sysroot/*/` that contains a
-`dyld_shared_cache_arm64e`. `--sysroot DIR` overrides.
+The directory must end up containing the cache files the build produces (`dyld_shared_cache_arm64e` plus its
+subcaches and `.map`; newer releases also have `.a2s/.atlas`). Maclator finds it automatically, in this order:
+`$MACLATOR_SYSROOT`, `~/.maclator/sysroot` (a directory, or a file containing a path), then the newest
+`~/maclator-sysroot/*/` that contains a `dyld_shared_cache_arm64e`. `--sysroot DIR` overrides.
 
-Which version? The cache used during development is **macOS 26.6.2 (25G83)** on a **26.7** host; the exact
-matching build was not obtainable and it works anyway. Use the newest release that `ipsw` can fetch that is close
-to your host version. A cache that is *newer* than the host kernel is more likely to hit unimplemented syscalls.
+Stock `ipsw` cannot stream an IPSW from Apple's CDN any more: the CDN answers range requests with `206` but omits
+the `Accept-Ranges` header, and `ipsw` refuses to continue ("does not support byte-ranged requests"). A build with
+`ranger.HTTPRanger.DisableAcceptRangesHeaderCheck = true` works; `scripts/fetch-sysroot.sh` prefers one found as
+`$MACLATOR_IPSW`, `ipsw-patched` on `PATH`, or `~/bin/ipsw-patched`, and otherwise explains what is missing.
+
+If you fetch a cache from a different macOS major than the host, dyld aborts with
+`compatible libdyld.dylib not found`. The script then pulls the matching arm64e `/usr/lib/dyld` out of the same
+build's recovery image; point `MACLATOR_DYLD` at the printed path.
+
+Which version? The cache used during development is **macOS 26.6.2 (25G83)** on a **26.7** host. Prefer a release
+of the host's own major version; a cache that is *newer* than the host kernel is more likely to hit unimplemented
+syscalls, and one that is much older cannot run apps that need newer APIs.
 
 ## 3. Check it works
 
@@ -86,9 +100,13 @@ program exits normally.
 
 ## 4. Optional: GPU acceleration
 
-Launch with `--gpu` (see [GPU.md](GPU.md) for what that does). For Chromium/Electron apps only the GPU process
-should get the bridge: `--gpu --gpu-only --type=gpu-process`. Ready-made launchers are in [USAGE.md](USAGE.md).
-The GPU bridge needs a working Metal device on the Intel Mac; on GPUs without Metal support it cannot work.
+Launch with `--gpu` (see [GPU.md](GPU.md) for what that does); it behaves as it always has: every guest
+process gets the bridge. Add `--gpu-only --type=gpu-process` (or the shorthand `--gpu-process`) to confine it to
+the GPU process. For arm64-only Chromium-family bundles the bridge is enabled automatically **when you pass the
+bundle path**, so `maclator /Applications/Foo.app` needs no flags at all (`--no-gpu` opts out). Note that only
+arm64-only helpers are re-launched through maclator: a universal or x86_64 helper runs natively and never gets
+the bridge. Ready-made launchers are in [USAGE.md](USAGE.md). The GPU bridge needs a working Metal device on the
+Intel Mac; on GPUs without Metal support it cannot work.
 
 ## Where things live
 

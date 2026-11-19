@@ -4,7 +4,9 @@
 |---|---|
 | dyld fails opening `/System/Library/dyld/dyld_shared_cache_arm64e` (or similar at startup) | No sysroot. Run `scripts/fetch-sysroot.sh` or pass `--sysroot DIR`; see [SETUP.md](SETUP.md). |
 | Immediate crash with `sandbox initialization failed` | Electron/Chromium apps need `--no-sandbox`. |
-| App aborts with "GPU … usable. Goodbye." / `gpu_data_manager_impl_private.cc` | The app's GPU process cannot start without a Metal device. Launch with the GPU bridge (`--gpu --gpu-only --type=gpu-process` + ANGLE flags, see [USAGE.md](USAGE.md)) or add `--disable-gpu`. |
+| App aborts with "GPU … usable. Goodbye." / `gpu_data_manager_impl_private.cc` | The app's GPU process cannot start without a Metal device. Launch with `--gpu` (arm64-only Chromium-family bundles get it automatically when the bundle path is used; see [USAGE.md](USAGE.md)) or add `--disable-gpu`. |
+| Rendering is wrong or slower with the bridge on | Rule it out with `--no-gpu` (or `--dry-run` to see whether it would have been enabled at all). |
+| `several executables in Contents/MacOS` | The bundle has more than one executable and no usable `CFBundleExecutable`. Pass the one you want explicitly: `maclator Foo.app/Contents/MacOS/Name`. |
 | `maclator: cannot load GPU bridge …` | `libmclbridge.dylib`/`libmclmetal.dylib` not found. Install to `~/bin/gpu/` (`scripts/install.sh`) or set `MACLATOR_GPU_DIR`. |
 | Chromium runs at ~1 fps after the GPU bridge is enabled | Often not a GPU problem: a window that is not visible (`document.visibilityState == "hidden"`) throttles requestAnimationFrame. For benchmarks add `--disable-backgrounding-occluded-windows --disable-renderer-backgrounding --disable-background-timer-throttling`. Also check `MCL_STATS=1` output for `remote exception` lines, and that the GPU process did not crash ("GPU process exited unexpectedly" in the log; Chromium then falls back to software). |
 | Very slow first launch, then fast | Expected: code is translated on the fly. Quit normally so the translation cache is saved. The cache is invalidated by every Maclator update that changes code generation. |

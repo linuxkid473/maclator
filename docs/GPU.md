@@ -9,6 +9,9 @@ Launch Chromium with acceleration: `~/bin/chromium-gpu [url]` on the test Mac (s
 `--gpu --gpu-only --type=gpu-process` so only the GPU process loads the bridge — giving every helper the bridge
 starved the renderers; flags: `--use-angle=metal --use-gl=angle --enable-gpu --ignore-gpu-blocklist
 --disable-gpu-sandbox --disable-gpu-watchdog --no-sandbox`, plus the "lean" flags, see Chromium configuration).
+`--gpu` on its own still means every guest process; only a bundle-path launch (`maclator Foo.app`) picks the
+GPU-process scope automatically. Only arm64-only helpers are re-launched through maclator, so a universal or
+x86_64 helper runs natively and never gets the bridge.
 
 ### Results (animated 2D canvas, hack; `bench/gpubench.py`)
 | stage | median frame | notes |

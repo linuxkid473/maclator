@@ -71,12 +71,17 @@ fn cstr_at(p: u64) -> String {
 
 /// Longest path name read from guest memory, NUL included. Above XNU's MAXPATHLEN (1024), so any
 /// name the kernel would accept fits; a longer one is passed to the host kernel unread.
-const GUEST_NAME_MAX: usize = 8192;
+pub(crate) const GUEST_NAME_MAX: usize = 8192;
 
 /// The NUL-terminated string at guest address `p`, read with `read` (a fault-safe copy) in pieces
 /// that stop at each 4 KiB boundary, so a name that ends just before an unmapped page is still read.
 /// None if any byte before the NUL cannot be read, or no NUL comes within `max` bytes.
-fn guest_cstr(p: u64, max: usize, mut read: impl FnMut(u64, &mut [u8]) -> bool) -> Option<String> {
+pub(crate) fn guest_cstr(p: u64, max: usize, read: impl FnMut(u64, &mut [u8]) -> bool) -> Option<String> {
+    guest_cbytes(p, max, read).map(|name| String::from_utf8_lossy(&name).into_owned())
+}
+
+/// [`guest_cstr`]'s bytes as the guest wrote them, before the conversion to UTF-8, NUL excluded.
+pub(crate) fn guest_cbytes(p: u64, max: usize, mut read: impl FnMut(u64, &mut [u8]) -> bool) -> Option<Vec<u8>> {
     const PIECE: u64 = 4096;
     let mut name = Vec::new();
     let mut at = p;
@@ -88,7 +93,7 @@ fn guest_cstr(p: u64, max: usize, mut read: impl FnMut(u64, &mut [u8]) -> bool) 
         }
         if let Some(end) = buf.iter().position(|&c| c == 0) {
             name.extend_from_slice(&buf[..end]);
-            return Some(String::from_utf8_lossy(&name).into_owned());
+            return Some(name);
         }
         name.extend_from_slice(&buf);
         at = at.checked_add(n as u64)?;

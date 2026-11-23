@@ -472,14 +472,29 @@ fn bsd_inner(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
         478 if args[0] == 0x100 => set_ok(cpu, 0, 0),
         92 if matches!(args[1], 59 | 61 | 97 | 98 | 103) => {
             // Code-signing fcntls (F_ADDSIGS, F_ADDFILESIGS[_RETURN/_INFO], F_CHECK_LV):
-            // the Intel host kernel cannot validate arm64 signatures, so accept them.
+            // the Intel host kernel cannot validate arm64 signatures, so accept them once the
+            // descriptor and, where it is read, the struct check out. XNU first refuses an
+            // invalid descriptor, or one that is not a vnode (a pipe or a socket, say), with
+            // EBADF, and F_GETPATH makes the same two checks.
+            let mut path = [0u8; 1024];
+            let g = hostsys::unix(92, &[args[0], 50 /* F_GETPATH */, path.as_mut_ptr() as u64, 0, 0, 0, 0, 0]);
+            if g.carry && g.rax == libc::EBADF as u64 {
+                set_res(cpu, g);
+                return;
+            }
             // F_ADDFILESIGS_RETURN/_INFO report the signed extent back in fs_file_start;
             // the signature blob sits at the tail, so everything before it is signed.
-            if matches!(args[1], 97 | 103) && args[2] != 0 {
-                unsafe {
-                    let fs = args[2] as *mut u64;
-                    let blob_off = *fs.add(1);
-                    *fs = blob_off;
+            // As XNU does, the struct's input part is copied in whole (24 bytes up to
+            // fs_fsignatures_size, 32 for _INFO up to fs_cdhash), and a struct that cannot be
+            // read (NULL included) is EFAULT. One that is read but cannot be written back is
+            // EFAULT too; that answer is this runtime's own (XNU goes on to the signature first).
+            if matches!(args[1], 97 | 103) {
+                let mut fs = [0u8; 32];
+                let len = if args[1] == 97 { 24 } else { 32 };
+                // fs_file_start (at 0) takes fs_blob_start (at 8).
+                if !crate::guestmem::read(args[2], &mut fs[..len]) || !crate::guestmem::write(args[2], &fs[8..16]) {
+                    set_err(cpu, libc::EFAULT as u64);
+                    return;
                 }
             }
             set_ok(cpu, 0, 0);
@@ -493,9 +508,14 @@ fn bsd_inner(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
             let g = hostsys::unix(92, &[args[0], 50 /* F_GETPATH */, path.as_mut_ptr() as u64, 0, 0, 0, 0, 0]);
             let p = std::ffi::CStr::from_bytes_until_nul(&path).ok().and_then(|c| c.to_str().ok()).unwrap_or("");
             if !g.carry && (p.starts_with("/usr/lib/") || p.starts_with("/System/")) {
-                // struct fgetsigsinfo { off_t fg_file_start; int fg_info_request; int fg_sig_is_platform; }
-                unsafe { *((args[2] + 12) as *mut i32) = 1 };
-                set_ok(cpu, 0, 0);
+                // struct fgetsigsinfo { off_t fg_file_start; int fg_info_request; int fg_sig_is_platform; },
+                // copied in whole first, as XNU does.
+                let mut si = [0u8; 16];
+                if crate::guestmem::read(args[2], &mut si) && crate::guestmem::write(args[2] + 12, &1i32.to_le_bytes()) {
+                    set_ok(cpu, 0, 0);
+                } else {
+                    set_err(cpu, libc::EFAULT as u64);
+                }
             } else {
                 let r = hostsys::unix(n, &args);
                 set_res(cpu, r);

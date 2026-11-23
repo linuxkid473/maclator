@@ -62,11 +62,23 @@ fn set_res(cpu: &mut Cpu, r: SysResult) {
     }
 }
 
-fn cstr_at(p: u64) -> String {
-    if p == 0 {
-        return String::new();
+/// What sysctlbyname(2) copies in: exactly `len` bytes at guest address `p`, read with `read` (a
+/// fault-safe copy), with the name it would look up (the bytes up to the first NUL, less one
+/// trailing dot, which XNU's name2oid also drops). `Ok(None)`
+/// when `len` is 0 or at least MAXPATHLEN (1024, which XNU refuses with ENAMETOOLONG), which the
+/// host kernel answers without reading the name; `Err(EFAULT)` when the bytes cannot be read.
+fn sysctl_name(p: u64, len: u64, read: impl FnOnce(u64, &mut [u8]) -> bool) -> Result<Option<(Vec<u8>, String)>, u64> {
+    if len == 0 || len >= 1024 {
+        return Ok(None);
     }
-    unsafe { std::ffi::CStr::from_ptr(p as *const libc::c_char).to_string_lossy().into_owned() }
+    let mut buf = vec![0u8; len as usize];
+    if !read(p, &mut buf) {
+        return Err(libc::EFAULT as u64);
+    }
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    let name = String::from_utf8_lossy(&buf[..end]);
+    let name = name.strip_suffix('.').unwrap_or(&name).to_string();
+    Ok(Some((buf, name)))
 }
 
 /// Longest path name read from guest memory, NUL included. Above XNU's MAXPATHLEN (1024), so any
@@ -381,7 +393,26 @@ fn bsd_inner(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
             set_res(cpu, r);
         }
         SYS_SYSCTLBYNAME => {
-            let name = cstr_at(args[0]);
+            // XNU copies exactly namelen bytes of the name, failing with EFAULT if it cannot, then
+            // uses them up to the first NUL. The host kernel is handed our copy, not the guest's
+            // pointer, so it looks up the name checked here even if guest memory changes meanwhile.
+            let (copy, name) = match sysctl_name(args[0], args[1], crate::guestmem::read) {
+                Ok(Some(read)) => read,
+                Ok(None) => {
+                    let r = hostsys::unix(n, &args);
+                    set_res(cpu, r);
+                    return;
+                }
+                Err(e) => {
+                    set_err(cpu, e);
+                    return;
+                }
+            };
+            // The names answered here are read-only, so a write (newp and newlen both set) is EPERM.
+            if (name == "hw.machine" || sysctl_override(&name).is_some()) && args[4] != 0 && args[5] != 0 {
+                set_err(cpu, libc::EPERM as u64);
+                return;
+            }
             if name == "hw.machine" {
                 write_sysctl_str(cpu, args[2], args[3], "arm64");
                 return;
@@ -390,15 +421,29 @@ fn bsd_inner(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
                 write_sysctl_int(cpu, args[2], args[3], v);
                 return;
             }
+            args[0] = copy.as_ptr() as u64;
             let r = hostsys::unix(n, &args);
             set_res(cpu, r);
         }
         SYS_SYSCTL => {
-            // hw.machine (CTL_HW=6, HW_MACHINE=1) is what uname() reports.
-            let mib = unsafe { std::slice::from_raw_parts(args[0] as *const i32, (args[1] as usize).min(8)) };
-            if args[1] == 2 && mib == [6, 1] {
-                write_sysctl_str(cpu, args[2], args[3], "arm64");
-                return;
+            // hw.machine (CTL_HW=6, HW_MACHINE=1) is what uname() reports. XNU copies a two-entry
+            // MIB (its count is a 32-bit u_int), failing with EFAULT if it cannot; the host kernel is
+            // handed our copy, as above, and a write to hw.machine is EPERM.
+            let mut mib = [0u8; 8];
+            if args[1] as u32 == 2 {
+                if !crate::guestmem::read(args[0], &mut mib) {
+                    set_err(cpu, libc::EFAULT as u64);
+                    return;
+                }
+                if mib == [6, 0, 0, 0, 1, 0, 0, 0] {
+                    if args[4] != 0 && args[5] != 0 {
+                        set_err(cpu, libc::EPERM as u64);
+                        return;
+                    }
+                    write_sysctl_str(cpu, args[2], args[3], "arm64");
+                    return;
+                }
+                args[0] = mib.as_ptr() as u64;
             }
             let r = hostsys::unix(n, &args);
             set_res(cpu, r);
@@ -825,6 +870,29 @@ mod tests {
         assert_eq!(guest_cstr(p, GUEST_NAME_MAX, reader(base, &mem, base + 4096)), None);
         // A pointer into the unreadable page itself.
         assert_eq!(guest_cstr(base + 4096, GUEST_NAME_MAX, reader(base, &mem, base + 4096)), None);
+    }
+
+    #[test]
+    fn sysctl_name_reads_exactly_namelen_bytes() {
+        let base = 0x30_0000u64;
+        let mut mem = vec![0u8; 8192];
+        // "hw.machine" with no NUL, ending exactly where the unreadable page begins.
+        mem[4096 - 10..4096].copy_from_slice(b"hw.machine");
+        let p = base + 4096 - 10;
+        let copied = |copy: &[u8], name: &str| Ok(Some((copy.to_vec(), name.to_string())));
+        assert_eq!(sysctl_name(p, 10, reader(base, &mem, base + 4096)), copied(b"hw.machine", "hw.machine"));
+        // One byte more runs into the unreadable page: EFAULT, as XNU's copyin.
+        assert_eq!(sysctl_name(p, 11, reader(base, &mem, base + 4096)), Err(libc::EFAULT as u64));
+        // Bytes after a NUL inside namelen are not part of the name, but stay in the copy.
+        mem[4096 - 3] = 0;
+        assert_eq!(sysctl_name(p, 10, reader(base, &mem, base + 4096)), copied(b"hw.mach\0ne", "hw.mach"));
+        // One trailing dot is dropped from the name, as XNU's name2oid does; the copy keeps it.
+        mem[4096 - 3] = b'.';
+        assert_eq!(sysctl_name(p, 8, reader(base, &mem, base + 4096)), copied(b"hw.mach.", "hw.mach"));
+        // An empty name, and lengths XNU refuses with ENAMETOOLONG, are left to the host kernel.
+        assert_eq!(sysctl_name(p, 0, reader(base, &mem, base + 4096)), Ok(None));
+        assert_eq!(sysctl_name(base, 1024, reader(base, &mem, base + 8192)), Ok(None));
+        assert_eq!(sysctl_name(base, 1023, reader(base, &mem, base + 8192)), copied(&[0; 1023], ""));
     }
 
     #[test]

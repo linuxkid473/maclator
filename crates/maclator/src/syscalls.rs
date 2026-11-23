@@ -367,7 +367,9 @@ fn bsd_inner(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
             // dyld maps a library's __TEXT (file offset 0, executable) at its final address:
             // register it with the AOT cache so translations persist across runs.
             if !r.carry && was_exec && args[5] == 0 && (args[4] as i64) >= 0 && args[1] >= 0x1000 {
-                crate::aot::register_image_at(r.rax);
+                // The length mapped: mmap_16k rounds it up to 16 KiB, the host a MAP_FIXED one to its 4 KiB pages.
+                let page = if args[3] & 0x10 != 0 { 0x1000 } else { 0x4000 };
+                crate::aot::register_image_at(r.rax, (args[1] + page - 1) & !(page - 1));
             }
             set_res(cpu, r);
         }

@@ -105,41 +105,51 @@ pub fn register_cache(uuid: [u8; 16], start: u64, end: u64) {
 }
 
 /// Register the arm64 Mach-O whose header is mapped at `addr` (a dyld-loaded library or
-/// helper image). Keyed by UUID and load address, so it only hits the cache when the
-/// library loads at the same place again.
-pub fn register_image_at(addr: u64) {
+/// helper image) by a mapping `len` bytes long. Keyed by UUID and load address, so it only hits
+/// the cache when the library loads at the same place again.
+pub fn register_image_at(addr: u64, len: u64) {
     if !ENABLED.load(Ordering::Relaxed) {
         return;
     }
-    let rd = |o: u64| unsafe { std::ptr::read_unaligned((addr + o) as *const u32) };
+    // The mapping is the guest's: it may be unreadable, shorter than its header claims, or not a
+    // Mach-O at all. So copy the header and then the load commands with the fault-safe read, and
+    // never read load commands past the mapping.
+    let mut head = [0u8; 32];
+    if !crate::guestmem::read(addr, &mut head) {
+        return;
+    }
+    let field = |o: usize| u32::from_le_bytes(head[o..o + 4].try_into().unwrap());
     // mach_header_64: magic, cputype, ..., ncmds at +16, sizeofcmds at +20
-    if rd(0) != 0xfeed_facf || rd(4) != 0x0100_000c {
+    if field(0) != 0xfeed_facf || field(4) != 0x0100_000c {
         if std::env::var_os("MACLATOR_STATS").is_some() {
-            eprintln!("[maclator] aot: mmap exec at {addr:#x} not an arm64 mach-o ({:#x} {:#x})", rd(0), rd(4));
+            eprintln!("[maclator] aot: mmap exec at {addr:#x} not an arm64 mach-o ({:#x} {:#x})", field(0), field(4));
         }
         return;
     }
-    let ncmds = rd(16);
+    let ncmds = field(16);
+    let mut buf = vec![0u8; (32 + field(20) as usize).min(0x4000).min(len as usize)];
+    if !crate::guestmem::read(addr, &mut buf) {
+        return;
+    }
+    let rd = |o: u64| buf.get(o as usize..o as usize + 4).map_or(0, |s| u32::from_le_bytes(s.try_into().unwrap()));
+    let rd64 = |o: u64| buf.get(o as usize..o as usize + 8).map_or(0, |s| u64::from_le_bytes(s.try_into().unwrap()));
+    let rd16 = |o: u64| -> [u8; 16] { buf.get(o as usize..o as usize + 16).map_or([0; 16], |s| s.try_into().unwrap()) };
     let mut off = 32u64;
     let mut uuid = [0u8; 16];
     let (mut text_vm, mut lo, mut hi) = (u64::MAX, u64::MAX, 0u64);
     for _ in 0..ncmds.min(512) {
         let cmd = rd(off);
         let size = rd(off + 4) as u64;
-        if size < 8 || off + size > 0x4000 {
+        // An LC_UUID (24 bytes) or LC_SEGMENT_64 (72) too short for the fields read below is malformed too.
+        if size < 8 || off + size > buf.len() as u64 || (cmd == 0x1b && size < 24) || (cmd == 0x19 && size < 72) {
             return;
         }
         if cmd == 0x1b {
-            for i in 0..16 {
-                uuid[i] = unsafe { *((addr + off + 8 + i as u64) as *const u8) };
-            }
+            uuid = rd16(off + 8);
         } else if cmd == 0x19 {
-            let mut name = [0u8; 16];
-            for i in 0..16 {
-                name[i] = unsafe { *((addr + off + 8 + i as u64) as *const u8) };
-            }
-            let vmaddr = unsafe { std::ptr::read_unaligned((addr + off + 24) as *const u64) };
-            let vmsize = unsafe { std::ptr::read_unaligned((addr + off + 32) as *const u64) };
+            let name = rd16(off + 8);
+            let vmaddr = rd64(off + 24);
+            let vmsize = rd64(off + 32);
             if name.starts_with(b"__PAGEZERO") {
                 off += size;
                 continue;
@@ -590,6 +600,80 @@ mod tests {
         assert_eq!(cache_layout(&different_features, expected_len), None);
         different_features[12..16].copy_from_slice(&(flags_word() ^ (1 << 11)).to_le_bytes());
         assert_eq!(cache_layout(&different_features, expected_len), None);
+    }
+
+    /// An arm64 MH_DYLIB header with two load commands (96 bytes): LC_UUID with `id` in every
+    /// byte, then LC_SEGMENT_64 __TEXT from byte 56 to byte 128.
+    fn dylib_header(id: u8) -> [u32; 32] {
+        let u = u32::from_le_bytes([id; 4]);
+        let mut w = [0u32; 32];
+        w[..6].copy_from_slice(&[0xfeed_facf, 0x0100_000c, 0, 6, 2, 96]);
+        w[8..14].copy_from_slice(&[0x1b, 24, u, u, u, u]);
+        w[14..18].copy_from_slice(&[0x19, 72, u32::from_le_bytes(*b"__TE"), u32::from_le_bytes(*b"XT\0\0")]);
+        w[22] = 0x4000; // vmsize
+        w
+    }
+
+    /// Whether the image of `dylib_header(id)` is registered with its header at `addr`.
+    /// (Registering one reads the cache directory for its AOT file, and never writes there.)
+    fn registered(id: u8, addr: u64) -> bool {
+        IMAGES.lock().unwrap().iter().any(|i| i.key == format!("lib-{}-{addr:x}", hex(&[id; 16])))
+    }
+
+    /// Register `w` placed 0x100 bytes before a page that cannot be read, by a mapping that runs on
+    /// into that page, and return where the header was.
+    fn register_before_unreadable_page(w: &[u32; 32]) -> u64 {
+        let pg = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let m = unsafe { libc::mmap(std::ptr::null_mut(), 2 * pg, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0) };
+        assert_ne!(m, libc::MAP_FAILED);
+        let at = unsafe { m.cast::<u8>().add(pg - 0x100) };
+        unsafe { std::ptr::copy_nonoverlapping(w.as_ptr(), at.cast::<u32>(), w.len()) };
+        assert_eq!(unsafe { libc::mprotect(m.cast::<u8>().add(pg).cast(), pg, libc::PROT_NONE) }, 0);
+        register_image_at(at as u64, pg as u64 + 0x100);
+        unsafe { libc::munmap(m, 2 * pg) };
+        at as u64
+    }
+
+    #[test]
+    fn image_header_is_read_only_within_the_mapping() {
+        let w = dylib_header(0x5a);
+        // A mapping that ends at byte 120 cuts the segment command short: the rest is not the image's.
+        register_image_at(w.as_ptr() as u64, 120);
+        assert!(!registered(0x5a, w.as_ptr() as u64));
+        register_image_at(w.as_ptr() as u64, 128);
+        assert!(registered(0x5a, w.as_ptr() as u64));
+    }
+
+    #[test]
+    fn unreadable_load_commands_do_not_fault() {
+        // A header claiming 0x3100 bytes of load commands, which run into the unreadable page
+        // whatever the page size: registering it must return instead of faulting, and register
+        // nothing.
+        let mut w = dylib_header(0x6b);
+        w[5] = 0x3100; // sizeofcmds
+        assert!(!registered(0x6b, register_before_unreadable_page(&w)));
+    }
+
+    #[test]
+    fn load_commands_are_read_only_up_to_sizeofcmds() {
+        // Load commands that end before the unreadable page: the image is registered, though the
+        // mapping runs on into that page.
+        assert!(registered(0x3c, register_before_unreadable_page(&dylib_header(0x3c))));
+    }
+
+    #[test]
+    fn short_load_commands_are_not_used() {
+        // A last load command too short for its fields (an 8-byte LC_UUID or LC_SEGMENT_64), with
+        // 16 more bytes of sizeofcmds after it: the image is not registered, whatever the missing
+        // fields would be read as.
+        for cmd in [0x1b, 0x19] {
+            let mut w = [0u32; 38];
+            w[..32].copy_from_slice(&dylib_header(0x2d));
+            w[4..6].copy_from_slice(&[3, 120]); // ncmds, sizeofcmds
+            w[32..].copy_from_slice(&[cmd, 8, 0x2d2d_2d2d, 0x2d2d_2d2d, 0x2d2d_2d2d, 0x2d2d_2d2d]);
+            register_image_at(w.as_ptr() as u64, 152);
+            assert!(!registered(0x2d, w.as_ptr() as u64), "cmd {cmd:#x}");
+        }
     }
 
     #[test]

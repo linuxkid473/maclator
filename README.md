@@ -1,3 +1,5 @@
+## I've submitted a PR to the original repository, if they accept the PR, this fork will no longer be maintained! So in the future you may have to go to the original project to get newer versions. I will not be updating this until I get a response to the PR.
+
 <p align="left">
   <img src="Screenshots/maclator-icon.png" width="128" alt="Maclator icon">
 </p>

@@ -17,28 +17,51 @@ pub fn configure(flags: Vec<String>) {
     *FORWARD.lock().unwrap() = flags;
 }
 
-unsafe fn cstr(p: u64) -> String {
+/// XNU's NCARGS (ARG_MAX): the space execve and posix_spawn give the argument and environment
+/// strings.
+const NCARGS: usize = 1 << 20;
+
+/// The guest's path, read with the fault-safe copy: None if a byte before its NUL cannot be read,
+/// or it has no NUL within `max` bytes.
+fn cstr(p: u64, max: usize) -> Option<String> {
     if p == 0 {
-        return String::new();
+        return Some(String::new());
     }
-    std::ffi::CStr::from_ptr(p as *const libc::c_char).to_string_lossy().into_owned()
+    crate::syscalls::guest_cstr(p, max, crate::guestmem::read)
 }
 
-unsafe fn read_argv(p: u64) -> Vec<String> {
+/// The guest's NULL-terminated string vector, read with the fault-safe copy and charged as XNU's
+/// exec_extract_strings charges argv: each string its bytes as the guest wrote them, its NUL and
+/// an 8-byte pointer, then the final NULL pointer, out of `space` bytes, and no string read past
+/// the space left. EFAULT when a pointer in the vector cannot be read, even with no space left (it
+/// is read first, as in XNU), or when a byte of a string cannot be read before the space runs out;
+/// E2BIG when the space runs out first while a string is copied, or when a string's pointer or the
+/// final NULL pointer does not fit. Unlike XNU, the environment is not charged with argv: the host
+/// kernel charges it, with its NULL pointer, and scrub_shim reads it with a space of its own.
+fn read_argv(p: u64, mut space: usize) -> Result<Vec<String>, i32> {
     let mut v = Vec::new();
     if p == 0 {
-        return v;
+        return Ok(v);
     }
     let mut i = 0;
     loop {
-        let e = *((p + i * 8) as *const u64);
-        if e == 0 || i > 4096 {
+        let e = crate::guestmem::read_u64(p + i * 8).ok_or(libc::EFAULT)?;
+        if e == 0 {
             break;
         }
-        v.push(cstr(e));
+        let mut fault = false;
+        let s = crate::syscalls::guest_cbytes(e, space, |a, b| {
+            let ok = crate::guestmem::read(a, b);
+            fault |= !ok;
+            ok
+        });
+        let s = s.ok_or(if fault { libc::EFAULT } else { libc::E2BIG })?;
+        space = space.checked_sub(s.len() + 1 + 8).ok_or(libc::E2BIG)?;
+        v.push(String::from_utf8_lossy(&s).into_owned());
         i += 1;
     }
-    v
+    space.checked_sub(8).ok_or(libc::E2BIG)?; // the final NULL pointer
+    Ok(v)
 }
 
 /// Host processes (native children and the maclator re-launcher) must not inherit the arm64
@@ -47,7 +70,9 @@ unsafe fn read_argv(p: u64) -> Vec<String> {
 fn scrub_shim(n: u64, args: &mut [u64; 8]) -> Option<(Vec<CString>, Vec<u64>)> {
     let eidx = if n == SYS_EXECVE { 2 } else { 4 };
     let shim = crate::gpu::shim_path()?;
-    let env = unsafe { read_argv(args[eidx]) };
+    // An environment that cannot be read, or does not fit, goes to the host kernel as the guest
+    // passed it, which answers EFAULT or E2BIG for it.
+    let env = read_argv(args[eidx], NCARGS).ok()?;
     if !env.iter().any(|e| e.starts_with("DYLD_INSERT_LIBRARIES=") && e.contains(&shim)) {
         return None;
     }
@@ -72,7 +97,12 @@ fn scrub_shim(n: u64, args: &mut [u64; 8]) -> Option<(Vec<CString>, Vec<u64>)> {
 
 pub fn exec_like(n: u64, args: &[u64; 8]) -> SysResult {
     let (pidx, aidx) = if n == SYS_EXECVE { (0, 1) } else { (1, 3) };
-    let original_path = unsafe { cstr(args[pidx]) };
+    // A path that cannot be read goes to the host kernel as the guest passed it, and the host picks
+    // the error as it does natively (XNU's exec_save_path): EFAULT if one of its first MAXPATHLEN
+    // bytes cannot be read, ENAMETOOLONG if they hold no NUL.
+    let Some(original_path) = cstr(args[pidx], crate::syscalls::GUEST_NAME_MAX) else {
+        return hostsys::unix(n, args);
+    };
     let path = crate::paths::redirect(&original_path).unwrap_or(original_path);
     if path.is_empty() {
         return hostsys::unix(n, args);
@@ -88,7 +118,12 @@ pub fn exec_like(n: u64, args: &[u64; 8]) -> SysResult {
         return hostsys::unix(n, args);
     }
     let Ok(me) = std::env::current_exe() else { return hostsys::unix(n, args) };
-    let argv = unsafe { read_argv(args[aidx]) };
+    // The host kernel is handed the re-launch's own argv, never the guest's, so the guest's argv
+    // is read here and fails as XNU's copy of it does.
+    let argv = match read_argv(args[aidx], NCARGS) {
+        Ok(v) => v,
+        Err(e) => return SysResult { rax: e as u64, rdx: 0, carry: true },
+    };
     let mut new_argv: Vec<String> = vec![me.to_string_lossy().into_owned()];
     new_argv.extend(FORWARD.lock().unwrap().iter().cloned());
     new_argv.push(path);

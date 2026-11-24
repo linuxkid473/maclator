@@ -408,9 +408,11 @@ fn bsd_inner(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
                     return;
                 }
             };
-            // The names answered here are read-only, so a write (newp and newlen both set) is EPERM.
+            // The names answered here are read-only, so a write (newp and newlen both set) is EPERM,
+            // except hw.optional.AdvSIMD: macOS 26 and 27 do not have it, so a write finds no such name.
             if (name == "hw.machine" || sysctl_override(&name).is_some()) && args[4] != 0 && args[5] != 0 {
-                set_err(cpu, libc::EPERM as u64);
+                let e = if name == "hw.optional.AdvSIMD" { libc::ENOENT } else { libc::EPERM };
+                set_err(cpu, e as u64);
                 return;
             }
             if name == "hw.machine" {

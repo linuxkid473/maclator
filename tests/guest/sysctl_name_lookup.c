@@ -108,6 +108,11 @@ static int row(int id) {
         if (sysctlnametomib("hw.optional.arm.FEAT_LSE2.", mib, &n) == -1 || sysctlnametomib(lse2, mib2, &n2) == -1) return -1;
         return n == 4 && n2 == 4 && memcmp(mib, mib2, 4 * sizeof(int)) == 0 ? 0 : 1;
     case 14: return sysctl((int *)name2oid, 2, mib, &len, NULL, 10) == -1 ? -1 : 1;
+    case 15: {  // a write to a name macOS does not have, through libc and through the system call
+        int a = sysctlbyname("hw.optional.AdvSIMD", NULL, NULL, &one, sizeof one) == -1 ? errno : 0;
+        int b = syscall(SYS_sysctlbyname, "hw.optional.AdvSIMD", 19UL, NULL, NULL, &one, sizeof one) == -1 ? errno : 0;
+        return a == ENOENT && b == ENOENT ? (errno = ENOENT, -1) : 1;
+    }
     }
     return -2;
 }
@@ -128,6 +133,7 @@ static const struct { const char *what; int err; } rows[] = {
     {"sysctlbyname write to hw.optional.arm.FEAT_LSE2: EPERM, old value untouched", EPERM},
     {"hw.optional.arm.FEAT_LSE2. (trailing dot) has the same MIB", 0},
     {"name2oid of a NULL name with newlen 10: ENOENT", ENOENT},
+    {"hw.optional.AdvSIMD write: ENOENT from sysctlbyname and the system call", ENOENT},
 };
 
 int main(void) {

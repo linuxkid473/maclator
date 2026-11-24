@@ -701,7 +701,10 @@ fn sysctl_runtime_mib(cpu: &mut Cpu, args: &[u64; 8]) -> bool {
     }
     let Some(v) = synthetic_oid_answer(mib) else { return false };
     if args[4] != 0 && args[5] != 0 {
-        set_err(cpu, libc::EPERM as u64); // a write: these names are read-only
+        // A write: these names are read-only, except that macOS 26 and 27 have no hw.optional.AdvSIMD,
+        // so a write to it finds no such name, as the sysctlbyname system call answers.
+        let absent = synthetic_oid_name(mib).as_deref() == Some("hw.optional.AdvSIMD");
+        set_err(cpu, if absent { libc::ENOENT } else { libc::EPERM } as u64);
     } else {
         write_sysctl_int(cpu, args[2], args[3], v);
     }
@@ -765,11 +768,16 @@ fn synthetic_mib(name: &str) -> Vec<i32> {
 
 /// The table's answer for `mib` if it is one of the MIBs `sysctl_name2oid` handed out.
 fn synthetic_oid_answer(mib: &[i32]) -> Option<i64> {
+    sysctl_override(&synthetic_oid_name(mib)?)
+}
+
+/// The name a synthetic MIB was made for, if `mib` is exactly that MIB.
+fn synthetic_oid_name(mib: &[i32]) -> Option<String> {
     let index = usize::try_from(-2 - i64::from(*mib.first()?)).ok()?;
     let names = SYNTHETIC_OIDS.lock().unwrap();
     let name = names.get(index)?;
     let matches = mib.len() == name.split('.').count() && mib.iter().all(|&x| x == mib[0]);
-    if matches { sysctl_override(name) } else { None }
+    matches.then(|| name.clone())
 }
 
 fn mach_trap(cpu: &mut Cpu, n: u64) {

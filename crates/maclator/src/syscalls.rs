@@ -331,7 +331,7 @@ fn bsd_inner(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
             // (mach_task_self, MIG reply ports, ...); the JIT reads guest memory through
             // mach_vm_read with the cached task port.
             crate::engine::flush_profile();
-            let pid = unsafe { libc::fork() };
+            let pid = fork_holding_synthetic_oids();
             if pid < 0 {
                 set_err(cpu, unsafe { *libc::__error() } as u64);
             } else if pid == 0 {
@@ -756,6 +756,21 @@ fn sysctl_name2oid(cpu: &mut Cpu, mut args: [u64; 8]) {
     }
 }
 
+/// libc::fork with `SYNTHETIC_OIDS` held across it, released in the parent and in the child. A fork
+/// copies only the calling thread, so the lock held by another thread at that instant would stay
+/// held in the child, and its next lookup would never return. Guest forks and lookups share the
+/// lock, so a fork can wait for a lookup or for another fork. A lookup holds no other lock of the
+/// runtime's while it holds this one, and the lock is taken before libc::fork is called; fork's
+/// errno is kept across the release.
+fn fork_holding_synthetic_oids() -> libc::pid_t {
+    let names = SYNTHETIC_OIDS.lock().unwrap();
+    let pid = unsafe { libc::fork() };
+    let err = unsafe { *libc::__error() };
+    drop(names);
+    unsafe { *libc::__error() = err };
+    pid
+}
+
 /// The synthetic MIB for `name`, made the first time it is asked for.
 fn synthetic_mib(name: &str) -> Vec<i32> {
     let mut names = SYNTHETIC_OIDS.lock().unwrap();
@@ -1030,5 +1045,58 @@ mod tests {
         assert_eq!(synthetic_oid_answer(&[i32::MIN; 4]), None);
         assert_eq!(synthetic_oid_answer(&[-1, -1]), None);
         assert_eq!(synthetic_oid_answer(&[6, 1]), None);
+    }
+
+    /// Fork with `fork` while another thread holds `SYNTHETIC_OIDS`, which it releases once the fork
+    /// has returned in the parent, or after 1 s if `fork` was called by then (it may be waiting for
+    /// the lock); the test fails if `fork` was not called while the lock was held. In the child, look
+    /// up the MIB the parent was given before the fork. The child is killed if it has not exited 3 s
+    /// after the fork. Its wait status.
+    fn lookup_in_a_child_forked_beside_a_registry_holder(fork: fn() -> libc::pid_t) -> i32 {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        let mib = synthetic_mib("hw.optional.arm.FEAT_SME");
+        let called = std::sync::Arc::new(AtomicBool::new(false));
+        let (held, wait_held) = std::sync::mpsc::channel();
+        let (forked, wait_forked) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn({
+            let called = called.clone();
+            move || {
+                let names = SYNTHETIC_OIDS.lock().unwrap();
+                held.send(()).unwrap();
+                let overlapped = wait_forked.recv_timeout(std::time::Duration::from_secs(1)).is_ok() || called.load(SeqCst);
+                drop(names);
+                overlapped
+            }
+        });
+        wait_held.recv().unwrap();
+        called.store(true, SeqCst);
+        let pid = fork();
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            let same = || synthetic_oid_answer(&mib) == Some(0) && synthetic_mib("hw.optional.arm.FEAT_SME") == mib;
+            let ok = std::panic::catch_unwind(same).unwrap_or(false);
+            unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+        }
+        let _ = forked.send(());
+        assert!(holder.join().unwrap(), "fork was not called while the lock was held");
+        let (mut st, start) = (0, std::time::Instant::now());
+        loop {
+            let r = unsafe { libc::waitpid(pid, &mut st, libc::WNOHANG) };
+            if r == pid {
+                return st;
+            }
+            let interrupted = std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR);
+            assert!(r == 0 || interrupted, "waitpid");
+            if start.elapsed() > std::time::Duration::from_secs(3) {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_child_forked_while_another_thread_holds_the_synthetic_mibs_can_look_a_name_up() {
+        let st = lookup_in_a_child_forked_beside_a_registry_holder(fork_holding_synthetic_oids);
+        assert!(libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0, "child wait status {st:#x}");
     }
 }

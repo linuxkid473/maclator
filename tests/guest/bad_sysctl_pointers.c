@@ -1,11 +1,12 @@
 // sysctlbyname(2) and sysctl(2) given a name or MIB the guest cannot read must fail with EFAULT,
-// as they do natively, instead of crashing the runtime. Rows 14 to 23 check that ordinary lookups
+// as they do natively, instead of crashing the runtime. Rows 14 to 24 check that ordinary lookups
 // still reach the host and that the names the runtime answers itself behave as natively (a write
-// is EPERM and changes nothing, newp or newlen alone is still a read, the MIB count is 32 bits,
-// one trailing dot is dropped). The raw system calls are used because libc's sysctlbyname()
-// measures the name with strlen() in the guest first. Each row runs in its own child process so a
-// crash is reported as that row's failure; a row whose child cannot be started or collected also
-// fails. Exit status 0 when every row matches native.
+// is EPERM and changes nothing, or ENOENT for hw.optional.AdvSIMD, which macOS 26 and 27 do not
+// have; newp or newlen alone is still a read, the MIB count is 32 bits, one trailing dot is
+// dropped). The raw system calls are used because libc's sysctlbyname() measures the name with
+// strlen() in the guest first. Each row runs in its own child process so a crash is reported as
+// that row's failure; a row whose child cannot be started or collected also fails. Exit status 0
+// when every row matches native.
 #include <errno.h>
 #include <pthread.h>
 #include <sched.h>
@@ -49,7 +50,7 @@ static int bymib(const void *mib, unsigned long n) {
     return checked(syscall(SYS_sysctl, mib, n, buf, &len, NULL, 0), buf);
 }
 
-// A write (newp and newlen both set) to a read-only name: -1 with errno set, or 1 if it succeeds.
+// A write (newp and newlen both set) to a name: -1 with errno set, or 1 if it succeeds.
 static int write_byname(const void *name, size_t namelen) {
     int one = 1;
     return syscall(SYS_sysctlbyname, name, namelen, NULL, NULL, &one, sizeof one) == -1 ? -1 : 1;
@@ -162,6 +163,7 @@ static int row(int id) {
     case 21: return read_with_half_a_write(0);
     case 22: return read_with_half_a_write(1);
     case 23: return write_keeps_old(0);
+    case 24: return write_byname("hw.optional.AdvSIMD", 19);
     }
     return -2;
 }
@@ -191,6 +193,7 @@ static const struct { const char *what; int err; } rows[] = {
     {"sysctlbyname(\"hw.machine\") with only newp, or only newlen, is a read: arm64", 0},
     {"sysctl({CTL_HW, HW_MACHINE}) with only newp, or only newlen, is a read: arm64", 0},
     {"sysctlbyname(\"hw.machine\") write leaves oldp and oldlenp untouched", EPERM},
+    {"sysctlbyname(\"hw.optional.AdvSIMD\") write, a name macOS does not have", ENOENT},
 };
 
 int main(void) {

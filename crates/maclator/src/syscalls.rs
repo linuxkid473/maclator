@@ -62,11 +62,23 @@ fn set_res(cpu: &mut Cpu, r: SysResult) {
     }
 }
 
-fn cstr_at(p: u64) -> String {
-    if p == 0 {
-        return String::new();
+/// What sysctlbyname(2) copies in: exactly `len` bytes at guest address `p`, read with `read` (a
+/// fault-safe copy), with the name it would look up (the bytes up to the first NUL, less one
+/// trailing dot, which XNU's name2oid also drops). `Ok(None)`
+/// when `len` is 0 or at least MAXPATHLEN (1024, which XNU refuses with ENAMETOOLONG), which the
+/// host kernel answers without reading the name; `Err(EFAULT)` when the bytes cannot be read.
+fn sysctl_name(p: u64, len: u64, read: impl FnOnce(u64, &mut [u8]) -> bool) -> Result<Option<(Vec<u8>, String)>, u64> {
+    if len == 0 || len >= 1024 {
+        return Ok(None);
     }
-    unsafe { std::ffi::CStr::from_ptr(p as *const libc::c_char).to_string_lossy().into_owned() }
+    let mut buf = vec![0u8; len as usize];
+    if !read(p, &mut buf) {
+        return Err(libc::EFAULT as u64);
+    }
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    let name = String::from_utf8_lossy(&buf[..end]);
+    let name = name.strip_suffix('.').unwrap_or(&name).to_string();
+    Ok(Some((buf, name)))
 }
 
 /// Longest path name read from guest memory, NUL included. Above XNU's MAXPATHLEN (1024), so any
@@ -319,7 +331,7 @@ fn bsd_inner(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
             // (mach_task_self, MIG reply ports, ...); the JIT reads guest memory through
             // mach_vm_read with the cached task port.
             crate::engine::flush_profile();
-            let pid = unsafe { libc::fork() };
+            let pid = fork_holding_synthetic_oids();
             if pid < 0 {
                 set_err(cpu, unsafe { *libc::__error() } as u64);
             } else if pid == 0 {
@@ -381,7 +393,28 @@ fn bsd_inner(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
             set_res(cpu, r);
         }
         SYS_SYSCTLBYNAME => {
-            let name = cstr_at(args[0]);
+            // XNU copies exactly namelen bytes of the name, failing with EFAULT if it cannot, then
+            // uses them up to the first NUL. The host kernel is handed our copy, not the guest's
+            // pointer, so it looks up the name checked here even if guest memory changes meanwhile.
+            let (copy, name) = match sysctl_name(args[0], args[1], crate::guestmem::read) {
+                Ok(Some(read)) => read,
+                Ok(None) => {
+                    let r = hostsys::unix(n, &args);
+                    set_res(cpu, r);
+                    return;
+                }
+                Err(e) => {
+                    set_err(cpu, e);
+                    return;
+                }
+            };
+            // The names answered here are read-only, so a write (newp and newlen both set) is EPERM,
+            // except hw.optional.AdvSIMD: macOS 26 and 27 do not have it, so a write finds no such name.
+            if (name == "hw.machine" || sysctl_override(&name).is_some()) && args[4] != 0 && args[5] != 0 {
+                let e = if name == "hw.optional.AdvSIMD" { libc::ENOENT } else { libc::EPERM };
+                set_err(cpu, e as u64);
+                return;
+            }
             if name == "hw.machine" {
                 write_sysctl_str(cpu, args[2], args[3], "arm64");
                 return;
@@ -390,15 +423,32 @@ fn bsd_inner(cpu: &mut Cpu, n: u64, mut args: [u64; 8]) {
                 write_sysctl_int(cpu, args[2], args[3], v);
                 return;
             }
+            args[0] = copy.as_ptr() as u64;
             let r = hostsys::unix(n, &args);
             set_res(cpu, r);
         }
         SYS_SYSCTL => {
-            // hw.machine (CTL_HW=6, HW_MACHINE=1) is what uname() reports.
-            let mib = unsafe { std::slice::from_raw_parts(args[0] as *const i32, (args[1] as usize).min(8)) };
-            if args[1] == 2 && mib == [6, 1] {
-                write_sysctl_str(cpu, args[2], args[3], "arm64");
+            if sysctl_runtime_mib(cpu, &args) {
                 return;
+            }
+            // hw.machine (CTL_HW=6, HW_MACHINE=1) is what uname() reports. XNU copies a two-entry
+            // MIB (its count is a 32-bit u_int), failing with EFAULT if it cannot; the host kernel is
+            // handed our copy, as above, and a write to hw.machine is EPERM.
+            let mut mib = [0u8; 8];
+            if args[1] as u32 == 2 {
+                if !crate::guestmem::read(args[0], &mut mib) {
+                    set_err(cpu, libc::EFAULT as u64);
+                    return;
+                }
+                if mib == [6, 0, 0, 0, 1, 0, 0, 0] {
+                    if args[4] != 0 && args[5] != 0 {
+                        set_err(cpu, libc::EPERM as u64);
+                        return;
+                    }
+                    write_sysctl_str(cpu, args[2], args[3], "arm64");
+                    return;
+                }
+                args[0] = mib.as_ptr() as u64;
             }
             let r = hostsys::unix(n, &args);
             set_res(cpu, r);
@@ -626,6 +676,125 @@ fn sysctl_override(name: &str) -> Option<i64> {
     })
 }
 
+/// Names in `sysctl_override` that the host kernel has no MIB for, in the order the guest first
+/// looked them up. The i-th is answered at a synthetic MIB with one entry per component of its name,
+/// each -2 - i. XNU numbers its OIDs from 0 up (fixed numbers, and OID_AUTO ones from 100), so no
+/// host MIB starts with a negative number and these cannot hide a real one. They are valid in the
+/// process that looked the name up and in its forks.
+static SYNTHETIC_OIDS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// sysctl for name2oid ({0, 3}), which libc's sysctlbyname() calls before asking by number and which
+/// is all sysctlnametomib() does, and for the synthetic MIBs it hands out. True if the call was
+/// answered here; any other MIB, or one that cannot be read, is left to the caller.
+fn sysctl_runtime_mib(cpu: &mut Cpu, args: &[u64; 8]) -> bool {
+    // XNU reads the MIB's count as a u_int, and accepts 2 to CTL_MAXNAME (12) entries.
+    let count = args[1] as u32 as usize;
+    let mut raw = [0u8; 4 * 12];
+    if !(2..=12).contains(&count) || !crate::guestmem::read(args[0], &mut raw[..4 * count]) {
+        return false;
+    }
+    let mib: [i32; 12] = std::array::from_fn(|i| i32::from_le_bytes(raw[4 * i..4 * i + 4].try_into().unwrap()));
+    let mib = &mib[..count];
+    if mib == [0, 3] {
+        sysctl_name2oid(cpu, *args);
+        return true;
+    }
+    let Some(v) = synthetic_oid_answer(mib) else { return false };
+    if args[4] != 0 && args[5] != 0 {
+        // A write: these names are read-only, except that macOS 26 and 27 have no hw.optional.AdvSIMD,
+        // so a write to it finds no such name, as the sysctlbyname system call answers.
+        let absent = synthetic_oid_name(mib).as_deref() == Some("hw.optional.AdvSIMD");
+        set_err(cpu, if absent { libc::ENOENT } else { libc::EPERM } as u64);
+    } else {
+        write_sysctl_int(cpu, args[2], args[3], v);
+    }
+    true
+}
+
+/// sysctl {0, 3} (name2oid, the name in newp). The host kernel is asked first. A name it does not
+/// have (XNU registers the arm64 ones only in an arm64 kernel) that `sysctl_override` answers gets a
+/// synthetic MIB, which `sysctl_runtime_mib` then answers from the same table.
+fn sysctl_name2oid(cpu: &mut Cpu, mut args: [u64; 8]) {
+    // XNU copies exactly newlen bytes of the name once, failing with EFAULT if it cannot. It copies
+    // nothing for a NULL name, or for a newlen of 0 or of 1024 and more, which it refuses: those go to
+    // the host unchanged. Otherwise the host kernel is handed our copies.
+    let len = if args[4] != 0 && (1..1024).contains(&args[5]) { args[5] as usize } else { 0 };
+    let mut copy = vec![0u8; len];
+    if len > 0 {
+        if !crate::guestmem::read(args[4], &mut copy) {
+            set_err(cpu, libc::EFAULT as u64);
+            return;
+        }
+        args[4] = copy.as_ptr() as u64;
+    }
+    let name2oid = [0i32, 3];
+    args[0] = name2oid.as_ptr() as u64;
+    let r = hostsys::unix(SYS_SYSCTL, &args);
+    // XNU looks up the bytes before the first NUL, less one trailing dot.
+    let end = copy.iter().position(|&c| c == 0).unwrap_or(len);
+    let name = String::from_utf8_lossy(&copy[..end]);
+    let name = name.strip_suffix('.').unwrap_or(&name);
+    if !(r.carry && r.rax == libc::ENOENT as u64) || sysctl_override(name).is_none() {
+        set_res(cpu, r);
+        return;
+    }
+    let mib: Vec<u8> = synthetic_mib(name).iter().flat_map(|v| v.to_le_bytes()).collect();
+    // As natively: with no buffer only the size is returned, and a buffer too small for the whole
+    // MIB gets nothing, a size of 0 and ENOMEM.
+    let (oldp, oldlenp, size) = (args[2], args[3], mib.len() as u64);
+    let out = || {
+        let room = if oldlenp == 0 { 0 } else { crate::guestmem::read_u64(oldlenp).ok_or(libc::EFAULT)? };
+        if oldp != 0 && room < size {
+            return Err(if oldlenp == 0 || crate::guestmem::write_u64(oldlenp, 0) { libc::ENOMEM } else { libc::EFAULT });
+        }
+        let copied = oldp == 0 || crate::guestmem::write(oldp, &mib);
+        if copied && (oldlenp == 0 || crate::guestmem::write_u64(oldlenp, size)) { Ok(()) } else { Err(libc::EFAULT) }
+    };
+    match out() {
+        Ok(()) => set_ok(cpu, 0, 0),
+        Err(e) => set_err(cpu, e as u64),
+    }
+}
+
+/// libc::fork with `SYNTHETIC_OIDS` held across it, released in the parent and in the child. A fork
+/// copies only the calling thread, so the lock held by another thread at that instant would stay
+/// held in the child, and its next lookup would never return. Guest forks and lookups share the
+/// lock, so a fork can wait for a lookup or for another fork. A lookup holds no other lock of the
+/// runtime's while it holds this one, and the lock is taken before libc::fork is called; fork's
+/// errno is kept across the release.
+fn fork_holding_synthetic_oids() -> libc::pid_t {
+    let names = SYNTHETIC_OIDS.lock().unwrap();
+    let pid = unsafe { libc::fork() };
+    let err = unsafe { *libc::__error() };
+    drop(names);
+    unsafe { *libc::__error() = err };
+    pid
+}
+
+/// The synthetic MIB for `name`, made the first time it is asked for.
+fn synthetic_mib(name: &str) -> Vec<i32> {
+    let mut names = SYNTHETIC_OIDS.lock().unwrap();
+    let index = names.iter().position(|n| n == name).unwrap_or_else(|| {
+        names.push(name.to_string());
+        names.len() - 1
+    });
+    vec![-2 - index as i32; name.split('.').count()]
+}
+
+/// The table's answer for `mib` if it is one of the MIBs `sysctl_name2oid` handed out.
+fn synthetic_oid_answer(mib: &[i32]) -> Option<i64> {
+    sysctl_override(&synthetic_oid_name(mib)?)
+}
+
+/// The name a synthetic MIB was made for, if `mib` is exactly that MIB.
+fn synthetic_oid_name(mib: &[i32]) -> Option<String> {
+    let index = usize::try_from(-2 - i64::from(*mib.first()?)).ok()?;
+    let names = SYNTHETIC_OIDS.lock().unwrap();
+    let name = names.get(index)?;
+    let matches = mib.len() == name.split('.').count() && mib.iter().all(|&x| x == mib[0]);
+    matches.then(|| name.clone())
+}
+
 fn mach_trap(cpu: &mut Cpu, n: u64) {
     let trace = TRACE.load(Ordering::Relaxed);
     match n {
@@ -828,6 +997,29 @@ mod tests {
     }
 
     #[test]
+    fn sysctl_name_reads_exactly_namelen_bytes() {
+        let base = 0x30_0000u64;
+        let mut mem = vec![0u8; 8192];
+        // "hw.machine" with no NUL, ending exactly where the unreadable page begins.
+        mem[4096 - 10..4096].copy_from_slice(b"hw.machine");
+        let p = base + 4096 - 10;
+        let copied = |copy: &[u8], name: &str| Ok(Some((copy.to_vec(), name.to_string())));
+        assert_eq!(sysctl_name(p, 10, reader(base, &mem, base + 4096)), copied(b"hw.machine", "hw.machine"));
+        // One byte more runs into the unreadable page: EFAULT, as XNU's copyin.
+        assert_eq!(sysctl_name(p, 11, reader(base, &mem, base + 4096)), Err(libc::EFAULT as u64));
+        // Bytes after a NUL inside namelen are not part of the name, but stay in the copy.
+        mem[4096 - 3] = 0;
+        assert_eq!(sysctl_name(p, 10, reader(base, &mem, base + 4096)), copied(b"hw.mach\0ne", "hw.mach"));
+        // One trailing dot is dropped from the name, as XNU's name2oid does; the copy keeps it.
+        mem[4096 - 3] = b'.';
+        assert_eq!(sysctl_name(p, 8, reader(base, &mem, base + 4096)), copied(b"hw.mach.", "hw.mach"));
+        // An empty name, and lengths XNU refuses with ENAMETOOLONG, are left to the host kernel.
+        assert_eq!(sysctl_name(p, 0, reader(base, &mem, base + 4096)), Ok(None));
+        assert_eq!(sysctl_name(base, 1024, reader(base, &mem, base + 8192)), Ok(None));
+        assert_eq!(sysctl_name(base, 1023, reader(base, &mem, base + 8192)), copied(&[0; 1023], ""));
+    }
+
+    #[test]
     fn guest_cstr_reads_across_pages_and_stops_at_max() {
         let base = 0x20_0000u64;
         let mut mem = vec![b'b'; 8192];
@@ -836,5 +1028,75 @@ mod tests {
         assert_eq!(guest_cstr(p, GUEST_NAME_MAX, reader(base, &mem, base + 8192)).map(|s| s.len()), Some(2000));
         assert_eq!(guest_cstr(p, 2000, reader(base, &mem, base + 8192)), None);
         assert_eq!(guest_cstr(p, 2001, reader(base, &mem, base + 8192)).map(|s| s.len()), Some(2000));
+    }
+
+    #[test]
+    fn synthetic_mibs_answer_only_the_name_they_were_made_for() {
+        let lse2 = synthetic_mib("hw.optional.arm.FEAT_LSE2");
+        let arm64 = synthetic_mib("hw.optional.arm64");
+        assert_eq!(synthetic_mib("hw.optional.arm.FEAT_LSE2"), lse2);
+        assert_eq!((lse2.len(), arm64.len()), (4, 3));
+        assert!(lse2.iter().chain(&arm64).all(|&x| x <= -2) && lse2[0] != arm64[0]);
+        assert_eq!(synthetic_oid_answer(&lse2), Some(0));
+        assert_eq!(synthetic_oid_answer(&arm64), Some(1));
+        // Part of one, a mix of two, a number never handed out and real MIBs are not answered.
+        assert_eq!(synthetic_oid_answer(&lse2[..3]), None);
+        assert_eq!(synthetic_oid_answer(&[lse2[0], lse2[0], lse2[0], arm64[0]]), None);
+        assert_eq!(synthetic_oid_answer(&[i32::MIN; 4]), None);
+        assert_eq!(synthetic_oid_answer(&[-1, -1]), None);
+        assert_eq!(synthetic_oid_answer(&[6, 1]), None);
+    }
+
+    /// Fork with `fork` while another thread holds `SYNTHETIC_OIDS`, which it releases once the fork
+    /// has returned in the parent, or after 1 s if `fork` was called by then (it may be waiting for
+    /// the lock); the test fails if `fork` was not called while the lock was held. In the child, look
+    /// up the MIB the parent was given before the fork. The child is killed if it has not exited 3 s
+    /// after the fork. Its wait status.
+    fn lookup_in_a_child_forked_beside_a_registry_holder(fork: fn() -> libc::pid_t) -> i32 {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        let mib = synthetic_mib("hw.optional.arm.FEAT_SME");
+        let called = std::sync::Arc::new(AtomicBool::new(false));
+        let (held, wait_held) = std::sync::mpsc::channel();
+        let (forked, wait_forked) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn({
+            let called = called.clone();
+            move || {
+                let names = SYNTHETIC_OIDS.lock().unwrap();
+                held.send(()).unwrap();
+                let overlapped = wait_forked.recv_timeout(std::time::Duration::from_secs(1)).is_ok() || called.load(SeqCst);
+                drop(names);
+                overlapped
+            }
+        });
+        wait_held.recv().unwrap();
+        called.store(true, SeqCst);
+        let pid = fork();
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            let same = || synthetic_oid_answer(&mib) == Some(0) && synthetic_mib("hw.optional.arm.FEAT_SME") == mib;
+            let ok = std::panic::catch_unwind(same).unwrap_or(false);
+            unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+        }
+        let _ = forked.send(());
+        assert!(holder.join().unwrap(), "fork was not called while the lock was held");
+        let (mut st, start) = (0, std::time::Instant::now());
+        loop {
+            let r = unsafe { libc::waitpid(pid, &mut st, libc::WNOHANG) };
+            if r == pid {
+                return st;
+            }
+            let interrupted = std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR);
+            assert!(r == 0 || interrupted, "waitpid");
+            if start.elapsed() > std::time::Duration::from_secs(3) {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_child_forked_while_another_thread_holds_the_synthetic_mibs_can_look_a_name_up() {
+        let st = lookup_in_a_child_forked_beside_a_registry_holder(fork_holding_synthetic_oids);
+        assert!(libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0, "child wait status {st:#x}");
     }
 }
